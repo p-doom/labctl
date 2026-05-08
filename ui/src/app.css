@@ -1,0 +1,263 @@
+/* Self-hosted variable fonts. Vite inlines the WOFF2 imports into the
+ * bundle and the @font-face rules; no CDN round-trip on cold load. */
+@import "@fontsource-variable/inter/wght.css";
+@import "@fontsource-variable/jetbrains-mono/wght.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------- design tokens ----------
+ * Two palettes, both expressed in CSS variables so theme switching is a
+ * single class change on <html>. Default is dark; .light flips. The same
+ * variables resolve from Tailwind's `theme()` (via the shim in
+ * tailwind.config.js) so component CSS doesn't care which is active. */
+
+:root,
+:root.dark {
+  /* Surfaces */
+  --bg-0: #0a0b0d; /* page */
+  --bg-1: #101114; /* surface */
+  --bg-2: #15171b; /* raised */
+  --bg-3: #1c1f24; /* hover */
+  /* Foregrounds */
+  --fg-0: #ecedef;
+  --fg-1: #a1a4ab;
+  --fg-2: #6b6f78;
+  --fg-3: #42464e;
+  /* Borders/lines */
+  --line-0: #1f2228;
+  --line-1: #2a2d35;
+  --line-2: #3a3e47;
+  /* Accent — desaturated chartreuse */
+  --accent: #bdf26d;
+  --accent-dim: #8cb84d;
+  --accent-soft: rgba(189, 242, 109, 0.12);
+  /* Status */
+  --status-running: #bdf26d;
+  --status-running-soft: rgba(189, 242, 109, 0.12);
+  --status-running-fg: #d6f6a0;
+  --status-succeeded: #7dd3a8;
+  --status-succeeded-soft: rgba(125, 211, 168, 0.10);
+  --status-succeeded-fg: #a8e3c5;
+  --status-failed: #ef7c6a;
+  --status-failed-soft: rgba(239, 124, 106, 0.12);
+  --status-failed-fg: #f5a99c;
+  --status-pending: #e8c170;
+  --status-pending-soft: rgba(232, 193, 112, 0.12);
+  --status-pending-fg: #efd49a;
+  --status-neutral: #7c828d;
+  --status-neutral-soft: rgba(124, 130, 141, 0.12);
+  --status-neutral-fg: #a1a4ab;
+  /* Misc */
+  --shadow-panel-1: rgba(0, 0, 0, 0.6);
+  --selection-bg: rgba(189, 242, 109, 0.25);
+  --scrollbar-thumb: #2a2d35;
+  --scrollbar-thumb-hover: #3a3e47;
+  --shiki-bg: var(--bg-0);
+  color-scheme: dark;
+}
+
+:root.light {
+  /* Restrained, warm-cool light. Linear/Marimo discipline — surfaces in
+   * tight near-white range, single accent, status colors darkened just
+   * enough to read on near-white backgrounds. */
+  --bg-0: #fafafa;
+  --bg-1: #f4f5f7;
+  --bg-2: #ebedef;
+  --bg-3: #e0e2e6;
+  --fg-0: #1c1d20;
+  --fg-1: #565a62;
+  --fg-2: #7e828a;
+  --fg-3: #b1b5bc;
+  --line-0: #e7e9ec;
+  --line-1: #d6d9de;
+  --line-2: #b8bcc4;
+  /* Accent — chartreuse darkened for contrast on near-white. */
+  --accent: #5e8e1f;
+  --accent-dim: #4f7a18;
+  --accent-soft: rgba(94, 142, 31, 0.12);
+  --status-running: #5e8e1f;
+  --status-running-soft: rgba(94, 142, 31, 0.10);
+  --status-running-fg: #4a7218;
+  --status-succeeded: #2d8856;
+  --status-succeeded-soft: rgba(45, 136, 86, 0.08);
+  --status-succeeded-fg: #1f6038;
+  --status-failed: #c1463a;
+  --status-failed-soft: rgba(193, 70, 58, 0.08);
+  --status-failed-fg: #8e2f25;
+  --status-pending: #a87618;
+  --status-pending-soft: rgba(168, 118, 24, 0.08);
+  --status-pending-fg: #7d5712;
+  --status-neutral: #6b6f78;
+  --status-neutral-soft: rgba(107, 111, 120, 0.08);
+  --status-neutral-fg: #4a4d54;
+  --shadow-panel-1: rgba(20, 22, 25, 0.18);
+  --selection-bg: rgba(94, 142, 31, 0.22);
+  --scrollbar-thumb: #c8cbd0;
+  --scrollbar-thumb-hover: #aeb1b6;
+  --shiki-bg: var(--bg-0);
+  color-scheme: light;
+}
+
+:root {
+  font-family: "Inter Variable", "Inter", ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings: "ss01", "ss03", "cv11";
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+::selection {
+  background: var(--selection-bg);
+  color: var(--fg-0);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+button:focus,
+a:focus {
+  outline: none;
+}
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@layer components {
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full font-medium font-mono text-xs leading-none;
+    padding: 4px 8px 4px 6px;
+    transition: background-color 250ms cubic-bezier(0.2, 0, 0, 1),
+      color 250ms cubic-bezier(0.2, 0, 0, 1);
+  }
+  .pill-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    flex-shrink: 0;
+  }
+
+  .row {
+    @apply grid items-center text-sm;
+    grid-template-columns: 22px 1fr 140px 110px 80px 80px;
+    column-gap: 12px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--line-0);
+  }
+  .row:hover,
+  .row.is-active {
+    background-color: var(--bg-2);
+  }
+  .row:last-child {
+    border-bottom: none;
+  }
+
+  .kbd {
+    @apply inline-flex items-center justify-center font-mono text-xs;
+    background: var(--bg-2);
+    border: 1px solid var(--line-1);
+    border-bottom-width: 2px;
+    color: var(--fg-1);
+    padding: 1px 5px;
+    border-radius: 4px;
+    min-width: 18px;
+    height: 18px;
+    line-height: 1;
+  }
+
+  .iconbtn {
+    @apply inline-flex items-center justify-center text-fg-1 rounded;
+    width: 26px;
+    height: 26px;
+  }
+  .iconbtn:hover {
+    background: var(--bg-3);
+    color: var(--fg-0);
+  }
+
+  .skel {
+    background: linear-gradient(
+      90deg,
+      var(--bg-1) 0%,
+      var(--bg-2) 50%,
+      var(--bg-1) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s linear infinite;
+    border-radius: 4px;
+  }
+}
+
+/* xyflow palette overrides */
+.svelte-flow__node {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+}
+.svelte-flow__edge-path {
+  stroke: var(--line-2);
+  stroke-width: 1.5px;
+}
+.svelte-flow__edge.selected .svelte-flow__edge-path,
+.svelte-flow__edge.highlighted .svelte-flow__edge-path {
+  stroke: var(--accent);
+}
+.svelte-flow__background {
+  background-color: var(--bg-0);
+}
+.svelte-flow__controls {
+  background: var(--bg-1);
+  border: 1px solid var(--line-1);
+  box-shadow: none;
+  border-radius: 6px;
+}
+.svelte-flow__controls-button {
+  background: transparent;
+  border-bottom: 1px solid var(--line-0);
+  color: var(--fg-1);
+}
+.svelte-flow__controls-button:hover {
+  background: var(--bg-2);
+  color: var(--fg-0);
+}
+.svelte-flow__attribution {
+  display: none !important;
+}

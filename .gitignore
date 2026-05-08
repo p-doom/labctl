@@ -1,0 +1,27 @@
+# Rust
+/target/
+
+# Frontend
+/ui/node_modules/
+/ui/dist/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local cluster configs (paths and SLURM accounts vary per user/site)
+/labctl.toml
+cluster.*.local.toml
+
+# Local registries / artifacts (should never be checked in)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Env / secrets
+.env
+.env.*
