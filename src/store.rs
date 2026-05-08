@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS runs (
     finished_at INTEGER,
     pipeline_id TEXT,
     dependency_on TEXT,
-    stage_name TEXT
+    stage_name TEXT,
+    submitted_by TEXT
 );
 
 CREATE TABLE IF NOT EXISTS pipelines (
@@ -136,6 +137,7 @@ pub struct RunRow {
     pub pipeline_id: Option<String>,
     pub stage_name: Option<String>,
     pub dependency_on: Option<Value>,
+    pub submitted_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +213,7 @@ pub struct NewRun<'a> {
     pub run_dir: &'a Path,
     pub source_path: &'a Path,
     pub context_json: &'a Value,
+    pub submitted_by: Option<&'a str>,
 }
 
 pub struct Store {
@@ -240,6 +243,12 @@ impl Store {
                 if msg.contains("duplicate column name") => {}
             Err(e) => return Err(e.into()),
         }
+        match conn.execute("ALTER TABLE runs ADD COLUMN submitted_by TEXT", []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") => {}
+            Err(e) => return Err(e.into()),
+        }
         Ok(Self { conn })
     }
 
@@ -248,8 +257,8 @@ impl Store {
         tx.execute(
             "INSERT INTO runs
              (id, recipe_name, recipe_hash, status, run_dir, repo, source_path,
-              recipe_json, context_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              recipe_json, context_json, created_at, submitted_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 run.id,
                 run.recipe.name,
@@ -261,6 +270,7 @@ impl Store {
                 serde_json::to_string(run.recipe)?,
                 serde_json::to_string(run.context_json)?,
                 util::now_ts(),
+                run.submitted_by,
             ],
         )?;
         for input in inputs {
@@ -297,13 +307,27 @@ impl Store {
         Ok(())
     }
 
-    pub fn update_status(&mut self, run_id: &str, status: &str) -> Result<()> {
+    pub fn update_status(
+        &mut self,
+        run_id: &str,
+        status: &str,
+        finished_at: Option<i64>,
+    ) -> Result<()> {
         let terminal = is_terminal(status);
+        let ts = finished_at.unwrap_or_else(util::now_ts);
         self.conn.execute(
             "UPDATE runs SET status=?, finished_at=CASE WHEN ? THEN ? ELSE finished_at END WHERE id=?",
-            params![status, terminal, util::now_ts(), run_id],
+            params![status, terminal, ts, run_id],
         )?;
         self.event(run_id, "run_status", json!({ "status": status }))?;
+        Ok(())
+    }
+
+    pub fn set_finished_at(&mut self, run_id: &str, finished_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET finished_at=? WHERE id=?",
+            params![finished_at, run_id],
+        )?;
         Ok(())
     }
 
@@ -332,6 +356,20 @@ impl Store {
             .query_map([], row_to_run)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// All terminal runs — used by `labctl repair-finish-times` which
+    /// recomputes ``finished_at`` from sacct/status.json. Idempotent: if
+    /// the recomputed value matches the stored one, the row is left alone.
+    pub fn terminal_runs(&self) -> Result<Vec<RunRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM runs WHERE status IN
+             ('succeeded','failed','cancelled','timeout','oom','unknown_terminal')
+             ORDER BY created_at DESC",
+        )?;
+        Ok(stmt
+            .query_map([], row_to_run)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Terminal runs that have no `run_outputs` rows at all — i.e. runs
@@ -1000,6 +1038,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         pipeline_id: row.get("pipeline_id").ok().flatten(),
         stage_name: row.get("stage_name").ok().flatten(),
         dependency_on,
+        submitted_by: row.get("submitted_by").ok().flatten(),
     })
 }
 

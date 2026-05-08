@@ -26,6 +26,7 @@ export interface RunSummary {
   duration_secs: number | null;
   pipeline_id: string | null;
   stage_name: string | null;
+  submitted_by: string | null;
   is_terminal: boolean;
 }
 

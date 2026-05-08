@@ -34,7 +34,7 @@ pub struct SubmitOverrides {
     pub input_artifacts: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmittedRun {
     pub run_id: String,
     pub job_id: String,
@@ -52,6 +52,17 @@ struct StatusFile {
     status: String,
     #[allow(dead_code)]
     job_id: Option<String>,
+    /// Wall-clock unix timestamp of the last write_status call inside the
+    /// sbatch wrapper. For terminal transitions this is when the recipe
+    /// command actually exited (not when reconcile observed it), so we
+    /// prefer it over now_ts() when sacct doesn't return a usable End.
+    updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct SchedulerOutcome {
+    status: String,
+    finished_at: Option<i64>,
 }
 
 pub fn submit_recipe(
@@ -203,6 +214,7 @@ fn submit_recipe_inner(
     let script_path = lab_dir.join("submit.sh");
     util::atomic_write(&script_path, script.as_bytes())?;
 
+    let submitted_by = std::env::var("USER").ok();
     store.insert_run(
         NewRun {
             id: &run_id,
@@ -212,6 +224,7 @@ fn submit_recipe_inner(
             run_dir: &run_dir,
             source_path: &source_path,
             context_json: &ctx,
+            submitted_by: submitted_by.as_deref(),
         },
         &inputs,
     )?;
@@ -240,14 +253,14 @@ fn submit_recipe_inner(
     })
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmittedPipeline {
     pub pipeline_id: String,
     pub name: String,
     pub stages: Vec<SubmittedStage>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmittedStage {
     pub stage_name: String,
     pub run_id: String,
@@ -353,11 +366,12 @@ pub fn reconcile_one(
         status_changed: false,
         artifacts_registered: 0,
     };
-    let status = scheduler_status(cluster, run)
-        .or_else(|| status_file_status(&run.run_dir))
-        .unwrap_or_else(|| run.status.clone());
+    let (status, finished_at) = scheduler_outcome(cluster, run)
+        .map(|o| (o.status, o.finished_at))
+        .or_else(|| status_file_outcome(&run.run_dir))
+        .unwrap_or_else(|| (run.status.clone(), None));
     if status != run.status {
-        store.update_status(&run.id, &status)?;
+        store.update_status(&run.id, &status, finished_at)?;
         step.status_changed = true;
     }
     let current = store.get_run(&run.id)?;
@@ -428,6 +442,43 @@ pub struct RecoverReport {
     pub scanned: usize,
     pub recovered: usize,
     pub artifacts_registered: usize,
+}
+
+/// One-shot repair for runs whose ``finished_at`` was set to ``now_ts()`` at
+/// reconcile time instead of the run's actual end time. Recomputes from
+/// sacct's End (preferred) or status.json's updated_at (fallback). Idempotent
+/// — repeated invocations converge: a run whose finished_at already matches
+/// the recomputed value is left alone.
+pub fn repair_finish_times(
+    cluster: &ClusterConfig,
+    store: &mut Store,
+) -> Result<RepairReport> {
+    let mut report = RepairReport::default();
+    for run in store.terminal_runs()? {
+        report.scanned += 1;
+        let recomputed = scheduler_outcome(cluster, &run)
+            .and_then(|o| o.finished_at)
+            .or_else(|| status_file_outcome(&run.run_dir).and_then(|(_, ts)| ts));
+        let Some(ts) = recomputed else {
+            report.unresolved += 1;
+            continue;
+        };
+        if Some(ts) == run.finished_at {
+            report.unchanged += 1;
+            continue;
+        }
+        store.set_finished_at(&run.id, ts)?;
+        report.repaired += 1;
+    }
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepairReport {
+    pub scanned: usize,
+    pub repaired: usize,
+    pub unchanged: usize,
+    pub unresolved: usize,
 }
 
 pub fn gc(_cluster: &ClusterConfig, store: &mut Store, terminal_snapshots: bool) -> Result<usize> {
@@ -665,6 +716,24 @@ fn render_script(
             run_dir.display(),
             run_dir.display()
         ));
+        // Power-user escape hatch. Rendered last so it can layer atop the
+        // typed directives, but cannot reorder them.
+        for extra in &recipe.resources.sbatch_extra {
+            let trimmed = extra.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Refuse comments and stray `#SBATCH` prefixes — the user
+            // gives us flags, we own the formatting. Catching this at
+            // submission time keeps the rendered script self-explanatory.
+            if trimmed.starts_with('#') {
+                bail!(
+                    "resources.sbatch_extra entries must be bare flags (e.g. \"--array=0-3\"); \
+                     labctl prepends the #SBATCH prefix. Got: {extra:?}"
+                );
+            }
+            script.push_str(&format!("#SBATCH {trimmed}\n"));
+        }
     } else {
         script.push_str("#!/usr/bin/env bash\n");
     }
@@ -802,21 +871,64 @@ fn submit_script(cluster: &ClusterConfig, script_path: &Path, run_id: &str) -> R
     }
 }
 
-fn scheduler_status(cluster: &ClusterConfig, run: &crate::store::RunRow) -> Option<String> {
+/// Query sacct for the run's State and End. We pass ``--starttime`` derived
+/// from the run's ``created_at`` (minus a 1-day buffer) so that very old jobs
+/// still appear, and so a recycled job_id can't return a row from a different
+/// run that ran much later. ``TZ=UTC`` is forced so we can parse End without
+/// ambiguity. Returns ``None`` only if sacct itself can't be invoked or
+/// returns nonzero — an unparseable End is fine, we just leave finished_at
+/// empty and let the caller fall back.
+fn scheduler_outcome(
+    cluster: &ClusterConfig,
+    run: &crate::store::RunRow,
+) -> Option<SchedulerOutcome> {
     if cluster.scheduler.kind == SchedulerKind::Local {
         return None;
     }
     let job_id = run.job_id.as_ref()?;
+    let starttime = fmt_starttime_utc((run.created_at - 86_400).max(0));
     let output = Command::new(&cluster.scheduler.sacct)
-        .args(["-j", job_id, "-P", "-n", "--format=State"])
+        .env("TZ", "UTC")
+        .args([
+            "-j",
+            job_id,
+            "-P",
+            "-n",
+            "--format=State,End",
+            "--starttime",
+            &starttime,
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let state = stdout.lines().next()?.split('|').next()?.trim();
-    Some(map_slurm_state(state))
+    let line = stdout.lines().next()?;
+    let mut parts = line.split('|');
+    let state = parts.next()?.split_whitespace().next()?.trim();
+    let end_field = parts.next().unwrap_or("").trim();
+    Some(SchedulerOutcome {
+        status: map_slurm_state(state),
+        finished_at: parse_sacct_end_utc(end_field),
+    })
+}
+
+fn parse_sacct_end_utc(s: &str) -> Option<i64> {
+    if s.is_empty() || s == "Unknown" || s == "None" {
+        return None;
+    }
+    let dt = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok()?;
+    Some(dt.and_utc().timestamp())
+}
+
+fn fmt_starttime_utc(ts: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_opt(ts.max(0), 0)
+        .single()
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_else(|| "1970-01-01T00:00:00".to_string())
 }
 
 fn map_slurm_state(state: &str) -> String {
@@ -834,11 +946,11 @@ fn map_slurm_state(state: &str) -> String {
     .to_string()
 }
 
-fn status_file_status(run_dir: &Path) -> Option<String> {
+fn status_file_outcome(run_dir: &Path) -> Option<(String, Option<i64>)> {
     let path = run_dir.join(".lab/status.json");
     let text = fs::read_to_string(path).ok()?;
     let status: StatusFile = serde_json::from_str(&text).ok()?;
-    Some(status.status)
+    Some((status.status, status.updated_at))
 }
 
 fn register_outputs(store: &mut Store, run: &crate::store::RunRow) -> Result<usize> {

@@ -40,7 +40,8 @@ def schema(c):
       status TEXT NOT NULL, job_id TEXT, run_dir TEXT NOT NULL, repo TEXT NOT NULL,
       source_path TEXT NOT NULL, recipe_json TEXT NOT NULL, context_json TEXT NOT NULL,
       created_at INTEGER NOT NULL, finished_at INTEGER,
-      pipeline_id TEXT, dependency_on TEXT, stage_name TEXT
+      pipeline_id TEXT, dependency_on TEXT, stage_name TEXT,
+      submitted_by TEXT
     );
     CREATE TABLE pipelines (
       id TEXT PRIMARY KEY, name TEXT NOT NULL,

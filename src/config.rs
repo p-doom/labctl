@@ -26,6 +26,32 @@ pub struct ClusterConfig {
     /// by `--no-dispatch`, `labctl serve` runs reconcile + evald + throttle
     /// in tokio tasks. When absent, serve stays a read-only viewer.
     pub dispatch: Option<DispatchConfig>,
+    /// Where the CLI sends submissions. The daemon (`labctl serve`) is the
+    /// only writer to the registry, so `labctl run` and `labctl run-pipeline`
+    /// POST here by default; the `--local` flag bypasses this for solo use.
+    /// Defaults to ``http://127.0.0.1:8765`` to match the default `--bind`.
+    #[serde(default)]
+    pub server: ServerConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// Daemon base URL. Trailing slash is tolerated.
+    pub url: String,
+    /// HTTP request timeout in seconds for CLI → daemon submission. The
+    /// submission path snapshots the source repo before returning, so this
+    /// has to accommodate slow filesystems.
+    pub timeout_secs: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://127.0.0.1:8765".to_string(),
+            timeout_secs: 120,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -272,6 +298,16 @@ pub struct Resources {
     /// Useful for routing around hosts with intermittent issues without
     /// waiting for SLURM's drain detection.
     pub exclude_nodes: Option<String>,
+    /// Escape hatch for sbatch directives the typed schema doesn't cover
+    /// (e.g. `--array`, `--nodes`, `--mail-type`, `--gpu-bind`). Each entry
+    /// is rendered verbatim as a separate `#SBATCH` line, *after* the
+    /// typed directives. Use this only for things labctl can't model —
+    /// don't override `--cpus-per-task` or `--time` here, those have
+    /// dedicated fields and overriding them confuses the dispatcher.
+    /// Lines must start with the bare flag (e.g. `"--array=0-3"`); labctl
+    /// prepends the `#SBATCH ` prefix.
+    #[serde(default)]
+    pub sbatch_extra: Vec<String>,
 }
 
 impl Default for Resources {
@@ -285,6 +321,7 @@ impl Default for Resources {
             qos: None,
             account: None,
             exclude_nodes: None,
+            sbatch_extra: Vec::new(),
         }
     }
 }
@@ -321,14 +358,18 @@ pub struct PipelineStage {
     pub recipe: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+/// A pipeline whose stages have been parsed and topologically ordered. The
+/// CLI loads this from disk (resolving relative stage paths) and sends it to
+/// the daemon over HTTP, which is why it derives serde — the daemon needs to
+/// reconstruct the same shape without re-reading the user's filesystem.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoadedPipeline {
     pub name: String,
     pub stages: BTreeMap<String, LoadedStage>,
     pub topo_order: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoadedStage {
     pub recipe_path: PathBuf,
     pub recipe: Recipe,

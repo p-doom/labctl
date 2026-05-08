@@ -1,4 +1,5 @@
 mod artifacts;
+mod client;
 mod config;
 #[cfg(feature = "ui")]
 mod dispatch;
@@ -18,8 +19,18 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+/// Compile-time version stamp. Crate version + short git SHA captured by
+/// build.rs so `labctl --version` identifies the exact build.
+const BUILD_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("LABCTL_GIT_SHA"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(name = "labctl")]
+#[command(version = BUILD_VERSION)]
 #[command(about = "Reproducible lab run envelope and artifact lineage control plane")]
 struct Cli {
     #[arg(long, global = true, default_value = "labctl.toml")]
@@ -73,6 +84,15 @@ enum Command {
     /// output rows. Recovers runs whose outputs went unregistered because
     /// of the pre-fix terminal-transition bug. Idempotent.
     RecoverOutputs,
+    /// Recompute `finished_at` for terminal runs from sacct's End field
+    /// (or status.json's updated_at as fallback). Use this after upgrading
+    /// past the bug where finished_at was set to wall-clock time at
+    /// reconcile observation rather than the actual job end time.
+    RepairFinishTimes,
+    /// Run a self-check: cluster config, filesystem perms, scheduler
+    /// availability, and systemd unit status. Use this before reporting a
+    /// problem so the report includes the environment state.
+    Doctor,
     /// Manage the systemd user service that keeps `labctl serve` alive.
     Service {
         #[command(subcommand)]
@@ -140,6 +160,11 @@ fn main() -> Result<()> {
     // shouldn't have to fix every TOML detail before they can install,
     // and the unit just delegates back to `labctl serve` which will
     // re-validate on every startup.
+    // Doctor must work even when the cluster config doesn't load — that's
+    // exactly the situation it's here to diagnose.
+    if let Command::Doctor = &cli.command {
+        return run_doctor(&cli.cluster);
+    }
     if let Command::Service { command } = cli.command {
         return match command {
             ServiceCommand::Install { bind, name, force } => {
@@ -153,29 +178,21 @@ fn main() -> Result<()> {
             ServiceCommand::Status { name } => service::status(&name),
         };
     }
+    // Run and RunPipeline are handled before opening the local registry —
+    // the daemon owns every write. CLI invocations on a shared registry
+    // would race on POSIX locks (broken on parallel filesystems) and
+    // corrupt the DB.
+    if let Command::Run { recipe } = &cli.command {
+        return run_recipe_command(&cli.cluster, recipe);
+    }
+    if let Command::RunPipeline { pipeline } = &cli.command {
+        return run_pipeline_command(&cli.cluster, pipeline);
+    }
 
     let cluster = config::ClusterConfig::load(&cli.cluster)?;
     let mut store = store::Store::open(&cluster.filesystem.registry_db)?;
 
     match cli.command {
-        Command::Run { recipe } => {
-            let recipe = config::Recipe::load(&recipe)?;
-            let submitted = runner::submit_recipe(&cluster, &mut store, &recipe, None)?;
-            println!("run_id: {}", submitted.run_id);
-            println!("job_id: {}", submitted.job_id);
-            println!("run_dir: {}", submitted.run_dir.display());
-            maybe_print_service_hint(&cluster);
-        }
-        Command::RunPipeline { pipeline } => {
-            let loaded = config::Pipeline::load(&pipeline)?;
-            let submitted = runner::submit_pipeline(
-                &cluster,
-                &mut store,
-                &loaded,
-                Some(&pipeline),
-            )?;
-            println!("{}", serde_json::to_string_pretty(&submitted)?);
-        }
         Command::PipelineShow { id } => {
             let pipeline = store
                 .get_pipeline(&id)?
@@ -235,6 +252,10 @@ fn main() -> Result<()> {
             let report = runner::recover_outputs(&cluster, &mut store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::RepairFinishTimes => {
+            let report = runner::repair_finish_times(&cluster, &mut store)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Command::Evald { command } => match command {
             EvaldCommand::Once { policy } => {
                 let policy = config::EvalPolicy::load(&policy)?;
@@ -249,7 +270,11 @@ fn main() -> Result<()> {
                 .with_context(|| format!("invalid --bind address {bind:?}"))?;
             server::serve(cluster, store, addr, no_dispatch)?;
         }
-        Command::Validate { .. } | Command::Service { .. } => {
+        Command::Validate { .. }
+        | Command::Service { .. }
+        | Command::Doctor
+        | Command::Run { .. }
+        | Command::RunPipeline { .. } => {
             unreachable!("handled above")
         }
     }
@@ -257,29 +282,174 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Self-check intended for first-time setup and bug reports. Never bails:
+/// every failure becomes a "FAIL" line so the user sees the whole picture.
+/// Exits with code 1 if any check failed, 0 otherwise.
+fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
+    use std::process::Command as Cmd;
+    let mut failed = 0usize;
+    let mut emit = |label: &str, ok: bool, detail: &str| {
+        let mark = if ok { "OK  " } else { "FAIL" };
+        println!("[{mark}] {label:<32} {detail}");
+        if !ok {
+            failed += 1;
+        }
+    };
+
+    println!("labctl {BUILD_VERSION}");
+    println!("cluster config: {}", cluster_path.display());
+    println!();
+
+    let cluster = match config::ClusterConfig::load(cluster_path) {
+        Ok(c) => {
+            emit("cluster config", true, &format!("loaded ({} repos)", c.repos.len()));
+            Some(c)
+        }
+        Err(e) => {
+            emit("cluster config", false, &format!("{e:#}"));
+            None
+        }
+    };
+
+    if let Some(cluster) = &cluster {
+        let runs_base = &cluster.filesystem.runs_base;
+        let runs_ok = runs_base.is_dir() && writable_dir(runs_base);
+        emit(
+            "runs_base writable",
+            runs_ok,
+            &runs_base.display().to_string(),
+        );
+
+        let registry_db = &cluster.filesystem.registry_db;
+        let parent_ok = registry_db
+            .parent()
+            .map(|p| p.is_dir() && writable_dir(p))
+            .unwrap_or(false);
+        emit(
+            "registry_db parent dir",
+            parent_ok,
+            &registry_db.display().to_string(),
+        );
+
+        match store::Store::open(registry_db) {
+            Ok(_) => emit("registry_db open", true, "ok"),
+            Err(e) => emit("registry_db open", false, &format!("{e:#}")),
+        }
+
+        for (kind, root) in &cluster.filesystem.artifact_roots {
+            let ok = root.is_dir() && writable_dir(root);
+            emit(
+                &format!("artifact_root[{kind}]"),
+                ok,
+                &root.display().to_string(),
+            );
+        }
+
+        let sched_kind = format!("{:?}", cluster.scheduler.kind);
+        let sacct_ok = which::which(&cluster.scheduler.sacct).is_ok();
+        emit(
+            "scheduler.sacct",
+            sacct_ok,
+            &format!("{} ({})", cluster.scheduler.sacct, sched_kind),
+        );
+        let sbatch_ok = which::which(&cluster.scheduler.sbatch).is_ok();
+        emit(
+            "scheduler.sbatch",
+            sbatch_ok,
+            &cluster.scheduler.sbatch.clone(),
+        );
+
+        match &cluster.dispatch {
+            Some(d) => emit(
+                "dispatch config",
+                true,
+                &format!(
+                    "reconcile={}s evald={}s policies_dir={}",
+                    d.reconcile_interval_secs,
+                    d.evald_interval_secs,
+                    d.policies_dir.display(),
+                ),
+            ),
+            None => emit(
+                "dispatch config",
+                true,
+                "absent (UI is read-only; reconcile + evald won't run)",
+            ),
+        }
+    }
+
+    let systemd_ok = service::systemd_available();
+    emit(
+        "systemctl --user",
+        systemd_ok,
+        if systemd_ok {
+            "available"
+        } else {
+            "not available (service install/status will not work)"
+        },
+    );
+    let unit_installed = service::is_installed("labctl");
+    if systemd_ok {
+        if unit_installed {
+            let active = Cmd::new("systemctl")
+                .args(["--user", "is-active", "labctl"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|| "unknown".into());
+            emit("labctl service unit", true, &format!("installed ({active})"));
+        } else {
+            emit(
+                "labctl service unit",
+                true,
+                "not installed (run `labctl service install`)",
+            );
+        }
+    }
+
+    println!();
+    if failed == 0 {
+        println!("doctor: all checks passed");
+        Ok(())
+    } else {
+        println!("doctor: {failed} check(s) failed");
+        std::process::exit(1);
+    }
+}
+
+fn writable_dir(path: &std::path::Path) -> bool {
+    // SAFETY: tempfile inside the dir is the only portable way to learn
+    // "can I write here". W_OK from access(2) lies about ACL/quota.
+    let probe = path.join(format!(".labctl-doctor-probe-{}", std::process::id()));
+    let ok = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
 /// One-line nudge after `labctl run` succeeds, when the cluster is
 /// configured for in-process dispatch but the user hasn't installed the
 /// systemd unit. Suppressed by `LABCTL_NO_HINT=1` and skipped on hosts
 /// without systemd-user. Designed to be ignorable — never blocks, never
 /// errors.
-fn maybe_print_service_hint(cluster: &config::ClusterConfig) {
-    if std::env::var_os("LABCTL_NO_HINT").is_some() {
-        return;
-    }
-    if cluster.dispatch.is_none() {
-        return;
-    }
-    if !service::systemd_available() {
-        return;
-    }
-    if service::is_installed("labctl") {
-        return;
-    }
-    eprintln!(
-        "\nTip: dispatch isn't running as a service. Reconcile + evald only \
-         run when `labctl serve` is up. To keep them alive across logouts:\n  \
-         labctl service install\n(silence this hint with LABCTL_NO_HINT=1)"
-    );
+/// Submit a recipe. Parses the TOML locally so the daemon doesn't need
+/// read access to the user's filesystem, then POSTs the resolved Recipe
+/// to the configured server. The daemon owns the registry write.
+fn run_recipe_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()> {
+    let cluster = config::ClusterConfig::load(cluster_path)?;
+    let recipe = config::Recipe::load(recipe_path)?;
+    let submitted = client::submit_recipe(&cluster.server, &recipe)?;
+    println!("run_id: {}", submitted.run_id);
+    println!("job_id: {}", submitted.job_id);
+    println!("run_dir: {}", submitted.run_dir.display());
+    Ok(())
+}
+
+fn run_pipeline_command(cluster_path: &PathBuf, pipeline_path: &PathBuf) -> Result<()> {
+    let cluster = config::ClusterConfig::load(cluster_path)?;
+    let loaded = config::Pipeline::load(pipeline_path)?;
+    let submitted = client::submit_pipeline(&cluster.server, &loaded, Some(pipeline_path))?;
+    println!("{}", serde_json::to_string_pretty(&submitted)?);
+    Ok(())
 }
 
 fn validate_path(path: &PathBuf) -> Result<()> {

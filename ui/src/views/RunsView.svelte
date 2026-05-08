@@ -22,6 +22,7 @@
   let statusFilter = $derived(router.query.get("status"));
   let pipelineFilter = $derived(router.query.get("pipeline"));
   let repoFilter = $derived(router.query.get("repo"));
+  let userFilter = $derived(router.query.get("user"));
 
   let allRuns = $derived(store.runs.data ?? []);
   let isLoading = $derived(store.runs.loading && allRuns.length === 0);
@@ -30,6 +31,7 @@
       if (statusFilter && statusGroup(r.status) !== statusFilter) return false;
       if (pipelineFilter && r.pipeline_id !== pipelineFilter) return false;
       if (repoFilter && r.repo !== repoFilter) return false;
+      if (userFilter && (r.submitted_by ?? "") !== userFilter) return false;
       return true;
     });
   });
@@ -46,6 +48,14 @@
     return [...set].sort();
   });
 
+  let users = $derived.by(() => {
+    const set = new Set<string>();
+    for (const r of allRuns) {
+      if (r.submitted_by) set.add(r.submitted_by);
+    }
+    return [...set].sort();
+  });
+
   let statusChips = $derived<ChipDef[]>([
     { key: null, label: "All", count: allRuns.length, always: true },
     { key: "running", label: "Running", count: counts.running, dot: "running" },
@@ -58,6 +68,13 @@
       key: r,
       label: r,
       count: allRuns.filter((run) => run.repo === r).length,
+    })),
+  );
+  let userChips = $derived<ChipDef[]>(
+    users.map((u) => ({
+      key: u,
+      label: u,
+      count: allRuns.filter((run) => run.submitted_by === u).length,
     })),
   );
 
@@ -107,6 +124,7 @@
     void statusFilter;
     void repoFilter;
     void pipelineFilter;
+    void userFilter;
     cursor = 0;
   });
   $effect(() => {
@@ -140,6 +158,9 @@
     <FilterChips chips={statusChips} active={statusFilter} onSelect={(k) => setFilter("status", k)} />
     {#if repos.length > 1}
       <FilterChips label="repo" chips={repoChips} active={repoFilter} onSelect={(k) => setFilter("repo", k)} />
+    {/if}
+    {#if users.length > 1}
+      <FilterChips label="user" chips={userChips} active={userFilter} onSelect={(k) => setFilter("user", k)} />
     {/if}
   </FilterBar>
 
@@ -231,6 +252,9 @@
             >{r.recipe_name}</button>
             {#if r.stage_name}
               <span class="stage" title="pipeline stage">/ {r.stage_name}</span>
+            {/if}
+            {#if r.submitted_by && users.length > 1 && !userFilter}
+              <span class="user" title={`Submitted by ${r.submitted_by}`}>{r.submitted_by}</span>
             {/if}
             {#if r.repo && repos.length > 1 && !repoFilter}
               <span class="repo">{r.repo}</span>
@@ -394,6 +418,22 @@
     padding: 1px 5px;
     border: 1px solid theme("colors.line.1");
     border-radius: 3px;
+  }
+  /* The user badge sits to the right of the recipe name. When the repo
+   * badge is also present (multi-repo deployments), only the first
+   * margin-left:auto sibling pushes to the far right; the user badge
+   * sits adjacent to it without competing for the auto-margin. */
+  .recipe .user {
+    font-family: theme("fontFamily.mono");
+    font-size: 11px;
+    color: theme("colors.fg.2");
+    margin-left: auto;
+    flex-shrink: 0;
+  }
+  /* When both badges are present, the repo gets the auto-margin and the
+   * user just sits next to it. */
+  .recipe .user + .repo {
+    margin-left: 6px;
   }
   .id { font-family: theme("fontFamily.mono"); }
   .hist { display: flex; align-items: center; }

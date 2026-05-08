@@ -1,7 +1,9 @@
-//! Read-only HTTP API + embedded SPA. Behind the `ui` feature.
+//! HTTP API + embedded SPA. Behind the `ui` feature.
 //!
-//! Single-user deploy: we expect this to bind 127.0.0.1 on a login node and
-//! be reached over an SSH tunnel. No auth, no write paths.
+//! The daemon is the **single writer** to the registry — `labctl run` and
+//! `labctl run-pipeline` POST here by default; admin commands still write
+//! directly. We expect this to bind 127.0.0.1 on a login node and be reached
+//! over an SSH tunnel. No auth today; access control is "who can SSH in."
 
 use std::{
     convert::Infallible,
@@ -30,7 +32,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
 
 use crate::{
-    config::ClusterConfig,
+    config::{ClusterConfig, LoadedPipeline, Recipe},
+    runner,
     store::{ArtifactRow, RunRow, Store, is_terminal},
 };
 
@@ -74,7 +77,8 @@ pub fn serve(
     };
 
     let api = Router::new()
-        .route("/runs", get(list_runs))
+        .route("/runs", get(list_runs).post(submit_run))
+        .route("/pipelines", get(list_pipelines).post(submit_pipeline))
         .route("/runs/:id", get(get_run))
         .route("/runs/:id/log", get(get_run_log))
         .route("/runs/:id/events", get(get_run_events))
@@ -83,7 +87,6 @@ pub fn serve(
         // Top-level so it doesn't collide with the /runs/:id route — matchit
         // disallows static + dynamic siblings on the same prefix.
         .route("/compare", get(compare_runs))
-        .route("/pipelines", get(list_pipelines))
         .route("/pipelines/:id", get(get_pipeline))
         .route("/artifacts", get(list_artifacts))
         .route("/artifacts/:id", get(get_artifact))
@@ -261,6 +264,7 @@ fn run_summary(r: &RunRow) -> Value {
         "duration_secs": r.finished_at.map(|f| f.saturating_sub(r.created_at)),
         "pipeline_id": r.pipeline_id,
         "stage_name": r.stage_name,
+        "submitted_by": r.submitted_by,
         "is_terminal": is_terminal(&r.status),
     })
 }
@@ -298,6 +302,45 @@ async fn list_runs(State(state): State<AppState>) -> Result<axum::Json<Value>, A
     let store = state.store.lock().unwrap();
     let runs: Vec<Value> = store.list_runs()?.iter().map(run_summary).collect();
     Ok(axum::Json(json!({ "runs": runs })))
+}
+
+/// Submit a single recipe. Body: a fully-parsed ``Recipe`` JSON. The CLI
+/// parses the user's TOML so the daemon doesn't need read access to the
+/// user's filesystem; the daemon owns the registry write and the sbatch
+/// invocation.
+async fn submit_run(
+    State(state): State<AppState>,
+    axum::Json(recipe): axum::Json<Recipe>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let mut store = state.store.lock().unwrap();
+    let submitted = runner::submit_recipe(&state.cluster, &mut store, &recipe, None)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(axum::Json(json!({
+        "run_id": submitted.run_id,
+        "job_id": submitted.job_id,
+        "run_dir": submitted.run_dir.display().to_string(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitPipelineBody {
+    pipeline: LoadedPipeline,
+    /// Optional path the CLI loaded the pipeline from. Recorded in the
+    /// registry for provenance. The daemon does not read it.
+    pipeline_path: Option<String>,
+}
+
+async fn submit_pipeline(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<SubmitPipelineBody>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let mut store = state.store.lock().unwrap();
+    let path = body.pipeline_path.as_deref().map(std::path::Path::new);
+    let submitted = runner::submit_pipeline(&state.cluster, &mut store, &body.pipeline, path)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let body = serde_json::to_value(&submitted)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(axum::Json(body))
 }
 
 async fn get_run(
