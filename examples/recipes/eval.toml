@@ -1,0 +1,31 @@
+# Evaluation recipe. Takes a checkpoint artifact as input and emits
+# an eval_result artifact. Pair with examples/policies/
+# eval_per_checkpoint.toml to auto-dispatch this recipe whenever a
+# new checkpoint from a training run is registered.
+
+name    = "eval_example"
+repo    = "myrepo"
+command = [
+  "python", "scripts/eval.py",
+  "--checkpoint", "{inputs.checkpoint.path}",
+  "--out", "{outputs.result.dir}",
+]
+
+[resources]
+gpus = 1
+cpus = 4
+mem  = "16GB"
+time = "00:30:00"
+
+[inputs.checkpoint]
+# Resolved at submit time. The artifact id is whichever artifact the
+# eval policy points at (typically a freshly-emitted checkpoint).
+# For manual invocation: `labctl run eval.toml` requires the alias
+# below to exist; use `labctl evald once` for policy-driven dispatch.
+type     = "artifact"
+artifact = "train_LATEST"
+
+[outputs.result]
+type   = "eval_result"
+marker = "metrics.json"
+alias  = "eval_{inputs.checkpoint.alias}"

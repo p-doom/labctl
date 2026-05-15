@@ -1,0 +1,30 @@
+# Minimal training recipe. Submits one SLURM job that:
+#   - checks out `repo` at HEAD into <run_dir>/source/<repo>/
+#   - runs `command` with $LABCTL_RUN_DIR pointing at the run dir
+#   - on success, picks up the marker file at the output path and
+#     registers it as a `checkpoint` artifact bound to alias
+#     "train_{run.id}"
+#
+# See docs/RECIPE_CONTRACT.md for the full contract.
+
+name    = "train_example"
+repo    = "myrepo"
+command = ["python", "scripts/train.py", "--out", "{outputs.checkpoint.dir}"]
+
+[resources]
+gpus = 1
+cpus = 8
+mem  = "32GB"
+time = "04:00:00"
+
+[outputs.checkpoint]
+type   = "checkpoint_stream"
+# Marker is a path relative to the output dir; labctl waits for
+# this file to appear before registering each step. For a stream,
+# this is the marker emitted at every step subdir
+# (e.g. orbax's `<step>/manifest.ocdbt`).
+marker = "manifest.ocdbt"
+# Required. Templated against {run.id}, {run.dir}, {params.X},
+# {inputs.Y.path}. Rendered alias becomes the directory name under
+# cluster.filesystem.output_roots[checkpoint_stream]/<user>/.
+alias  = "train_{run.id}"

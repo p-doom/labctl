@@ -1,0 +1,61 @@
+# Multi-tenant cluster.toml. Same shape as single-user but with the
+# extras a shared-registry rollout needs:
+#   - `runs_base` lives on a group-readable, sgid'd directory tree
+#     (see docs/ONBOARDING.md §6 for the chgrp/chmod/setfacl recipe)
+#   - `[dispatch]` block enabled so every user's agent runs the
+#     reconcile + evald + throttle loops scoped to their own subtree
+#   - `[dispatch.throttle]` caps concurrent eval jobs per-user
+#
+# The actual filesystem permission setup (sgid, default ACLs, umask
+# 002) is OS-level — `labctl doctor` probes group propagation and
+# fails loudly if it's not applied. See docs/ONBOARDING.md §6.
+
+name = "example-shared"
+
+[filesystem]
+# Must be writable by every member of the lab group, with sgid set
+# on the dir so new subdirs inherit the group. Verify with
+# `labctl --cluster this.toml doctor`.
+runs_base = "/path/to/shared/labctl_runs"
+
+[filesystem.artifact_roots]
+dataset     = "/path/to/shared/datasets"
+checkpoint  = "/path/to/shared/checkpoints"
+eval_result = "/path/to/shared/eval_logs"
+
+[filesystem.output_roots]
+checkpoint_stream = "/path/to/shared/checkpoints"
+eval_result       = "/path/to/shared/eval_logs"
+
+[repos]
+# In a multi-tenant rollout, every recipe's `repo = "<name>"` path
+# must be readable by every teammate's uid, not just the original
+# author's. The safe pattern: clone canonical recipe repos under a
+# group-readable project directory. `labctl doctor` walks each path
+# verifying group traversability up to /.
+shared_repo = "/path/to/project/repos/shared_repo"
+
+[scheduler]
+kind = "slurm"
+
+[slurm]
+qos = "low"
+gres_gpu_syntax = "gpu:{n}"
+
+# Per-user agent loops. `labctl agent` (installed as a systemd user
+# unit per teammate via `labctl service install --agent`) reads
+# this block and reconciles only the invoking user's runs.
+[dispatch]
+reconcile_interval_secs = 60
+evald_interval_secs     = 300
+# Path to a directory of *.toml eval policies, relative to this
+# cluster file's parent dir (or absolute). See ../policies/ for an
+# example policy.
+policies_dir            = "../policies"
+
+# Cap concurrent eval jobs of the named recipe across the user's
+# SLURM queue. Excess pending jobs are held via `scontrol update
+# Hold=yes` and released as running slots free up.
+[dispatch.throttle]
+job_name       = "my_eval_recipe"
+max_concurrent = 16

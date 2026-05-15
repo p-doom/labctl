@@ -1,0 +1,87 @@
+name = "berlin"
+
+[filesystem]
+# Filesystem-truth registry root. Hosts runs/<user>/<run_id>/,
+# aliases/<name>/, eval_state/<user>/<key>/, pipelines/<user>/<id>/,
+# and events/<YYYYMMDD>.jsonl. The legacy registry.db has been
+# migrated and renamed to registry.db.legacy.bak.
+runs_base = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/labctl_runs"
+
+# Artifact kinds and their root paths — the kinds that exist as rows in
+# the `artifacts` table. `insert_artifact` validates that an artifact's
+# path is under `artifact_roots[kind]/<user>/<alias>` and the indexer
+# walks each unique root to populate the cache.
+[filesystem.artifact_roots]
+dataset     = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/datasets"
+checkpoint  = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/checkpoints"
+eval_result = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/eval_logs"
+# ``environment`` is a reproducible-runtime artifact — a tree containing a
+# pre-built venv plus the source clones (slime, Megatron-LM, sglang, apex)
+# the venv editable-installs from. Consumed by OPD-train recipes via
+# ``inputs.env type = "artifact"``. Built by opd-slime's
+# ``scripts/build_slime_venv.sh`` once per slime SHA combination.
+environment = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/environments"
+
+# Recipe-output resolution kinds and their root paths — looked up by the
+# `type =` field in a recipe's `[outputs.X]`. Two flavors live here:
+#
+#   1. Dual-use kinds (`dataset`, `eval_result`) that are also artifact
+#      kinds. The same path appears in both maps because each recipe
+#      output of this type both writes to the path AND gets registered
+#      as an artifact with that kind.
+#   2. Pure resolution kinds (`checkpoint_stream`) that describe walking
+#      behavior, never appear in the artifacts table, and would otherwise
+#      pollute the artifact-kind namespace if they lived in
+#      `[artifact_roots]`. `register_outputs` walks a `checkpoint_stream`
+#      output's tree and registers each step subdir as a `checkpoint`
+#      artifact (registered via the dedicated `checkpoint` artifact_root).
+#
+# Every value listed under `[outputs.X] type = ...` in any recipe must
+# have a corresponding entry here, otherwise submission errors out at
+# `output_paths` lookup time.
+[filesystem.output_roots]
+dataset           = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/datasets"
+checkpoint_stream = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/checkpoints"
+eval_result       = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/eval_logs"
+# Dual-use kind: env-build recipes write outputs of `type = "environment"`
+# to this root, and the resulting tree gets registered as an `environment`
+# artifact (single-marker, like dataset/eval_result — not a walking stream).
+environment       = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/environments"
+
+[repos]
+omegalax      = "/fast/home/franz.srambical/omegalax"
+data_pipeline = "/fast/home/franz.srambical/data_pipeline"
+eval          = "/fast/home/franz.srambical/eval"
+opd-slime     = "/fast/home/franz.srambical/opd-slime"
+
+[scheduler]
+kind = "slurm"
+
+[slurm]
+qos = "low"
+gres_gpu_syntax = "gpu:{n}"
+
+[env]
+HF_HOME      = "/fast/project/HFMI_SynergyUnit/p-doom_shared/huggingface"
+UV_CACHE_DIR = "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/uv_cache"
+# Explicit PATH so recipes can find user-installed CLIs (uv, etc.) under
+# ~/.local/bin. Slurm batch scripts run as non-interactive bash and don't
+# source ~/.bashrc, and the systemd-managed labctl serve has empty
+# Environment=, so without this jobs inherit only /usr/local/bin:/usr/bin
+# and ``uv run ...`` exits 127. ``/usr/local/cuda-12/bin`` covers nvcc
+# for recipes that need it (e.g. tvm_ffi inside roundtrip_ifeval).
+PATH         = "/home/franz.srambical/.local/bin:/usr/local/cuda-12/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin"
+
+# Per-user agent loops. `labctl agent` (run as a systemd user unit via
+# `labctl service install`) reads this block and runs reconcile + evald +
+# throttle as the invoking user. Eval submissions go through the same
+# all-CLI path as `labctl run`, so eval jobs are owned by the agent's
+# user in SLURM.
+[dispatch]
+reconcile_interval_secs = 60
+evald_interval_secs = 300
+policies_dir = "policies"
+
+[dispatch.throttle]
+job_name = "roundtrip_ifeval_qwen3vl2b"
+max_concurrent = 16

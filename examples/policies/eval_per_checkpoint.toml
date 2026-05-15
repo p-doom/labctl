@@ -1,0 +1,25 @@
+# Eval policy: dispatch an eval recipe whenever a new checkpoint
+# artifact is registered by a producer recipe.
+#
+# `labctl agent` walks cluster.dispatch.policies_dir at every
+# evald_interval_secs tick, evaluates each policy against the
+# current registry state, and submits eval recipes for any
+# (checkpoint, eval_recipe_hash) pair that hasn't already been
+# enqueued. Deduped via eval_state/<user>/<key>/.
+
+name   = "eval_per_checkpoint"
+# Path to the eval recipe; relative paths resolve against this
+# policy file's parent dir.
+recipe = "../recipes/eval.toml"
+
+[applies_to]
+# Trigger on every artifact of this kind...
+type            = "checkpoint"
+# ...that was produced by THIS recipe (by name). Omit to apply to
+# all checkpoints regardless of producer.
+producer_recipe = "train_example"
+
+[cadence]
+# Submit one eval per N steps of the checkpoint stream. 1 = every
+# checkpoint. Omit to evaluate every emitted checkpoint.
+every_n_steps = 1

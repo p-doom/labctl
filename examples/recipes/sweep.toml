@@ -1,0 +1,41 @@
+# Sweep recipe. `labctl run-sweep <this>` submits ONE SLURM array
+# job covering the inclusive range [start, end]. Each task is a
+# normal labctl run with full provenance; the swept arg is injected
+# at runtime from $SLURM_ARRAY_TASK_ID.
+#
+# If [sweep].aggregate is set, a second job is submitted with
+# --dependency=afterok:<array_job_id> so it runs once after every
+# array task succeeds.
+
+name    = "sweep_example"
+repo    = "myrepo"
+command = ["python", "scripts/train.py", "--lr-index", "{args.lr_index}"]
+
+[args]
+# The value below is the default for `labctl run`; for `run-sweep`,
+# it's overridden per-task with $SLURM_ARRAY_TASK_ID (offset by
+# [sweep].start).
+lr_index = "0"
+
+[resources]
+gpus = 1
+cpus = 4
+mem  = "16GB"
+time = "01:00:00"
+
+[outputs.checkpoint]
+type   = "checkpoint_stream"
+marker = "manifest.ocdbt"
+alias  = "sweep_{run.id}_lr{args.lr_index}"
+
+[sweep]
+# The [args] key whose value is replaced per array task.
+arg      = "lr_index"
+start    = 0
+end      = 7
+# Cap concurrent tasks (SLURM `%N`). Omit for unlimited.
+throttle = 4
+# Optional. After all array tasks succeed, this aggregate recipe
+# runs with --dependency=afterok:<array_job_id>. Path is relative
+# to this file or absolute.
+# aggregate = "aggregate.toml"

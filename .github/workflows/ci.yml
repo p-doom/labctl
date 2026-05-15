@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel an in-flight run on the same ref when a new push lands. Saves
+# minutes on PR push-storms without affecting main protections.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build frontend
+        run: |
+          cd ui
+          npm ci
+          npm run build
+
+      - name: Cargo check (default features)
+        run: cargo check --all-targets
+
+      - name: Cargo build (release, with UI feature)
+        run: cargo build --release --features ui
+
+      - name: Cargo test
+        run: cargo test --all-features
+
+      - name: Validate all example configs
+        run: |
+          set -euo pipefail
+          for f in examples/clusters/*.toml examples/recipes/*.toml examples/policies/*.toml; do
+            echo "validating $f"
+            ./target/release/labctl validate "$f"
+          done
+          # The repo-root cluster.berlin.toml is operational config —
+          # its [dispatch].policies_dir resolves to a directory that
+          # only exists in the SLURM-repo location it actually runs
+          # from. Skip the local validate; schema drift fails the
+          # examples above first.

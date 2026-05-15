@@ -1,0 +1,56 @@
+# Single-user cluster.toml. Copy this, edit the absolute paths, point
+# labctl at it with --cluster. Suitable for a solo developer on a
+# shared SLURM cluster where no one else needs to read your runs.
+#
+# See examples/clusters/multi-tenant.toml for a group-sharing setup
+# and examples/clusters/with-remote.toml for a cluster you want to
+# import artifacts FROM.
+
+name = "example"
+
+[filesystem]
+# Filesystem-truth registry root. Hosts:
+#   runs/<user>/<run_id>/        per-run sidecars + source snapshot
+#   aliases/<name>/.target.json  global alias namespace
+#   eval_state/<user>/<key>/     per-user eval dedup
+#   pipelines/<user>/<id>/
+#   events/<YYYYMMDD>.jsonl      append-only event log
+runs_base = "/path/to/your/labctl_runs"
+
+# Artifact kinds and their root paths. Each kind appears as a row
+# kind in the `artifacts` table. `insert_artifact` validates that an
+# artifact path is under artifact_roots[kind]/<user>/<alias>.
+[filesystem.artifact_roots]
+dataset     = "/path/to/your/datasets"
+checkpoint  = "/path/to/your/checkpoints"
+eval_result = "/path/to/your/eval_logs"
+
+# Recipe-output resolution kinds. Looked up by [outputs.X] type =
+# "..." in a recipe. Distinct namespace from artifact_roots — a
+# `checkpoint_stream` output walks a directory and registers each
+# step subdir as a `checkpoint` artifact under the same physical
+# root.
+[filesystem.output_roots]
+checkpoint_stream = "/path/to/your/checkpoints"
+eval_result       = "/path/to/your/eval_logs"
+
+[repos]
+# Logical name (referenced by recipe.repo) → on-disk path.
+# Replace with the repos you'll submit recipes from.
+myrepo = "/path/to/your/repo"
+
+[scheduler]
+kind = "slurm"
+
+[slurm]
+# Adjust to your site. Run `sinfo` and `scontrol show partition` to
+# discover the valid values. `labctl init` (when run on a SLURM
+# host) can fill these in automatically.
+qos = "low"
+gres_gpu_syntax = "gpu:{n}"
+
+# Optional. Without [dispatch], `labctl agent` is a no-op.
+# [dispatch]
+# reconcile_interval_secs = 60
+# evald_interval_secs = 300
+# policies_dir = "policies"

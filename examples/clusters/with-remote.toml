@@ -1,0 +1,60 @@
+# Cluster.toml with a [remote] section, for clusters you want to
+# import artifacts FROM. The [remote] block is consumed only when
+# this file is loaded as a *foreign* cluster (the `--foreign` arg to
+# `labctl import-from-cluster`, or the reachability check in
+# `labctl doctor`). When this file is the current cluster, the
+# section is ignored.
+#
+# Treat cluster.<name>.toml as the cluster's complete identity card:
+# filesystem + scheduler + reachability. Commit it to git and share
+# across the team — anyone with the file can target this cluster.
+
+name = "example-remote"
+
+# How OTHER clusters reach this one. SSH-protocol-agnostic: labctl
+# invokes `ssh <target>` and trusts your ~/.ssh/config for the rest
+# (ControlMaster, ProxyJump, OTP multiplex, etc.).
+[remote]
+# Recommended: a ~/.ssh/config alias. Putting host details there
+# (plus ControlMaster, ProxyJump, etc.) gives labctl one stable
+# handle and the rest of your shell the same.
+ssh_alias = "example-login"
+
+# Fallback for hosts that don't need anything fancy:
+# host     = "example.cluster.org"
+# ssh_user = "yourusername"
+
+[filesystem]
+runs_base = "/scratch/yourusername/labctl_runs"
+
+[filesystem.artifact_roots]
+dataset     = "/scratch/yourusername/datasets"
+checkpoint  = "/scratch/yourusername/checkpoints"
+eval_result = "/scratch/yourusername/eval_logs"
+
+[filesystem.output_roots]
+checkpoint_stream = "/scratch/yourusername/checkpoints"
+eval_result       = "/scratch/yourusername/eval_logs"
+
+[repos]
+myrepo = "/home/yourusername/repos/myrepo"
+
+[scheduler]
+kind = "slurm"
+
+[slurm]
+qos = "normal"
+gres_gpu_syntax = "gpu:{n}"
+
+# Suggested ~/.ssh/config entry for an OTP-gated host with
+# ControlMaster (one OTP per session lifetime, not per labctl op):
+#
+#   Host example-login
+#       HostName        example.cluster.org
+#       User            yourusername
+#       ControlMaster   auto
+#       ControlPath     ~/.ssh/cm-%r@%h:%p
+#       ControlPersist  8h
+#
+# First `ssh example-login true` prompts; subsequent labctl ops
+# (import-from-cluster, doctor) reuse the multiplex socket silently.
