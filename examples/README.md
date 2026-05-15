@@ -15,8 +15,9 @@ fails CI if one drifts.
   `labctl import-from-cluster` invocation.
 
 Pick the closest match, copy it, edit the paths. Or, on a new
-cluster, use [`labctl init`](../docs/INIT.md) (with `--from
-examples/clusters/<x>.toml`) to get an auto-edited copy.
+cluster, use `labctl init` (with `--from examples/clusters/<x>.toml`)
+to get an auto-edited copy — see
+[`docs/ONBOARDING.md`](../docs/ONBOARDING.md) §2.
 
 ## recipes/
 
