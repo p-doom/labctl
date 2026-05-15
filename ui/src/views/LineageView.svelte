@@ -15,7 +15,7 @@
 
   import ArtifactNode from "../components/ArtifactNode.svelte";
   import RunDagNode from "../components/RunDagNode.svelte";
-  import Icon from "../components/Icon.svelte";
+  import DetailHeader from "../components/DetailHeader.svelte";
 
   interface Props {
     artifactId: string;
@@ -238,26 +238,23 @@
 </script>
 
 <div class="lineage" data-highlighting={highlightAttr}>
-  <header>
-    <button type="button" class="back" onclick={close} aria-label="Back to artifact">
-      <Icon name="back" size={14} />
-      <span>Artifact</span>
-    </button>
-    <div class="title">
-      <span class="t-label mono">lineage</span>
-      <span class="t-name mono">{focalLabel}</span>
-      {#if focalArtifact}
-        <span class="t-kind">{focalArtifact.kind}</span>
-      {/if}
-    </div>
-    <div class="hops" role="group" aria-label="Hop limit">
-      <span class="h-label mono">hops</span>
-      <button type="button" class:active={hopLimit === 1} onclick={() => setHopLimit(1)}>1</button>
-      <button type="button" class:active={hopLimit === 3} onclick={() => setHopLimit(3)}>3</button>
-      <button type="button" class:active={hopLimit === 5} onclick={() => setHopLimit(5)}>5</button>
-      <button type="button" class:active={hopLimit === null} onclick={() => setHopLimit(null)}>all</button>
-    </div>
-  </header>
+  <DetailHeader
+    label="lineage"
+    name={focalLabel}
+    meta={focalArtifact?.kind}
+    backLabel="Artifact"
+    onBack={close}
+  >
+    {#snippet actions()}
+      <div class="hops" role="group" aria-label="Hop limit">
+        <span class="h-label mono">hops</span>
+        <button type="button" class:active={hopLimit === 1} onclick={() => setHopLimit(1)}>1</button>
+        <button type="button" class:active={hopLimit === 3} onclick={() => setHopLimit(3)}>3</button>
+        <button type="button" class:active={hopLimit === 5} onclick={() => setHopLimit(5)}>5</button>
+        <button type="button" class:active={hopLimit === null} onclick={() => setHopLimit(null)}>all</button>
+      </div>
+    {/snippet}
+  </DetailHeader>
 
   {#if error}
     <div class="error">{error}</div>
@@ -310,80 +307,23 @@
     display: flex;
     flex-direction: column;
     height: 100%;
-    background: theme("colors.bg.0");
+    background: var(--bg-0);
     overflow: hidden;
-    --edge-off: theme("colors.line.2");
-    --edge-on: theme("colors.accent.dim");
-  }
-  header {
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    align-items: center;
-    gap: 16px;
-    padding: 10px 16px;
-    border-bottom: 1px solid theme("colors.line.0");
-    background: theme("colors.bg.0");
-    flex-shrink: 0;
-  }
-  .back {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 10px 4px 8px;
-    background: transparent;
-    border: 1px solid theme("colors.line.1");
-    border-radius: 4px;
-    color: theme("colors.fg.1");
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .back:hover {
-    background: theme("colors.bg.2");
-    color: theme("colors.fg.0");
-    border-color: theme("colors.line.2");
-  }
-  .title {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    overflow: hidden;
-  }
-  .t-label {
-    font-size: 10px;
-    color: theme("colors.fg.3");
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-  }
-  .t-name {
-    font-size: 14px;
-    color: theme("colors.fg.0");
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .t-kind {
-    font-family: theme("fontFamily.mono");
-    font-size: 10px;
-    color: theme("colors.accent.dim");
-    background: theme("colors.accent.soft");
-    padding: 2px 6px;
-    border-radius: 3px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    flex-shrink: 0;
+    --edge-off: var(--line-2);
+    --edge-on: var(--accent-dim);
   }
   .hops {
     display: inline-flex;
     align-items: center;
     gap: 2px;
     padding: 2px;
-    background: theme("colors.bg.1");
-    border: 1px solid theme("colors.line.1");
+    background: var(--bg-1);
+    border: 1px solid var(--line-1);
     border-radius: 4px;
   }
   .hops .h-label {
     font-size: 10px;
-    color: theme("colors.fg.3");
+    color: var(--fg-3);
     letter-spacing: 0.05em;
     text-transform: uppercase;
     padding: 0 6px;
@@ -391,17 +331,17 @@
   .hops button {
     background: transparent;
     border: none;
-    color: theme("colors.fg.1");
+    color: var(--fg-1);
     font-family: theme("fontFamily.mono");
     font-size: 11px;
     padding: 3px 9px;
     border-radius: 3px;
     cursor: pointer;
   }
-  .hops button:hover { color: theme("colors.fg.0"); }
+  .hops button:hover { color: var(--fg-0); }
   .hops button.active {
-    background: theme("colors.bg.3");
-    color: theme("colors.fg.0");
+    background: var(--bg-3);
+    color: var(--fg-0);
   }
 
   .canvas {

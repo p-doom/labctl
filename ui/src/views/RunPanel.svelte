@@ -14,6 +14,7 @@
   import CodeBlock from "../components/CodeBlock.svelte";
   import Result from "../components/Result.svelte";
   import EvalSeriesCard from "../components/EvalSeriesCard.svelte";
+  import MetaRow from "../components/MetaRow.svelte";
 
   interface Props {
     runId: string;
@@ -46,10 +47,11 @@
   /** Eval-result artifact among this run's outputs, if any. The server
    *  inlines `metadata.result` on eval_result outputs so we don't need
    *  a follow-up fetch. Surfaced prominently above the log. */
-  let evalResult = $derived.by<unknown>(() => {
+  let evalOutput = $derived.by(() => {
     const out = detail?.outputs.find((o) => o.kind === "eval_result");
-    return (out as { result?: unknown } | undefined)?.result ?? null;
+    return out as (typeof out & { result?: unknown }) | undefined;
   });
+  let evalResult = $derived<unknown>(evalOutput?.result ?? null);
   let recipeToml = $derived.by(() => {
     if (!detail) return "";
     return tomlSerialize(detail.run.recipe as Record<string, unknown>);
@@ -129,7 +131,7 @@
       <button
         type="button"
         class="iconbtn"
-        onclick={() => copy(detail!.run.id)}
+        onclick={() => copy(detail.run.id)}
         aria-label="Copy run id"
         title="Copy run id"
       >
@@ -151,49 +153,29 @@
   {:else if detail}
     {@const r = detail.run}
     <section class="meta">
-      <div class="meta-row">
-        <span class="k">id</span>
-        <span class="v"><Hash value={r.id} n={20} /></span>
-      </div>
+      <MetaRow label="id"><Hash value={r.id} n={20} /></MetaRow>
       {#if r.job_id}
-        <div class="meta-row">
-          <span class="k">job</span>
-          <span class="v"><Hash value={r.job_id} n={16} label="job id" /></span>
-        </div>
+        <MetaRow label="job"><Hash value={r.job_id} n={16} label="job id" /></MetaRow>
       {/if}
-      <div class="meta-row">
-        <span class="k">recipe hash</span>
-        <span class="v"><Hash value={r.recipe_hash} n={12} /></span>
-      </div>
-      <div class="meta-row">
-        <span class="k">repo</span>
-        <span class="v mono">{r.repo}</span>
-      </div>
-      <div class="meta-row">
-        <span class="k">started</span>
-        <span class="v"><RelativeTime ts={r.created_at} /></span>
-      </div>
-      <div class="meta-row">
-        <span class="k">duration</span>
-        <span class="v"><Duration run={r} /></span>
-      </div>
+      <MetaRow label="recipe hash"><Hash value={r.recipe_hash} n={12} /></MetaRow>
+      <MetaRow label="repo">
+        <span class="mono">{r.repo}</span>
+      </MetaRow>
+      <MetaRow label="started"><RelativeTime ts={r.created_at} /></MetaRow>
+      <MetaRow label="duration"><Duration run={r} /></MetaRow>
       {#if r.finished_at}
-        <div class="meta-row">
-          <span class="k">finished</span>
-          <span class="v" title={formatAbsolute(r.finished_at)}>
+        <MetaRow label="finished">
+          <span title={formatAbsolute(r.finished_at)}>
             <RelativeTime ts={r.finished_at} />
           </span>
-        </div>
+        </MetaRow>
       {/if}
-      <div class="meta-row">
-        <span class="k">run dir</span>
-        <span class="v mono path" title={r.run_dir}>{r.run_dir}</span>
-      </div>
+      <MetaRow label="run dir" path={r.run_dir} />
     </section>
 
     <div class="action-row">
       {#if wandb}
-        <a class="primary" href={wandb.url} target="_blank" rel="noopener" title={`${wandb.entity}/${wandb.project}`}>
+        <a class="btn-secondary" href={wandb.url} target="_blank" rel="noopener" title={`${wandb.entity}/${wandb.project}`}>
           <span>Open in W&amp;B</span>
           <Icon name="external" size={12} />
         </a>
@@ -201,7 +183,7 @@
       {#if r.pipeline_id}
         <button
           type="button"
-          class="secondary"
+          class="btn-secondary"
           onclick={() => router.go("pipelines", r.pipeline_id)}
         >
           <span>View pipeline</span>
@@ -210,7 +192,7 @@
       {/if}
       <button
         type="button"
-        class="secondary"
+        class="btn-secondary"
         onclick={() => router.go("recipes", r.recipe_name)}
         title={`All runs of ${r.recipe_name}`}
       >
@@ -219,8 +201,8 @@
       </button>
       <button
         type="button"
-        class="secondary"
-        class:active={compareSelection.has(r.id)}
+        class="btn-secondary"
+        data-state={compareSelection.has(r.id) ? "active" : undefined}
         onclick={() => compareSelection.toggle(r.id)}
         title={compareSelection.has(r.id)
           ? "Remove from comparison"
@@ -332,7 +314,7 @@
         <header class="block-h">
           <h3>Result</h3>
         </header>
-        <Result result={evalResult} />
+        <Result result={evalResult} artifactId={evalOutput?.id} />
       </section>
     {/if}
 
@@ -401,80 +383,23 @@
     font-size: 13px;
   }
 
-  .loading { padding: 24px 18px; }
-  .error { padding: 24px 18px; color: theme("colors.status.failed.fg"); font-size: 13px; }
+  .loading { padding: 24px 16px; }
+  .error { padding: 24px 16px; color: theme("colors.status.failed.fg"); font-size: 13px; }
 
   .meta {
-    padding: 14px 18px 6px 18px;
-  }
-  .meta-row {
-    display: grid;
-    grid-template-columns: 110px 1fr;
-    align-items: baseline;
-    padding: 4px 0;
-    font-size: 13px;
-  }
-  .meta-row .k {
-    font-family: theme("fontFamily.mono");
-    font-size: 11px;
-    color: theme("colors.fg.3");
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-  .meta-row .v.mono {
-    font-family: theme("fontFamily.mono");
-    font-size: 12px;
-    color: theme("colors.fg.1");
-  }
-  .meta-row .v.path {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    padding: 12px 16px 4px 16px;
   }
 
   .action-row {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
-    padding: 10px 18px 14px 18px;
-    border-bottom: 1px solid theme("colors.line.0");
-  }
-  .primary, .secondary {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    padding: 5px 10px;
-    border-radius: 4px;
-    cursor: pointer;
-    text-decoration: none;
-  }
-  .primary {
-    background: theme("colors.accent.soft");
-    color: theme("colors.accent.dim");
-    border: 1px solid theme("colors.accent.soft");
-  }
-  .primary:hover {
-    background: rgba(189, 242, 109, 0.18);
-    border-color: theme("colors.accent.dim");
-    color: theme("colors.accent.DEFAULT");
-  }
-  .secondary {
-    background: transparent;
-    color: theme("colors.fg.1");
-    border: 1px solid theme("colors.line.1");
-  }
-  .secondary:hover {
-    color: theme("colors.fg.0");
-    border-color: theme("colors.line.2");
-  }
-  .secondary.active {
-    background: theme("colors.accent.soft");
-    color: theme("colors.accent.dim");
-    border-color: theme("colors.accent.dim");
+    padding: 8px 16px 12px 16px;
+    border-bottom: 1px solid var(--line-0);
   }
 
   .block {
-    padding: 16px 18px;
+    padding: 16px;
     border-top: 1px solid theme("colors.line.0");
   }
   .block-h {
@@ -485,11 +410,9 @@
     margin: 0 0 10px 0;
   }
   .block-h h3 {
-    font-size: 11px;
-    font-family: theme("fontFamily.mono");
-    color: theme("colors.fg.3");
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    font-size: 12px;
+    font-weight: 500;
+    color: theme("colors.fg.1");
     margin: 0;
   }
   .block-h .src {
@@ -606,7 +529,7 @@
     margin: 0;
     padding: 10px 12px;
     font-family: theme("fontFamily.mono");
-    font-size: 11.5px;
+    font-size: 12px;
     line-height: 1.5;
     color: theme("colors.fg.1");
     max-height: 360px;
@@ -624,7 +547,7 @@
     grid-template-columns: 100px 1fr;
     gap: 10px;
     padding: 4px 0;
-    border-bottom: 1px dashed theme("colors.line.0");
+    border-bottom: 1px solid theme("colors.line.0");
     font-size: 12px;
   }
   .ev:last-child { border-bottom: none; }

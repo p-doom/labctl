@@ -7,12 +7,16 @@
   import Hash from "../components/Hash.svelte";
   import FilterBar from "../components/FilterBar.svelte";
   import FilterChips from "../components/FilterChips.svelte";
+  import FilterInput from "../components/FilterInput.svelte";
+  import EmptyState from "../components/EmptyState.svelte";
   import type { ChipDef } from "../lib/filters";
   import PipelineDetail from "./PipelineDetail.svelte";
 
   onMount(() => loadPipelines());
 
   let statusFilter = $derived(router.query.get("status"));
+  let filterText = $state("");
+  let textQuery = $derived(filterText.trim().toLowerCase());
 
   let allPipelines = $derived(store.pipelines.data ?? []);
   let isLoading = $derived(store.pipelines.loading && allPipelines.length === 0);
@@ -27,9 +31,22 @@
     for (const p of allPipelines) c[p.status]++;
     return c;
   });
+  let haystacks = $derived.by(() => {
+    const m = new Map<string, string>();
+    for (const p of allPipelines) m.set(p.id, `${p.name}\n${p.id}`.toLowerCase());
+    return m;
+  });
+
   let filtered = $derived.by(() => {
-    if (!statusFilter) return allPipelines;
-    return allPipelines.filter((p) => p.status === statusFilter);
+    const q = textQuery;
+    const useText = q.length > 0;
+    const useStatus = statusFilter != null;
+    if (!useText && !useStatus) return allPipelines;
+    return allPipelines.filter((p) => {
+      if (useStatus && p.status !== statusFilter) return false;
+      if (useText && !haystacks.get(p.id)!.includes(q)) return false;
+      return true;
+    });
   });
 
   let statusChips = $derived<ChipDef[]>([
@@ -40,14 +57,70 @@
     { key: "mixed", label: "Mixed", count: counts.mixed, dot: "neutral" },
   ]);
 
+  let cursor = $state(0);
+  let filterInputEl = $state<HTMLInputElement | null>(null);
+  let listEl = $state<HTMLDivElement | null>(null);
+  $effect(() => { void statusFilter; void textQuery; cursor = 0; });
+  $effect(() => { if (cursor >= filtered.length) cursor = Math.max(0, filtered.length - 1); });
+
+  function openCursorRow() {
+    const p = filtered[cursor];
+    if (p) router.select("pipelines", p.id);
+  }
+  function onKey(e: KeyboardEvent) {
+    if (router.view !== "pipelines") return;
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      filterInputEl?.focus();
+      filterInputEl?.select();
+      return;
+    }
+    const t = e.target as HTMLElement | null;
+    const inField = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
+    if (e.key === "/" && !inField) {
+      e.preventDefault();
+      filterInputEl?.focus();
+      return;
+    }
+    if (inField) return;
+    if (e.key === "j" || e.key === "ArrowDown") {
+      e.preventDefault();
+      cursor = Math.min(cursor + 1, filtered.length - 1);
+      if (router.selected) router.select("pipelines", filtered[cursor]?.id ?? null);
+    } else if (e.key === "k" || e.key === "ArrowUp") {
+      e.preventDefault();
+      cursor = Math.max(cursor - 1, 0);
+      if (router.selected) router.select("pipelines", filtered[cursor]?.id ?? null);
+    } else if (e.key === "Enter") {
+      openCursorRow();
+    }
+  }
+  $effect(() => {
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+  $effect(() => {
+    const i = cursor;
+    if (!listEl) return;
+    requestAnimationFrame(() => {
+      (listEl!.querySelectorAll<HTMLElement>('.list-row'))[i]?.scrollIntoView({ block: "nearest" });
+    });
+  });
 </script>
 
 <div class="page">
   <FilterBar>
     <FilterChips chips={statusChips} active={statusFilter} onSelect={(k) => router.setQuery({ status: k })} />
+    <FilterInput
+      bind:inputRef={filterInputEl}
+      value={filterText}
+      placeholder="Filter pipelines…"
+      onInput={(v) => (filterText = v)}
+      onEnter={openCursorRow}
+    />
   </FilterBar>
-  <div class="list">
-    <div class="header">
+  <div class="list" bind:this={listEl}>
+    <div class="list-head pipe-head">
       <div></div>
       <div>name</div>
       <div>id</div>
@@ -56,7 +129,7 @@
     </div>
     {#if isLoading}
       {#each Array(4) as _, i (i)}
-        <div class="prow">
+        <div class="list-row pipe-row">
           <div class="skel" style="width: 6px; height: 6px"></div>
           <div class="skel" style="height: 14px; width: 50%"></div>
           <div class="skel" style="height: 12px; width: 100px"></div>
@@ -65,20 +138,25 @@
         </div>
       {/each}
     {:else if filtered.length === 0}
-      <div class="empty">
-        <p class="title">{allPipelines.length === 0 ? "No pipelines yet" : "No pipelines match"}</p>
-        {#if allPipelines.length === 0}
-          <p class="sub">Submit one with <code>labctl run-pipeline</code>.</p>
-        {:else}
-          <p class="sub">Clear the filter chips above.</p>
-        {/if}
-      </div>
+      <EmptyState title={allPipelines.length === 0 ? "No pipelines yet" : "No pipelines match"}>
+        {#snippet sub()}
+          {#if allPipelines.length === 0}
+            Submit one with <code>labctl run-pipeline</code>.
+          {:else}
+            Clear the filter chips above.
+          {/if}
+        {/snippet}
+      </EmptyState>
     {:else}
-      {#each filtered as p}
+      {#each filtered as p, i (p.id)}
         <div
-          class="prow"
-          class:is-active={router.selected === p.id}
-          onclick={() => router.select("pipelines", p.id)}
+          class="list-row pipe-row"
+          data-state={
+            router.selected === p.id ? "active" :
+            (cursor === i && router.selected !== p.id) ? "cursor" :
+            undefined
+          }
+          onclick={() => { cursor = i; router.select("pipelines", p.id); }}
           role="button"
           tabindex="0"
           onkeydown={(e) => e.key === "Enter" && router.select("pipelines", p.id)}
@@ -101,46 +179,10 @@
 <style>
   .page { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
   .list { flex: 1; overflow-y: auto; }
-  .header {
-    display: grid;
+  .pipe-head,
+  .pipe-row {
     grid-template-columns: 22px 1fr 140px 80px 100px;
-    column-gap: 12px;
-    padding: 6px 16px;
-    font-family: theme("fontFamily.mono");
-    font-size: 10px;
-    color: theme("colors.fg.3");
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    border-bottom: 1px solid theme("colors.line.0");
-    background: theme("colors.bg.0");
-    position: sticky;
-    top: 0;
-    z-index: 1;
   }
-  .prow {
-    display: grid;
-    grid-template-columns: 22px 1fr 140px 80px 100px;
-    column-gap: 12px;
-    align-items: center;
-    padding: 8px 16px;
-    border-bottom: 1px solid theme("colors.line.0");
-    cursor: pointer;
-    font-size: 13px;
-  }
-  .prow:hover, .prow.is-active { background: theme("colors.bg.2"); }
-  .name { font-family: theme("fontFamily.mono"); color: theme("colors.fg.0"); }
-  .stages { font-family: theme("fontFamily.mono"); font-size: 12px; color: theme("colors.fg.1"); }
-  .empty {
-    padding: 80px 24px;
-    text-align: center;
-  }
-  .empty .title { font-size: 14px; color: theme("colors.fg.0"); margin: 0 0 6px 0; }
-  .empty .sub { font-size: 13px; color: theme("colors.fg.2"); margin: 0; }
-  .empty code {
-    font-family: theme("fontFamily.mono");
-    background: theme("colors.bg.2");
-    padding: 1px 5px;
-    border-radius: 3px;
-    color: theme("colors.fg.1");
-  }
+  .name { font-family: theme("fontFamily.mono"); color: var(--fg-0); }
+  .stages { font-family: theme("fontFamily.mono"); font-size: 12px; color: var(--fg-1); }
 </style>

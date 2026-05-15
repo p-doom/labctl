@@ -54,7 +54,12 @@
 <section class="card">
   <header>
     <div class="title">
-      <span class="policy mono" title={series.policy_id}>{series.policy_id}</span>
+      <button
+        type="button"
+        class="policy mono"
+        title={`Open policy "${series.policy_id}" — compare across runs`}
+        onclick={() => router.go("policies", series.policy_id)}
+      >{series.policy_id}</button>
       {#if series.metric_name}
         <span class="metric mono">{series.metric_name}</span>
       {/if}
@@ -148,7 +153,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
   }
+  .policy:hover { color: theme("colors.accent.DEFAULT"); }
   .metric {
     font-size: 11px;
     color: theme("colors.fg.2");

@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{fs, path::Path, process::Command};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -69,56 +65,97 @@ pub fn run_capture(cmd: &mut Command) -> Result<String> {
         .to_string())
 }
 
+/// Snapshot `src` into `dst` using git as the authoritative filter:
+/// `git ls-files -z --cached --others --exclude-standard` yields tracked
+/// files + new-untracked files − ignored files, honoring nested
+/// `.gitignore`, global excludes, and `.git/info/exclude`. No labctl-side
+/// fallback skip list — `.lab/` lives under `runs_base`, not inside any
+/// source repo, so the gitignore set is sufficient.
+///
+/// Symlinks are recreated as symlinks (not dereferenced). Files larger
+/// than 1 GiB get a warning — single huge files in a source repo are
+/// almost always a mistake.
 pub fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink as unix_symlink;
+
+    const LARGE_FILE_WARN: u64 = 1 << 30;
+
     if dst.exists() {
         fs::remove_dir_all(dst)
             .with_context(|| format!("failed to remove existing snapshot {}", dst.display()))?;
     }
     fs::create_dir_all(dst)?;
-    for entry in WalkDir::new(src).follow_links(false) {
-        let entry = entry?;
-        let rel = entry.path().strip_prefix(src)?;
-        if rel.as_os_str().is_empty() {
+
+    let mut cmd = Command::new("git");
+    cmd.args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .current_dir(src);
+    let output = cmd
+        .output()
+        .with_context(|| format!("failed to run git ls-files in {}", src.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git ls-files failed in {}: {}",
+            src.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    for raw in output.stdout.split(|&b| b == 0) {
+        if raw.is_empty() {
             continue;
         }
-        if should_skip(rel) {
-            if entry.file_type().is_dir() {
+        let rel_str = std::str::from_utf8(raw)
+            .with_context(|| format!("git ls-files returned non-UTF-8 path in {}", src.display()))?;
+        let rel = Path::new(rel_str);
+
+        let src_path = src.join(rel);
+        let dst_path = dst.join(rel);
+
+        let meta = match fs::symlink_metadata(&src_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Staged-for-deletion files appear in the index but not on disk.
+                // The deletion is recorded in tracked.patch, so silent skip is correct.
                 continue;
             }
+            Err(e) => return Err(e).with_context(|| format!("stat {}", src_path.display())),
+        };
+
+        if meta.is_dir() {
+            // Submodule gitlinks list as a single directory entry. Skipping is fine
+            // for the current cluster (no submodules); revisit if that changes.
             continue;
         }
-        let target = dst.join(rel);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)?;
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
+
+        if let Some(parent) = dst_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            let target = fs::read_link(&src_path)
+                .with_context(|| format!("read_link {}", src_path.display()))?;
+            unix_symlink(&target, &dst_path).with_context(|| {
+                format!("symlink {} -> {}", dst_path.display(), target.display())
+            })?;
+        } else if ft.is_file() {
+            if meta.len() > LARGE_FILE_WARN {
+                eprintln!(
+                    "labctl: warning: copying {} MiB file into snapshot: {}",
+                    meta.len() >> 20,
+                    rel.display()
+                );
             }
-            fs::copy(entry.path(), &target).with_context(|| {
+            fs::copy(&src_path, &dst_path).with_context(|| {
                 format!(
                     "failed to copy {} to {}",
-                    entry.path().display(),
-                    target.display()
+                    src_path.display(),
+                    dst_path.display()
                 )
             })?;
         }
     }
     Ok(())
-}
-
-fn should_skip(rel: &Path) -> bool {
-    let first = rel.components().next().and_then(|c| c.as_os_str().to_str());
-    matches!(
-        first,
-        Some(".git")
-            | Some(".venv")
-            | Some("__pycache__")
-            | Some(".pytest_cache")
-            | Some(".mypy_cache")
-            | Some("target")
-            | Some(".lab")
-            | Some(".ruff_cache")
-    )
 }
 
 pub fn shell_quote(s: &str) -> String {
@@ -131,13 +168,3 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
-pub fn ensure_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
-pub fn relative_display(path: &Path) -> String {
-    PathBuf::from(path).display().to_string()
-}

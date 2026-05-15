@@ -110,6 +110,32 @@ export interface EvalRequest {
   primary_value?: number;
 }
 
+/**
+ * Row shape for the Policies list view. `series` is the metric pivot
+ * for the policy's primary metric, restricted to the few most recent
+ * training runs that ran under this policy — enough to draw a sparkline
+ * per row without paying for the full detail.
+ */
+export interface PolicyCard {
+  name: string;
+  primary_metric: string | null;
+  total_count: number;
+  failed_count: number;
+  running_count: number;
+  last_fired_at: number;
+  series: MetricSeries | null;
+}
+
+/**
+ * Full policy detail. `requests` is the raw eval-request log for the
+ * activity drawer at the bottom of the page. The chart and leaderboard
+ * read from `series_by_metric` (same shape as recipe/compare views).
+ */
+export interface PolicyDetail extends MetricPivotView {
+  policy_name: string;
+  requests: EvalRequest[];
+}
+
 export interface PipelineSummary {
   id: string;
   name: string;
@@ -197,4 +223,65 @@ export interface RunEvent {
   event_type: string;
   payload: Record<string, unknown>;
   created_at: number;
+}
+
+export interface RolloutStep {
+  step_num: number;
+  action: string;
+  response: string;
+  reward: number;
+  done: boolean;
+  info: Record<string, unknown>;
+}
+
+export interface RolloutData {
+  steps: RolloutStep[];
+  frame_count: number;
+}
+
+// ---------- Dataset explorer (crowd-cast SFT per-segment datasets) ----------
+
+export interface DatasetSegmentStats {
+  n_keypress: number;
+  n_keyrelease: number;
+  n_mousepress: number;
+  n_mouserelease: number;
+  n_mousemove: number;
+  n_scroll: number;
+  n_context_changed: number;
+  n_dangling_release: number;
+  n_held_at_end: number;
+  max_simultaneous_keys: number;
+}
+
+export interface DatasetSegment {
+  split: string;
+  segment_id: string;
+  contributor_hash: string;
+  n_frames: number;
+  n_no_op: number;
+  frame_width: number;
+  frame_height: number;
+  target_fps: number;
+  /** ISO8601 UTC, or empty string when meta.json had no creation_time. */
+  creation_time: string;
+  stats: DatasetSegmentStats;
+}
+
+export interface DatasetSummary {
+  splits: string[];
+  n_segments: number;
+  n_contributors: number;
+  total_hours: number;
+  /** (earliest, latest) creation_time, empty strings if unknown. */
+  date_range: [string, string];
+  segments: DatasetSegment[];
+}
+
+export interface SegmentDetail {
+  split: string;
+  segment_id: string;
+  meta: Record<string, unknown>;
+  /** One action string per frame, in source order. */
+  actions: string[];
 }

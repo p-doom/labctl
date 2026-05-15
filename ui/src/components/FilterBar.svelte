@@ -13,9 +13,11 @@
 <style>
   .filterbar {
     display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 12px 16px 10px 16px;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    padding: 8px 16px;
     border-bottom: 1px solid theme("colors.line.0");
     background: theme("colors.bg.0");
     flex-shrink: 0;

@@ -18,8 +18,9 @@ import { api } from "./api";
 import type {
   ArtifactSummary,
   CompareView,
-  EvalRequest,
   PipelineSummary,
+  PolicyCard,
+  PolicyDetail,
   RecipeHistory,
   RecipeView,
   RunDetailResponse,
@@ -51,7 +52,7 @@ const FRESH_MS = 1000; // SWR threshold — within this we don't refetch on read
 let _runs = $state<Collection<RunSummary[]>>({ data: null, loadedAt: null, loading: false, error: null });
 let _pipelines = $state<Collection<PipelineSummary[]>>({ data: null, loadedAt: null, loading: false, error: null });
 let _artifacts = $state<Collection<ArtifactSummary[]>>({ data: null, loadedAt: null, loading: false, error: null });
-let _evals = $state<Collection<EvalRequest[]>>({ data: null, loadedAt: null, loading: false, error: null });
+let _policies = $state<Collection<PolicyCard[]>>({ data: null, loadedAt: null, loading: false, error: null });
 let _cluster = $state<ClusterInfo | null>(null);
 
 // ---------- equality short-circuits ----------
@@ -98,23 +99,6 @@ function sameArtifacts(a: ArtifactSummary[] | null, b: ArtifactSummary[]): boole
   return true; // Artifacts are immutable once written; identity by id is enough.
 }
 
-function sameEvals(a: EvalRequest[] | null, b: EvalRequest[]): boolean {
-  if (a == null || a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    const x = a[i]!;
-    const y = b[i]!;
-    if (
-      x.eval_key !== y.eval_key ||
-      x.state !== y.state ||
-      x.eval_run_id !== y.eval_run_id ||
-      x.updated_at !== y.updated_at
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
-
 // Detail caches. Replace whole entries on update so Svelte's deep proxy
 // reactivity picks up only what changed.
 const _runDetails = $state<Record<string, Detail<RunDetailResponse>>>({});
@@ -126,6 +110,7 @@ const _lineage = $state<Record<string, Detail<LineageNode>>>({});
 const _recipeHistory = $state<Record<string, Detail<RecipeHistory>>>({});
 const _recipeViews = $state<Record<string, Detail<RecipeView>>>({});
 const _compareViews = $state<Record<string, Detail<CompareView>>>({});
+const _policyDetails = $state<Record<string, Detail<PolicyDetail>>>({});
 
 // In-flight tracking — dedupe concurrent calls for the same key.
 const inflight = new Map<string, Promise<unknown>>();
@@ -206,22 +191,32 @@ export async function loadArtifacts(force = false): Promise<ArtifactSummary[]> {
   });
 }
 
-export async function loadEvals(force = false): Promise<EvalRequest[]> {
-  if (!force && _evals.data && isFresh(_evals.loadedAt)) return _evals.data;
-  return dedupe("evals", async () => {
-    if (!_evals.data) _evals.loading = true;
+export async function loadPolicies(force = false): Promise<PolicyCard[]> {
+  if (!force && _policies.data && isFresh(_policies.loadedAt)) return _policies.data;
+  return dedupe("policies", async () => {
+    if (!_policies.data) _policies.loading = true;
     try {
-      const next = await api.evals();
-      if (!sameEvals(_evals.data, next)) _evals.data = next;
-      _evals.loadedAt = Date.now();
-      _evals.error = null;
-      return _evals.data ?? next;
+      const next = await api.policies();
+      _policies.data = next;
+      _policies.loadedAt = Date.now();
+      _policies.error = null;
+      return next;
     } catch (e) {
-      _evals.error = e instanceof Error ? e.message : String(e);
+      _policies.error = e instanceof Error ? e.message : String(e);
       throw e;
     } finally {
-      _evals.loading = false;
+      _policies.loading = false;
     }
+  });
+}
+
+export async function loadPolicyDetail(name: string, force = false): Promise<PolicyDetail> {
+  const entry = _policyDetails[name];
+  if (!force && entry?.data && isFresh(entry.loadedAt)) return entry.data;
+  return dedupe(`policy:${name}`, async () => {
+    const next = await api.policy(name);
+    _policyDetails[name] = { data: next, loadedAt: Date.now() };
+    return next;
   });
 }
 
@@ -338,8 +333,11 @@ export const store = {
   get artifacts() {
     return _artifacts;
   },
-  get evals() {
-    return _evals;
+  get policies() {
+    return _policies;
+  },
+  policyDetail(name: string) {
+    return _policyDetails[name]?.data ?? null;
   },
   get cluster() {
     return _cluster;
@@ -407,6 +405,13 @@ export function connectStream() {
     if (_runLogs[id]?.data) loadRunLog(id, true).catch(() => {});
     // Recipe history sparkline likely needs a bump.
     invalidateRecipeHistoryFor(id);
+    // Eval-request transitions ride on `run.updated` (the eval *run*'s
+    // status flipping is what fires the event). Bump the policies list +
+    // any cached detail.
+    if (_policies.data) loadPolicies(true).catch(() => {});
+    for (const name of Object.keys(_policyDetails)) {
+      if (_policyDetails[name]?.data) loadPolicyDetail(name, true).catch(() => {});
+    }
   });
   es.addEventListener("artifact.created", () => {
     if (_artifacts.data) loadArtifacts(true).catch(() => {});

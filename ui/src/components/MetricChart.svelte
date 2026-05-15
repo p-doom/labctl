@@ -63,15 +63,15 @@
     const cs = getComputedStyle(document.documentElement);
     const get = (name: string) => cs.getPropertyValue(name).trim();
     return {
-      fg0: get("--fg-0") || "#ecedef",
-      fg2: get("--fg-2") || "#6b6f78",
-      fg3: get("--fg-3") || "#42464e",
-      line0: get("--line-0") || "#1f2228",
-      line1: get("--line-1") || "#2a2d35",
-      bg0: get("--bg-0") || "#0a0b0d",
-      bg1: get("--bg-1") || "#101114",
-      bg2: get("--bg-2") || "#15171b",
-      accent: get("--accent") || "#bdf26d",
+      fg0: get("--fg-0"),
+      fg2: get("--fg-2"),
+      fg3: get("--fg-3"),
+      line0: get("--line-0"),
+      line1: get("--line-1"),
+      bg0: get("--bg-0"),
+      bg1: get("--bg-1"),
+      bg2: get("--bg-2"),
+      accent: get("--accent"),
     };
   }
 

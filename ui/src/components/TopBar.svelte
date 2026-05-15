@@ -7,15 +7,14 @@
 
   interface Props {
     cluster: ClusterInfo | null;
-    onOpenPalette: () => void;
   }
-  let { cluster, onOpenPalette }: Props = $props();
+  let { cluster }: Props = $props();
 
   const titles: Record<string, string> = {
     runs: "Runs",
     pipelines: "Pipelines",
     artifacts: "Artifacts",
-    evals: "Evals",
+    policies: "Policies",
   };
 </script>
 
@@ -30,13 +29,6 @@
     {/if}
   </div>
   <div class="right">
-    <button type="button" class="search" onclick={onOpenPalette} aria-label="Search">
-      <Icon name="search" size={12} />
-      <span class="text">Search</span>
-      <span class="kbds">
-        <span class="kbd">⌘</span><span class="kbd">K</span>
-      </span>
-    </button>
     <button
       type="button"
       class="iconbtn"
@@ -94,30 +86,5 @@
     display: flex;
     align-items: center;
     gap: 8px;
-  }
-  .search {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 4px 8px 4px 8px;
-    background: theme("colors.bg.1");
-    border: 1px solid theme("colors.line.1");
-    border-radius: 4px;
-    color: theme("colors.fg.1");
-    cursor: pointer;
-    min-width: 220px;
-  }
-  .search:hover {
-    border-color: theme("colors.line.2");
-    color: theme("colors.fg.0");
-  }
-  .search .text {
-    font-size: 12px;
-    flex: 1;
-    text-align: left;
-  }
-  .kbds {
-    display: inline-flex;
-    gap: 2px;
   }
 </style>

@@ -7,6 +7,7 @@
   import RelativeTime from "../components/RelativeTime.svelte";
   import Hash from "../components/Hash.svelte";
   import Icon from "../components/Icon.svelte";
+  import MetaRow from "../components/MetaRow.svelte";
   import { layout as dagLayout } from "../lib/dag";
   import { router } from "../lib/router.svelte";
   import { panelHistory } from "../lib/panel.svelte";
@@ -103,23 +104,13 @@
   {/snippet}
 
   <section class="meta">
-    <div class="meta-row">
-      <span class="k">id</span>
-      <span class="v"><Hash value={detail.pipeline.id} n={20} /></span>
-    </div>
-    <div class="meta-row">
-      <span class="k">stages</span>
-      <span class="v mono">{detail.stages.length}</span>
-    </div>
-    <div class="meta-row">
-      <span class="k">created</span>
-      <span class="v"><RelativeTime ts={detail.pipeline.created_at} /></span>
-    </div>
+    <MetaRow label="id"><Hash value={detail.pipeline.id} n={20} /></MetaRow>
+    <MetaRow label="stages">
+      <span class="mono">{detail.stages.length}</span>
+    </MetaRow>
+    <MetaRow label="created"><RelativeTime ts={detail.pipeline.created_at} /></MetaRow>
     {#if detail.pipeline.pipeline_path}
-      <div class="meta-row">
-        <span class="k">source</span>
-        <span class="v mono path">{detail.pipeline.pipeline_path}</span>
-      </div>
+      <MetaRow label="source" path={detail.pipeline.pipeline_path} />
     {/if}
   </section>
 
@@ -143,32 +134,8 @@
 
 <style>
   .title-row { display: flex; align-items: center; gap: 10px; }
-  .name { font-size: 14px; color: theme("colors.fg.0"); }
-  .meta { padding: 14px 18px 6px 18px; border-bottom: 1px solid theme("colors.line.0"); }
-  .meta-row {
-    display: grid;
-    grid-template-columns: 110px 1fr;
-    align-items: baseline;
-    padding: 4px 0;
-    font-size: 13px;
-  }
-  .meta-row .k {
-    font-family: theme("fontFamily.mono");
-    font-size: 11px;
-    color: theme("colors.fg.3");
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-  .meta-row .v.mono {
-    font-family: theme("fontFamily.mono");
-    font-size: 12px;
-    color: theme("colors.fg.1");
-  }
-  .meta-row .v.path {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
+  .name { font-size: 14px; color: var(--fg-0); }
+  .meta { padding: 12px 16px 4px 16px; border-bottom: 1px solid var(--line-0); }
   .dag {
     flex: 1;
     min-height: 480px;

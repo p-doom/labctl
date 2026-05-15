@@ -3,16 +3,24 @@
   import { store, loadRuns, loadRecipeHistory, loadRunDetail } from "../lib/store.svelte";
   import { router } from "../lib/router.svelte";
   import { compareSelection } from "../lib/compare.svelte";
-  import Pill from "../components/Pill.svelte";
   import Sparkline from "../components/Sparkline.svelte";
-  import RelativeTime from "../components/RelativeTime.svelte";
-  import Duration from "../components/Duration.svelte";
-  import Hash from "../components/Hash.svelte";
   import FilterBar from "../components/FilterBar.svelte";
   import FilterChips from "../components/FilterChips.svelte";
+  import FilterInput from "../components/FilterInput.svelte";
   import Icon from "../components/Icon.svelte";
+  import EmptyState from "../components/EmptyState.svelte";
+  import { nowSecs } from "../lib/time.svelte";
   import type { ChipDef } from "../lib/filters";
-  import { statusGroup } from "../lib/format";
+  import {
+    statusGroup,
+    shortHash,
+    shortId,
+    formatDuration,
+    formatRelative,
+    formatAbsolute,
+    liveDuration,
+    copy,
+  } from "../lib/format";
   import type { RunSummary } from "../lib/types";
 
   onMount(() => {
@@ -26,12 +34,38 @@
 
   let allRuns = $derived(store.runs.data ?? []);
   let isLoading = $derived(store.runs.loading && allRuns.length === 0);
+  let filterText = $state("");
+  let textQuery = $derived(filterText.trim().toLowerCase());
+
+  // Precomputed lowercase haystack per run. Built once when the list
+  // changes (cheap — ~1ms for 1000 runs); reused on every keystroke so
+  // the per-keystroke filter is one `.includes()` per row, not five
+  // `.toLowerCase().includes()` calls.
+  let haystacks = $derived.by(() => {
+    const m = new Map<string, string>();
+    for (const r of allRuns) {
+      m.set(
+        r.id,
+        `${r.recipe_name}\n${r.id}\n${r.stage_name ?? ""}\n${r.repo ?? ""}\n${r.submitted_by ?? ""}`.toLowerCase(),
+      );
+    }
+    return m;
+  });
+
   let filtered = $derived.by(() => {
+    const q = textQuery;
+    const useText = q.length > 0;
+    const useStatus = statusFilter != null;
+    const usePipe = pipelineFilter != null;
+    const useRepo = repoFilter != null;
+    const useUser = userFilter != null;
+    if (!useText && !useStatus && !usePipe && !useRepo && !useUser) return allRuns;
     return allRuns.filter((r) => {
-      if (statusFilter && statusGroup(r.status) !== statusFilter) return false;
-      if (pipelineFilter && r.pipeline_id !== pipelineFilter) return false;
-      if (repoFilter && r.repo !== repoFilter) return false;
-      if (userFilter && (r.submitted_by ?? "") !== userFilter) return false;
+      if (useStatus && statusGroup(r.status) !== statusFilter) return false;
+      if (usePipe && r.pipeline_id !== pipelineFilter) return false;
+      if (useRepo && r.repo !== repoFilter) return false;
+      if (useUser && (r.submitted_by ?? "") !== userFilter) return false;
+      if (useText && !haystacks.get(r.id)!.includes(q)) return false;
       return true;
     });
   });
@@ -82,10 +116,14 @@
     router.select("runs", r.id);
   }
 
-  // Kick off recipe-history loads as new recipes appear in view.
+  // Kick off recipe-history loads as new recipes appear in view. We
+  // iterate only the *visible* slice — virtualization already caps that
+  // to ~30 rows, so this stays O(viewport), not O(filtered). Important:
+  // this is the only $effect on the keystroke critical path, and it
+  // used to walk thousands of rows per keystroke.
   $effect(() => {
     const seen = new Set<string>();
-    for (const r of filtered) {
+    for (const r of visibleRows) {
       if (seen.has(r.recipe_name)) continue;
       seen.add(r.recipe_name);
       if (!store.recipeHistory(r.recipe_name)) {
@@ -116,40 +154,114 @@
     router.setQuery({ [key]: value });
   }
 
+  let filterInputEl = $state<HTMLInputElement | null>(null);
+  let listEl = $state<HTMLDivElement | null>(null);
+
+  // -------- virtualization --------
+  // The list can hold thousands of rows. Mounting every row's Pill /
+  // Sparkline / Hash / Duration / RelativeTime on every filter change was
+  // the actual source of keystroke lag. We render only ~viewport-height
+  // worth of rows + a small overscan; spacer divs above and below keep
+  // the scroll height truthful so the scrollbar still represents the full
+  // dataset and scroll-position math stays linear.
+  const ROW_HEIGHT = 37;
+  const HEADER_HEIGHT = 30;
+  const OVERSCAN = 8;
+
+  let scrollTop = $state(0);
+  let viewportHeight = $state(800);
+
+  function onListScroll(e: UIEvent) {
+    scrollTop = (e.currentTarget as HTMLDivElement).scrollTop;
+  }
+
+  let firstIdx = $derived(
+    Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN),
+  );
+  let lastIdx = $derived(
+    Math.min(
+      filtered.length,
+      Math.ceil((scrollTop + viewportHeight - HEADER_HEIGHT) / ROW_HEIGHT) + OVERSCAN,
+    ),
+  );
+  let topPad = $derived(firstIdx * ROW_HEIGHT);
+  let bottomPad = $derived(Math.max(0, (filtered.length - lastIdx) * ROW_HEIGHT));
+  let visibleRows = $derived(filtered.slice(firstIdx, lastIdx));
+
   // Keyboard nav (j/k/Enter when no panel is open and no input is focused).
   let cursor = $state(0);
-  // Reset cursor when the filter set changes (status/repo/pipeline) so j/k
-  // don't land mid-list on the new view.
+  // Reset cursor and scroll position when the filter set changes — keeps
+  // the user grounded at the top of the new result set.
   $effect(() => {
     void statusFilter;
     void repoFilter;
     void pipelineFilter;
     void userFilter;
+    void textQuery;
     cursor = 0;
+    scrollTop = 0;
+    if (listEl) listEl.scrollTop = 0;
   });
   $effect(() => {
     if (cursor >= filtered.length) cursor = Math.max(0, filtered.length - 1);
   });
 
+  function openCursorRow() {
+    const r = filtered[cursor];
+    if (r) open(r);
+  }
+
   function onKey(e: KeyboardEvent) {
-    if (router.selected) return;
+    if (router.view !== "runs") return;
+    // Cmd/Ctrl-K and "/" focus the inline filter — same shortcut, one
+    // consistent behavior. Works even from inside other inputs, since the
+    // intent is "I want to filter."
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      filterInputEl?.focus();
+      filterInputEl?.select();
+      return;
+    }
     const target = e.target as HTMLElement | null;
-    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
-    if (e.key === "j") {
+    const inField =
+      target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA");
+    if (e.key === "/" && !inField) {
+      e.preventDefault();
+      filterInputEl?.focus();
+      return;
+    }
+    if (inField) return;
+    if (e.key === "j" || e.key === "ArrowDown") {
       e.preventDefault();
       cursor = Math.min(cursor + 1, filtered.length - 1);
-    } else if (e.key === "k") {
+      if (router.selected) { const r = filtered[cursor]; if (r) open(r); }
+    } else if (e.key === "k" || e.key === "ArrowUp") {
       e.preventDefault();
       cursor = Math.max(cursor - 1, 0);
+      if (router.selected) { const r = filtered[cursor]; if (r) open(r); }
     } else if (e.key === "Enter") {
-      const r = filtered[cursor];
-      if (r) open(r);
+      openCursorRow();
     }
   }
 
   $effect(() => {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  });
+
+  // Cursor scrollIntoView — compute target scrollTop directly because the
+  // cursor row may not be in the DOM when virtualized.
+  $effect(() => {
+    const i = cursor;
+    if (!listEl || filtered.length === 0) return;
+    const rowY = i * ROW_HEIGHT; // row position in row-space (header excluded)
+    const visTop = scrollTop;
+    const visBottom = scrollTop + viewportHeight - HEADER_HEIGHT;
+    if (rowY < visTop) {
+      listEl.scrollTop = rowY;
+    } else if (rowY + ROW_HEIGHT > visBottom) {
+      listEl.scrollTop = rowY + ROW_HEIGHT - viewportHeight + HEADER_HEIGHT;
+    }
   });
 </script>
 
@@ -162,10 +274,22 @@
     {#if users.length > 1}
       <FilterChips label="user" chips={userChips} active={userFilter} onSelect={(k) => setFilter("user", k)} />
     {/if}
+    <FilterInput
+      bind:inputRef={filterInputEl}
+      value={filterText}
+      placeholder="Filter runs…"
+      onInput={(v) => (filterText = v)}
+      onEnter={openCursorRow}
+    />
   </FilterBar>
 
-  <div class="list">
-    <div class="header">
+  <div
+    class="list"
+    bind:this={listEl}
+    bind:clientHeight={viewportHeight}
+    onscroll={onListScroll}
+  >
+    <div class="list-head run-head">
       <div></div>
       <div></div>
       <div>recipe</div>
@@ -177,7 +301,7 @@
 
     {#if isLoading}
       {#each Array(8) as _, i (i)}
-        <div class="row">
+        <div class="list-row run-row">
           <div></div>
           <div class="skel" style="width: 6px; height: 6px; border-radius: 3px"></div>
           <div class="skel" style="height: 14px; width: 60%"></div>
@@ -188,24 +312,31 @@
         </div>
       {/each}
     {:else if filtered.length === 0}
-      <div class="empty">
-        <p class="title">{allRuns.length === 0 ? "No runs yet" : "No runs match these filters"}</p>
-        <p class="sub">
+      <EmptyState title={allRuns.length === 0 ? "No runs yet" : "No runs match these filters"}>
+        {#snippet sub()}
           {allRuns.length === 0
             ? "Submit a recipe with labctl run, and it shows up here."
             : "Clear the filter chips above to see the rest."}
-        </p>
-      </div>
+        {/snippet}
+      </EmptyState>
     {:else}
-      {#each filtered as r, i (r.id)}
+      {#if topPad > 0}<div class="spacer" style={`height: ${topPad}px`} aria-hidden="true"></div>{/if}
+      {#each visibleRows as r, j (r.id)}
+        {@const i = firstIdx + j}
         {@const hist = store.recipeHistory(r.recipe_name)}
         {@const inCompare = compareSelection.has(r.id)}
+        {@const group = statusGroup(r.status)}
+        {@const pulse = group === "running" || r.status === "submitted"}
+        {@const dur = liveDuration(r, nowSecs.value)}
         <div
-          class="row"
-          class:is-active={router.selected === r.id}
-          class:is-cursor={cursor === i && router.selected !== r.id}
-          class:in-compare={inCompare}
+          class="list-row run-row"
           class:any-selected={compareSelection.size > 0}
+          data-state={
+            inCompare ? "compared" :
+            router.selected === r.id ? "active" :
+            (cursor === i && router.selected !== r.id) ? "cursor" :
+            undefined
+          }
           onclick={(e) => {
             // Shift-click is the power-user shortcut. The visible
             // checkbox in the leftmost column is the discoverable path.
@@ -239,7 +370,8 @@
               <Icon name="check" size={11} />
             {/if}
           </button>
-          <Pill status={r.status} showLabel={false} />
+          <!-- Pill (dot only): inlined to skip per-row component setup. -->
+          <span class="dot" data-group={group} class:animate-pulse-dot={pulse} aria-label={r.status}></span>
           <div class="recipe">
             <button
               type="button"
@@ -260,9 +392,15 @@
               <span class="repo">{r.repo}</span>
             {/if}
           </div>
-          <div class="id">
-            <Hash value={r.id} n={12} />
-          </div>
+          <!-- Hash (id): inlined. Drops the copy-badge animation in
+               exchange for ~30× fewer Svelte component setups. -->
+          <button
+            type="button"
+            class="hash"
+            onclick={(e) => { e.stopPropagation(); copy(r.id); }}
+            title={r.id}
+            aria-label={`Copy run id ${r.id}`}
+          >{shortId(r.id, 12)}</button>
           <div class="hist">
             {#if hist}
               <Sparkline history={hist.history} />
@@ -270,10 +408,13 @@
               <div class="skel" style="height: 14px; width: 80px; opacity: 0.5"></div>
             {/if}
           </div>
-          <Duration run={r} />
-          <RelativeTime ts={r.created_at} />
+          <!-- Duration: inlined. -->
+          <span class="dur mono" class:live={!r.is_terminal}>{formatDuration(dur)}</span>
+          <!-- RelativeTime: inlined. -->
+          <span class="rel mono" title={formatAbsolute(r.created_at)}>{formatRelative(r.created_at, nowSecs.value)}</span>
         </div>
       {/each}
+      {#if bottomPad > 0}<div class="spacer" style={`height: ${bottomPad}px`} aria-hidden="true"></div>{/if}
     {/if}
   </div>
 </div>
@@ -289,98 +430,56 @@
     flex: 1;
     overflow-y: auto;
   }
-  .header {
-    display: grid;
-    grid-template-columns: 18px 22px 1fr 140px 110px 80px 80px;
-    column-gap: 12px;
-    padding: 6px 16px;
-    font-family: theme("fontFamily.mono");
-    font-size: 10px;
-    color: theme("colors.fg.3");
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    border-bottom: 1px solid theme("colors.line.0");
-    background: theme("colors.bg.0");
-    position: sticky;
-    top: 0;
-    z-index: 1;
+  .spacer {
+    /* No content, no border — purely a layout placeholder so the scroll
+     * track size reflects the full filtered list while only a viewport's
+     * worth of rows is actually in the DOM. */
+    width: 100%;
   }
-  .row {
+  /* Runs view geometry: check | dot | recipe | id | sparkline | duration | age */
+  .run-head,
+  .run-row {
     grid-template-columns: 18px 22px 1fr 140px 110px 80px 80px;
-    cursor: pointer;
-    position: relative;
   }
   .check {
     width: 16px;
     height: 16px;
     border-radius: 4px;
-    border: 1px solid theme("colors.line.2");
+    border: 1px solid var(--line-2);
     background: transparent;
     padding: 0;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    color: theme("colors.bg.0");
+    color: var(--bg-0);
     /* Hidden by default; appears on row hover OR when *any* row is
-     * selected (so the user knows which rows are in the comparison without
-     * having to hover each one), AND stays visible on the row that's
-     * actually checked. */
+     * selected (so the user knows which rows are in the comparison
+     * without having to hover each one), AND stays visible on the row
+     * that's actually checked. */
     opacity: 0;
+    transition: opacity var(--dur-micro) var(--ease);
   }
-  .row:hover .check,
-  .row.any-selected .check,
+  .list-row:hover .check,
+  .run-row.any-selected .check,
   .check.checked,
   .check:focus-visible {
     opacity: 1;
   }
   .check:hover {
-    border-color: theme("colors.fg.2");
-    background: theme("colors.bg.3");
+    border-color: var(--fg-2);
+    background: var(--bg-3);
   }
   .check.checked {
-    background: theme("colors.accent.DEFAULT");
-    border-color: theme("colors.accent.DEFAULT");
-    color: theme("colors.bg.0");
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--bg-0);
   }
   .check.checked:hover {
-    background: theme("colors.accent.dim");
-    border-color: theme("colors.accent.dim");
+    background: var(--accent-dim);
+    border-color: var(--accent-dim);
   }
-  .row.is-cursor::before {
-    content: "";
-    position: absolute;
-    left: 0;
-    top: 4px;
-    bottom: 4px;
-    width: 2px;
-    background: theme("colors.fg.3");
-    border-radius: 0 1px 1px 0;
-  }
-  .row.is-active::before {
-    content: "";
-    position: absolute;
-    left: 0;
-    top: 4px;
-    bottom: 4px;
-    width: 2px;
-    background: theme("colors.accent.DEFAULT");
-    border-radius: 0 1px 1px 0;
-  }
-  .row.is-active {
-    background: theme("colors.bg.2");
-  }
-  .row.in-compare {
-    background: theme("colors.accent.soft");
-    box-shadow: inset 2px 0 0 theme("colors.accent.DEFAULT");
-  }
-  /* Subtle bump on hover that still works in either theme without a
-   * hardcoded accent rgba — relies on the existing soft token + a
-   * slightly darker overlay from the underlying surface. */
-  .row.in-compare:hover {
-    background: theme("colors.bg.2");
-    box-shadow: inset 2px 0 0 theme("colors.accent.DEFAULT");
-  }
+
   .recipe {
     display: flex;
     align-items: baseline;
@@ -390,7 +489,7 @@
   .recipe .name {
     font-family: theme("fontFamily.mono");
     font-size: 13px;
-    color: theme("colors.fg.0");
+    color: var(--fg-0);
     letter-spacing: -0.005em;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -401,60 +500,73 @@
     cursor: pointer;
     text-align: left;
   }
-  .recipe .name:hover {
-    color: theme("colors.accent.dim");
-  }
+  .recipe .name:hover { color: var(--accent-dim); }
   .recipe .stage {
     font-family: theme("fontFamily.mono");
     font-size: 11px;
-    color: theme("colors.fg.2");
+    color: var(--fg-1);
     flex-shrink: 0;
   }
   .recipe .repo {
     font-size: 11px;
-    color: theme("colors.fg.3");
+    color: var(--fg-2);
     margin-left: auto;
     flex-shrink: 0;
     padding: 1px 5px;
-    border: 1px solid theme("colors.line.1");
+    border: 1px solid var(--line-1);
     border-radius: 3px;
   }
-  /* The user badge sits to the right of the recipe name. When the repo
-   * badge is also present (multi-repo deployments), only the first
-   * margin-left:auto sibling pushes to the far right; the user badge
-   * sits adjacent to it without competing for the auto-margin. */
   .recipe .user {
     font-family: theme("fontFamily.mono");
     font-size: 11px;
-    color: theme("colors.fg.2");
+    color: var(--fg-1);
     margin-left: auto;
     flex-shrink: 0;
   }
-  /* When both badges are present, the repo gets the auto-margin and the
-   * user just sits next to it. */
-  .recipe .user + .repo {
-    margin-left: 6px;
-  }
-  .id { font-family: theme("fontFamily.mono"); }
+  .recipe .user + .repo { margin-left: 6px; }
   .hist { display: flex; align-items: center; }
 
-  .empty {
-    padding: 80px 24px;
-    text-align: center;
-    animation: fadeIn 250ms cubic-bezier(0.2, 0, 0, 1);
+  /* Inlined Pill dot. */
+  .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    flex-shrink: 0;
+    justify-self: center;
   }
-  .empty .title {
-    font-size: 14px;
-    color: theme("colors.fg.0");
-    margin: 0 0 6px 0;
+  .dot[data-group="running"]   { --dot: var(--status-running);   background: var(--dot); }
+  .dot[data-group="succeeded"] { --dot: var(--status-succeeded); background: var(--dot); }
+  .dot[data-group="failed"]    { --dot: var(--status-failed);    background: var(--dot); }
+  .dot[data-group="pending"]   { --dot: var(--status-pending);   background: var(--dot); }
+  .dot[data-group="neutral"]   { --dot: var(--status-neutral);   background: var(--dot); }
+
+  /* Inlined Hash. No copied-badge — title attr does the job. */
+  .hash {
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    font-family: theme("fontFamily.mono");
+    font-size: 12px;
+    color: var(--fg-1);
+    text-align: left;
+    letter-spacing: 0.01em;
+    transition: color var(--dur-micro) var(--ease);
   }
-  .empty .sub {
-    font-size: 13px;
-    color: theme("colors.fg.2");
-    margin: 0;
+  .hash:hover { color: var(--fg-0); }
+
+  /* Inlined Duration. */
+  .dur {
+    font-size: 12px;
+    color: var(--fg-1);
+    font-variant-numeric: tabular-nums;
   }
-  @keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
+  .dur.live { color: var(--fg-0); }
+
+  /* Inlined RelativeTime. */
+  .rel {
+    font-size: 12px;
+    color: var(--fg-1);
+    font-variant-numeric: tabular-nums;
   }
 </style>

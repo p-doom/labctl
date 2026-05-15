@@ -58,8 +58,4 @@
     padding: 0;
     background: transparent !important;
   }
-  .pill.no-label .pill-dot {
-    width: 8px;
-    height: 8px;
-  }
 </style>

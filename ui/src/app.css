@@ -37,23 +37,34 @@
   --status-running: #bdf26d;
   --status-running-soft: rgba(189, 242, 109, 0.12);
   --status-running-fg: #d6f6a0;
-  --status-succeeded: #7dd3a8;
-  --status-succeeded-soft: rgba(125, 211, 168, 0.10);
-  --status-succeeded-fg: #a8e3c5;
+  --status-succeeded: #4dcfbe;
+  --status-succeeded-soft: rgba(77, 207, 190, 0.12);
+  --status-succeeded-fg: #7dddd0;
   --status-failed: #ef7c6a;
   --status-failed-soft: rgba(239, 124, 106, 0.12);
   --status-failed-fg: #f5a99c;
   --status-pending: #e8c170;
   --status-pending-soft: rgba(232, 193, 112, 0.12);
   --status-pending-fg: #efd49a;
-  --status-neutral: #7c828d;
-  --status-neutral-soft: rgba(124, 130, 141, 0.12);
-  --status-neutral-fg: #a1a4ab;
+  --status-neutral: #9da5b4;
+  --status-neutral-soft: rgba(157, 165, 180, 0.18);
+  --status-neutral-fg: #b8bfc9;
+  /* Data series — chart multi-line palette; series-0 tracks accent */
+  --series-0: var(--accent);
+  --series-1: #7dc3e8;
+  --series-2: #f0a872;
+  --series-3: #d895c4;
+  --series-4: #7dd3a8;
+  --series-5: #c8b9f0;
+  --series-6: #e8c170;
+  --series-7: #9ed4d4;
   /* Misc */
   --shadow-panel-1: rgba(0, 0, 0, 0.6);
   --selection-bg: rgba(189, 242, 109, 0.25);
   --scrollbar-thumb: #2a2d35;
   --scrollbar-thumb-hover: #3a3e47;
+  --scrim: rgba(10, 11, 13, 0.4);
+  --scrim-strong: rgba(10, 11, 13, 0.6);
   --shiki-bg: var(--bg-0);
   color-scheme: dark;
 }
@@ -80,24 +91,49 @@
   --status-running: #5e8e1f;
   --status-running-soft: rgba(94, 142, 31, 0.10);
   --status-running-fg: #4a7218;
-  --status-succeeded: #2d8856;
-  --status-succeeded-soft: rgba(45, 136, 86, 0.08);
-  --status-succeeded-fg: #1f6038;
+  --status-succeeded: #0e8a7e;
+  --status-succeeded-soft: rgba(14, 138, 126, 0.10);
+  --status-succeeded-fg: #065f58;
   --status-failed: #c1463a;
   --status-failed-soft: rgba(193, 70, 58, 0.08);
   --status-failed-fg: #8e2f25;
   --status-pending: #a87618;
   --status-pending-soft: rgba(168, 118, 24, 0.08);
   --status-pending-fg: #7d5712;
-  --status-neutral: #6b6f78;
-  --status-neutral-soft: rgba(107, 111, 120, 0.08);
-  --status-neutral-fg: #4a4d54;
+  --status-neutral: #5c6475;
+  --status-neutral-soft: rgba(92, 100, 117, 0.15);
+  --status-neutral-fg: #404856;
+  /* Data series — darkened for light backgrounds */
+  --series-1: #2a78b8;
+  --series-2: #b35f15;
+  --series-3: #8a3572;
+  --series-4: #1e7045;
+  --series-5: #5e3fb8;
+  --series-6: #8a6010;
+  --series-7: #277070;
   --shadow-panel-1: rgba(20, 22, 25, 0.18);
   --selection-bg: rgba(94, 142, 31, 0.22);
   --scrollbar-thumb: #c8cbd0;
   --scrollbar-thumb-hover: #aeb1b6;
+  --scrim: rgba(20, 22, 25, 0.32);
+  --scrim-strong: rgba(20, 22, 25, 0.5);
   --shiki-bg: var(--bg-0);
   color-scheme: light;
+}
+
+/* ---------- layout tokens ----------
+ * These aren't theme-dependent; they parameterize the design language.
+ * Adjust only when changing the system, never per-component. */
+:root {
+  --row-pad-y: 8px;
+  --row-pad-x: 16px;
+  --row-gap: 12px;
+  --block-pad: 16px;
+  --meta-label-w: 96px;
+  --empty-pad-y: 80px;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --dur-micro: 150ms;
+  --dur-panel: 250ms;
 }
 
 :root {
@@ -145,27 +181,177 @@ body {
   color: var(--fg-0);
 }
 
-:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-  border-radius: 4px;
-}
-button:focus,
-a:focus {
+/* ---------- focus discipline ----------
+ * Mouse focus is silent; keyboard focus is loud. The :focus-visible ring
+ * is a 2px accent stripe with a 2px bg-0 inset so it remains crisp even
+ * when an element sits flush against another (list rows, button groups).
+ * We strip the legacy :focus outline on buttons/anchors so click focus
+ * doesn't show a ring, but :focus-visible always re-applies. */
+*:focus { outline: none; }
+*:focus-visible {
   outline: none;
-}
-button:focus-visible,
-a:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--bg-0), 0 0 0 4px var(--accent);
+  border-radius: 4px;
 }
 
 @layer components {
+  /* ---------- buttons ----------
+   * Four shapes: ghost, secondary, primary, icon. Every button in the app
+   * picks one. No special-snowflake variants — if you find yourself
+   * adding a new button style, add a modifier here instead. */
+  .btn-ghost,
+  .btn-secondary,
+  .btn-primary {
+    @apply inline-flex items-center;
+    gap: 6px;
+    font: inherit;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    border-radius: 4px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--fg-1);
+    padding: 5px 10px;
+    text-decoration: none;
+    transition:
+      background-color var(--dur-micro) var(--ease),
+      color var(--dur-micro) var(--ease),
+      border-color var(--dur-micro) var(--ease);
+    white-space: nowrap;
+  }
+  .btn-ghost:hover { color: var(--fg-0); }
+
+  .btn-secondary { border-color: var(--line-1); }
+  .btn-secondary:hover {
+    background: var(--bg-2);
+    border-color: var(--line-2);
+    color: var(--fg-0);
+  }
+  .btn-secondary[data-state="active"] {
+    background: var(--accent-soft);
+    border-color: var(--accent-dim);
+    color: var(--accent-dim);
+  }
+
+  .btn-primary {
+    background: var(--accent-soft);
+    border-color: var(--accent-soft);
+    color: var(--accent-dim);
+  }
+  .btn-primary:hover {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--bg-0);
+  }
+  .btn-primary:disabled,
+  .btn-secondary:disabled,
+  .btn-ghost:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
+
+  .iconbtn {
+    @apply inline-flex items-center justify-center rounded;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--fg-1);
+    cursor: pointer;
+    transition: background-color var(--dur-micro) var(--ease),
+      color var(--dur-micro) var(--ease);
+  }
+  .iconbtn:hover {
+    background: var(--bg-3);
+    color: var(--fg-0);
+  }
+  .iconbtn:disabled {
+    opacity: 0.35;
+    pointer-events: none;
+  }
+
+  /* ---------- list-row ----------
+   * The canonical list line. Each view supplies its own grid-template-
+   * columns via a `--cols` custom property or local `.list-row` override;
+   * the chrome (padding, border, hover, stripes) is inherited. */
+  .list-row {
+    display: grid;
+    align-items: center;
+    column-gap: var(--row-gap);
+    padding: var(--row-pad-y) var(--row-pad-x);
+    border-bottom: 1px solid var(--line-0);
+    font-size: 13px;
+    cursor: pointer;
+    position: relative;
+    background: transparent;
+    /* Reset button defaults so the same class works on <div> and <button>. */
+    color: inherit;
+    font-family: inherit;
+    text-align: left;
+    border-left: none;
+    border-right: none;
+    border-top: none;
+    width: 100%;
+    /* CSS containment — tells the browser that style/layout/paint inside
+     * this row cannot affect siblings or ancestors. Crucial for long
+     * filtered lists: without this the browser conservatively re-lays
+     * out neighbors when a single row's class changes. With it, hover/
+     * active state changes are painted in isolation. */
+    contain: layout style paint;
+  }
+  .list-row:hover,
+  .list-row[data-state="cursor"],
+  .list-row[data-state="active"] {
+    background: var(--bg-2);
+  }
+  .list-row[data-state="cursor"]::before,
+  .list-row[data-state="active"]::before,
+  .list-row[data-state="compared"]::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 4px;
+    bottom: 4px;
+    width: 2px;
+    border-radius: 0 1px 1px 0;
+  }
+  .list-row[data-state="cursor"]::before { background: var(--fg-3); }
+  .list-row[data-state="active"]::before { background: var(--accent); }
+  .list-row[data-state="compared"] {
+    background: var(--accent-soft);
+  }
+  .list-row[data-state="compared"]::before { background: var(--accent); }
+  .list-row[data-state="compared"]:hover {
+    background: var(--bg-2);
+  }
+  .list-row:last-child { border-bottom: none; }
+
+  .list-head {
+    display: grid;
+    align-items: center;
+    column-gap: var(--row-gap);
+    padding: 6px var(--row-pad-x);
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--fg-1);
+    border-bottom: 1px solid var(--line-0);
+    background: var(--bg-0);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+
+  /* ---------- pill ----------
+   * Status indicator. Has a label variant and a dot-only variant.
+   * Both share a 6px dot — no more 8px/6px split. */
   .pill {
     @apply inline-flex items-center gap-1.5 rounded-full font-medium font-mono text-xs leading-none;
     padding: 4px 8px 4px 6px;
-    transition: background-color 250ms cubic-bezier(0.2, 0, 0, 1),
-      color 250ms cubic-bezier(0.2, 0, 0, 1);
+    transition: background-color var(--dur-panel) var(--ease),
+      color var(--dur-panel) var(--ease);
   }
   .pill-dot {
     width: 6px;
@@ -174,21 +360,8 @@ a:focus-visible {
     flex-shrink: 0;
   }
 
-  .row {
-    @apply grid items-center text-sm;
-    grid-template-columns: 22px 1fr 140px 110px 80px 80px;
-    column-gap: 12px;
-    padding: 8px 16px;
-    border-bottom: 1px solid var(--line-0);
-  }
-  .row:hover,
-  .row.is-active {
-    background-color: var(--bg-2);
-  }
-  .row:last-child {
-    border-bottom: none;
-  }
-
+  /* ---------- kbd ----------
+   * Tiny key-cap. Used in palette footers, nav rails, search hints. */
   .kbd {
     @apply inline-flex items-center justify-center font-mono text-xs;
     background: var(--bg-2);
@@ -202,16 +375,8 @@ a:focus-visible {
     line-height: 1;
   }
 
-  .iconbtn {
-    @apply inline-flex items-center justify-center text-fg-1 rounded;
-    width: 26px;
-    height: 26px;
-  }
-  .iconbtn:hover {
-    background: var(--bg-3);
-    color: var(--fg-0);
-  }
-
+  /* ---------- skel ----------
+   * Loading shimmer block. Sized by inline style at the call site. */
   .skel {
     background: linear-gradient(
       90deg,
@@ -223,6 +388,11 @@ a:focus-visible {
     animation: shimmer 1.4s linear infinite;
     border-radius: 4px;
   }
+
+  /* ---------- dim ----------
+   * The canonical "this is less important" treatment. Walk the fg ramp;
+   * never use opacity for persistent dimming. */
+  .dim { color: var(--fg-3); }
 }
 
 /* xyflow palette overrides */

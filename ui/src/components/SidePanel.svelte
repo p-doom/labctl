@@ -16,10 +16,16 @@
     $props();
 
   function onKey(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      onClose();
-    }
+    if (e.key !== "Escape") return;
+    // Don't hijack Esc inside text inputs — they own that key for clearing
+    // their own content (e.g. FilterInput on the underlying list view).
+    const t = e.target as HTMLElement | null;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    e.preventDefault();
+    // Esc always closes. Back-through-history is reserved for the
+    // explicit back button (and Cmd+[) — using Esc for it surprised
+    // people whose stack contained a stale entry from a prior session.
+    onClose();
   }
 
   onMount(() => {
@@ -80,9 +86,9 @@
   .scrim {
     position: fixed;
     inset: 0;
-    background: rgba(10, 11, 13, 0.4);
+    background: var(--scrim);
     z-index: 40;
-    animation: fadeIn 150ms cubic-bezier(0.2, 0, 0, 1);
+    animation: fadeIn var(--dur-micro) var(--ease);
     border: none;
     cursor: default;
     padding: 0;
@@ -97,13 +103,13 @@
     right: 0;
     bottom: 0;
     width: min(680px, 60vw);
-    background: theme("colors.bg.1");
-    border-left: 1px solid theme("colors.line.1");
+    background: var(--bg-1);
+    border-left: 1px solid var(--line-1);
     box-shadow: theme("boxShadow.panel");
     z-index: 41;
     display: flex;
     flex-direction: column;
-    animation: slideIn 250ms cubic-bezier(0.2, 0, 0, 1);
+    animation: slideIn var(--dur-panel) var(--ease);
   }
   @keyframes slideIn {
     from { transform: translateX(8%); opacity: 0; }
@@ -115,17 +121,13 @@
     align-items: center;
     gap: 12px;
     padding: 10px 14px;
-    border-bottom: 1px solid theme("colors.line.0");
-    background: theme("colors.bg.1");
+    border-bottom: 1px solid var(--line-0);
+    background: var(--bg-1);
     flex-shrink: 0;
   }
   .nav {
     display: flex;
     gap: 2px;
-  }
-  .nav .iconbtn:disabled {
-    opacity: 0.35;
-    pointer-events: none;
   }
   .title {
     overflow: hidden;

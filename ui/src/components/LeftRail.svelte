@@ -8,11 +8,13 @@
     icon: "runs" | "pipelines" | "artifacts" | "evals";
     shortcut: string;
   }
+  // "evals" icon (checkbox-with-checkmark) doubles as the policies icon —
+  // a policy is the rubric used to evaluate. No new icon needed.
   const items: NavItem[] = [
     { view: "runs", label: "Runs", icon: "runs", shortcut: "g r" },
     { view: "pipelines", label: "Pipelines", icon: "pipelines", shortcut: "g p" },
     { view: "artifacts", label: "Artifacts", icon: "artifacts", shortcut: "g a" },
-    { view: "evals", label: "Evals", icon: "evals", shortcut: "g e" },
+    { view: "policies", label: "Policies", icon: "evals", shortcut: "g e" },
   ];
 </script>
 
@@ -96,6 +98,7 @@
   .item.active {
     background: theme("colors.bg.2");
     color: theme("colors.fg.0");
+    box-shadow: inset 2px 0 0 theme("colors.accent.DEFAULT");
   }
   .item.active .icon {
     color: theme("colors.accent.DEFAULT");

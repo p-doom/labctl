@@ -10,7 +10,14 @@
 //   #/artifacts                    → artifact list
 //   #/artifacts/artifact_abc       → artifact detail panel
 
-export type View = "runs" | "pipelines" | "artifacts" | "evals" | "lineage" | "recipes" | "compare";
+export type View =
+  | "runs"
+  | "pipelines"
+  | "artifacts"
+  | "policies"
+  | "lineage"
+  | "recipes"
+  | "compare";
 
 export interface Route {
   view: View;
@@ -25,7 +32,7 @@ function parse(hash: string): Route {
   const view = (segments[0] as View) || "runs";
   const selected = segments[1] ?? null;
   const query = new URLSearchParams(queryPart ?? "");
-  if (!["runs", "pipelines", "artifacts", "evals", "lineage", "recipes", "compare"].includes(view)) {
+  if (!["runs", "pipelines", "artifacts", "policies", "lineage", "recipes", "compare"].includes(view)) {
     return { view: "runs", selected: null, query };
   }
   return { view, selected, query };

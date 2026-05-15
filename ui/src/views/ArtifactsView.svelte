@@ -6,12 +6,64 @@
   import Hash from "../components/Hash.svelte";
   import FilterBar from "../components/FilterBar.svelte";
   import FilterChips from "../components/FilterChips.svelte";
+  import FilterInput from "../components/FilterInput.svelte";
+  import EmptyState from "../components/EmptyState.svelte";
   import type { ChipDef } from "../lib/filters";
   import ArtifactPanel from "./ArtifactPanel.svelte";
 
   onMount(() => loadArtifacts());
 
   let kindFilter = $derived(router.query.get("kind"));
+  let filterText = $state("");
+  let textQuery = $derived(filterText.trim().toLowerCase());
+  let cursor = $state(0);
+  let listEl = $state<HTMLDivElement | null>(null);
+  let filterInputEl = $state<HTMLInputElement | null>(null);
+  $effect(() => { void kindFilter; void textQuery; cursor = 0; });
+  $effect(() => { if (cursor >= filtered.length) cursor = Math.max(0, filtered.length - 1); });
+  function openCursorRow() {
+    const a = filtered[cursor];
+    if (a) router.select("artifacts", a.id);
+  }
+  function onKey(e: KeyboardEvent) {
+    if (router.view !== "artifacts") return;
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      filterInputEl?.focus();
+      filterInputEl?.select();
+      return;
+    }
+    const t = e.target as HTMLElement | null;
+    const inField = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
+    if (e.key === "/" && !inField) {
+      e.preventDefault();
+      filterInputEl?.focus();
+      return;
+    }
+    if (inField) return;
+    if (e.key === "j" || e.key === "ArrowDown") {
+      e.preventDefault();
+      cursor = Math.min(cursor + 1, filtered.length - 1);
+      if (router.selected) router.select("artifacts", filtered[cursor]?.id ?? null);
+    } else if (e.key === "k" || e.key === "ArrowUp") {
+      e.preventDefault();
+      cursor = Math.max(cursor - 1, 0);
+      if (router.selected) router.select("artifacts", filtered[cursor]?.id ?? null);
+    } else if (e.key === "Enter") {
+      openCursorRow();
+    }
+  }
+  $effect(() => {
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+  $effect(() => {
+    const i = cursor;
+    if (!listEl) return;
+    requestAnimationFrame(() => {
+      (listEl!.querySelectorAll<HTMLElement>('.list-row'))[i]?.scrollIntoView({ block: "nearest" });
+    });
+  });
   let allArtifacts = $derived(store.artifacts.data ?? []);
   let isLoading = $derived(store.artifacts.loading && allArtifacts.length === 0);
 
@@ -30,9 +82,27 @@
     prefetchTimer = null;
     prefetchTarget = null;
   }
+  let haystacks = $derived.by(() => {
+    const m = new Map<string, string>();
+    for (const a of allArtifacts) {
+      m.set(
+        a.id,
+        `${a.kind}\n${a.id}\n${a.content_hash}\n${a.path}\n${(a.aliases ?? []).join("\n")}`.toLowerCase(),
+      );
+    }
+    return m;
+  });
+
   let filtered = $derived.by(() => {
-    if (!kindFilter) return allArtifacts;
-    return allArtifacts.filter((a) => a.kind === kindFilter);
+    const q = textQuery;
+    const useText = q.length > 0;
+    const useKind = kindFilter != null;
+    if (!useText && !useKind) return allArtifacts;
+    return allArtifacts.filter((a) => {
+      if (useKind && a.kind !== kindFilter) return false;
+      if (useText && !haystacks.get(a.id)!.includes(q)) return false;
+      return true;
+    });
   });
   let kinds = $derived.by(() => {
     const s = new Set<string>();
@@ -51,18 +121,25 @@
 </script>
 
 <div class="page">
-  {#if kinds.length > 1}
-    <FilterBar>
+  <FilterBar>
+    {#if kinds.length > 1}
       <FilterChips
         label="kind"
         chips={kindChips}
         active={kindFilter}
         onSelect={(k) => router.setQuery({ kind: k })}
       />
-    </FilterBar>
-  {/if}
-  <div class="list">
-    <div class="header">
+    {/if}
+    <FilterInput
+      bind:inputRef={filterInputEl}
+      value={filterText}
+      placeholder="Filter artifacts…"
+      onInput={(v) => (filterText = v)}
+      onEnter={openCursorRow}
+    />
+  </FilterBar>
+  <div class="list" bind:this={listEl}>
+    <div class="list-head art-head">
       <div>kind</div>
       <div>aliases / id</div>
       <div>hash</div>
@@ -71,7 +148,7 @@
     </div>
     {#if isLoading}
       {#each Array(6) as _, i (i)}
-        <div class="arow">
+        <div class="list-row art-row">
           <div class="skel" style="height: 14px; width: 50px"></div>
           <div class="skel" style="height: 14px; width: 70%"></div>
           <div class="skel" style="height: 12px; width: 80px"></div>
@@ -80,16 +157,21 @@
         </div>
       {/each}
     {:else if filtered.length === 0}
-      <div class="empty">
-        <p class="title">No artifacts</p>
-        <p class="sub">Artifacts appear once a recipe finishes producing outputs.</p>
-      </div>
+      <EmptyState title="No artifacts">
+        {#snippet sub()}
+          Artifacts appear once a recipe finishes producing outputs.
+        {/snippet}
+      </EmptyState>
     {:else}
-      {#each filtered as a}
+      {#each filtered as a, i (a.id)}
         <div
-          class="arow"
-          class:is-active={router.selected === a.id}
-          onclick={() => router.select("artifacts", a.id)}
+          class="list-row art-row"
+          data-state={
+            router.selected === a.id ? "active" :
+            (cursor === i && !router.selected) ? "cursor" :
+            undefined
+          }
+          onclick={() => { cursor = i; router.select("artifacts", a.id); }}
           onmouseenter={() => onRowEnter(a.id)}
           onmouseleave={onRowLeave}
           role="button"
@@ -103,7 +185,7 @@
                 <span class="alias">{alias}</span>
               {/each}
             {:else}
-              <span class="muted mono">(no alias)</span>
+              <span class="dim mono">(no alias)</span>
             {/if}
             <span class="id mono">
               <Hash value={a.id} n={10} />
@@ -127,39 +209,16 @@
 <style>
   .page { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
   .list { flex: 1; overflow-y: auto; }
-  .header {
-    display: grid;
-    grid-template-columns: 80px 1fr 110px 1.5fr 90px;
-    column-gap: 14px;
-    padding: 6px 16px;
-    font-family: theme("fontFamily.mono");
-    font-size: 10px;
-    color: theme("colors.fg.3");
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    border-bottom: 1px solid theme("colors.line.0");
-    background: theme("colors.bg.0");
-    position: sticky;
-    top: 0;
-    z-index: 1;
+  .art-head,
+  .art-row {
+    grid-template-columns: 80px 1fr 96px 1.5fr 96px;
   }
-  .arow {
-    display: grid;
-    grid-template-columns: 80px 1fr 110px 1.5fr 90px;
-    column-gap: 14px;
-    align-items: center;
-    padding: 8px 16px;
-    border-bottom: 1px solid theme("colors.line.0");
-    cursor: pointer;
-    font-size: 13px;
-  }
-  .arow:hover, .arow.is-active { background: theme("colors.bg.2"); }
   .kind {
     font-family: theme("fontFamily.mono");
     font-size: 11px;
-    color: theme("colors.accent.dim");
+    color: var(--accent-dim);
     padding: 2px 6px;
-    background: theme("colors.accent.soft");
+    background: var(--accent-soft);
     border-radius: 3px;
     justify-self: start;
   }
@@ -167,21 +226,14 @@
   .alias {
     font-family: theme("fontFamily.mono");
     font-size: 12px;
-    color: theme("colors.fg.0");
+    color: var(--fg-0);
   }
-  .muted { color: theme("colors.fg.3"); font-size: 11px; }
   .id { font-size: 11px; }
   .path {
     font-size: 11px;
-    color: theme("colors.fg.2");
+    color: var(--fg-2);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .empty {
-    padding: 80px 24px;
-    text-align: center;
-  }
-  .empty .title { font-size: 14px; color: theme("colors.fg.0"); margin: 0 0 6px 0; }
-  .empty .sub { font-size: 13px; color: theme("colors.fg.2"); margin: 0; }
 </style>

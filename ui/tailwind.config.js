@@ -113,8 +113,9 @@ export default {
       },
       keyframes: {
         pulseDot: {
-          "0%, 100%": { opacity: "1", transform: "scale(1)" },
-          "50%": { opacity: "0.55", transform: "scale(0.85)" },
+          "0%": { opacity: "1", transform: "scale(1)", boxShadow: "0 0 0 0 var(--dot)" },
+          "50%": { opacity: "0.2", transform: "scale(0.5)", boxShadow: "0 0 0 5px transparent" },
+          "100%": { opacity: "1", transform: "scale(1)", boxShadow: "0 0 0 0 transparent" },
         },
         slideIn: {
           from: { transform: "translateX(8%)", opacity: "0" },
@@ -130,7 +131,7 @@ export default {
         },
       },
       animation: {
-        "pulse-dot": "pulseDot 1.6s ease-in-out infinite",
+        "pulse-dot": "pulseDot 1.1s cubic-bezier(0.4, 0, 0.6, 1) infinite",
         "slide-in": "slideIn 250ms cubic-bezier(0.2, 0, 0, 1)",
         "fade-in": "fadeIn 150ms cubic-bezier(0.2, 0, 0, 1)",
         shimmer: "shimmer 1.4s linear infinite",

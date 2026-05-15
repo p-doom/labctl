@@ -3,16 +3,20 @@ import type {
   ArtifactSummary,
   ClusterInfo,
   CompareView,
+  DatasetSummary,
   LineageNode,
   LogResponse,
   PipelineDetail,
   PipelineSummary,
+  PolicyCard,
+  PolicyDetail,
   RecipeHistory,
   RecipeView,
+  RolloutData,
   RunDetailResponse,
   RunEvent,
   RunSummary,
-  EvalRequest,
+  SegmentDetail,
 } from "./types";
 
 async function get<T>(path: string): Promise<T> {
@@ -48,5 +52,19 @@ export const api = {
     ),
   lineage: (id: string) =>
     get<LineageNode>(`/artifacts/${encodeURIComponent(id)}/lineage`),
-  evals: () => get<{ evals: EvalRequest[] }>("/evals").then((d) => d.evals),
+  policies: () =>
+    get<{ policies: PolicyCard[] }>("/policies").then((d) => d.policies),
+  policy: (name: string) => get<PolicyDetail>(`/policies/${encodeURIComponent(name)}`),
+  rollout: (id: string) => get<RolloutData>(`/artifacts/${encodeURIComponent(id)}/rollout`),
+  frameUrl: (id: string, n: number) => `/api/artifacts/${encodeURIComponent(id)}/frames/${n}`,
+  // Dataset explorer. `dataset()` 404s when the artifact isn't a browseable
+  // per-segment dataset (e.g. Stage C/D grain shards) — callers treat that
+  // as "no Browse section" rather than an error.
+  dataset: (id: string) => get<DatasetSummary>(`/artifacts/${encodeURIComponent(id)}/dataset`),
+  datasetSegment: (id: string, split: string, seg: string) =>
+    get<SegmentDetail>(
+      `/artifacts/${encodeURIComponent(id)}/dataset/segments/${encodeURIComponent(split)}/${encodeURIComponent(seg)}`,
+    ),
+  datasetFrameUrl: (id: string, split: string, seg: string, n: number) =>
+    `/api/artifacts/${encodeURIComponent(id)}/dataset/frames/${encodeURIComponent(split)}/${encodeURIComponent(seg)}/${n}`,
 };

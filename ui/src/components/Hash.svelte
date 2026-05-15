@@ -37,32 +37,25 @@
     gap: 6px;
     font-family: theme("fontFamily.mono");
     font-size: 12px;
-    color: theme("colors.fg.1");
-    padding: 1px 4px;
-    margin: -1px -4px;
+    color: var(--fg-1);
+    padding: 0;
     border-radius: 3px;
     background: transparent;
     border: none;
     cursor: pointer;
+    transition: color var(--dur-micro) var(--ease);
   }
-  .hash:hover {
-    background: theme("colors.bg.3");
-    color: theme("colors.fg.0");
-  }
-  .text {
-    letter-spacing: 0.01em;
-  }
+  .hash:hover { color: var(--fg-0); }
+  .text { letter-spacing: 0.01em; }
   .badge {
     font-size: 10px;
-    color: theme("colors.fg.2");
+    color: var(--fg-2);
     opacity: 0;
-    transition: opacity 150ms cubic-bezier(0.2, 0, 0, 1);
+    transition: opacity var(--dur-micro) var(--ease);
   }
-  .hash:hover .badge {
-    opacity: 1;
-  }
+  .hash:hover .badge { opacity: 1; }
   .badge.copied {
-    color: theme("colors.accent.DEFAULT");
+    color: var(--accent);
     opacity: 1;
   }
 </style>

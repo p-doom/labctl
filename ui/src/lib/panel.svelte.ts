@@ -19,10 +19,22 @@ function currentRouterEntry(): PanelEntry | null {
 }
 
 // Sync incoming router changes into the stack (avoid duplicates).
+//
+// History is scoped to a single panel-open session: when the panel
+// closes (no selection), the stack is reset. Without this, Esc on a
+// freshly-opened panel would walk back to a stale entry from a
+// previous browsing session — e.g. open run R from runs, press Esc,
+// land on the artifact you were viewing an hour ago.
 $effect.root(() => {
   $effect(() => {
     const entry = currentRouterEntry();
-    if (!entry) return;
+    if (!entry) {
+      if (stack.length > 0) {
+        stack = [];
+        index = -1;
+      }
+      return;
+    }
     const top = stack[index];
     if (top && top.view === entry.view && top.selected === entry.selected) return;
     // Truncate forward history when navigating to a new entry.

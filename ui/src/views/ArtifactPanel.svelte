@@ -9,6 +9,8 @@
   import RelativeTime from "../components/RelativeTime.svelte";
   import Icon from "../components/Icon.svelte";
   import Result from "../components/Result.svelte";
+  import MetaRow from "../components/MetaRow.svelte";
+  import DatasetExplorer from "../components/DatasetExplorer.svelte";
 
   interface Props {
     artifactId: string;
@@ -59,7 +61,7 @@
       <button
         type="button"
         class="iconbtn"
-        onclick={() => copy(detail!.artifact.content_hash)}
+        onclick={() => copy(detail.artifact.content_hash)}
         title="Copy content hash"
         aria-label="Copy content hash"
       >
@@ -77,36 +79,23 @@
     <div class="error">{error}</div>
   {:else if detail}
     <section class="meta">
-      <div class="meta-row">
-        <span class="k">id</span>
-        <span class="v"><Hash value={detail.artifact.id} n={20} /></span>
-      </div>
-      <div class="meta-row">
-        <span class="k">content hash</span>
-        <span class="v"><Hash value={detail.artifact.content_hash} n={16} /></span>
-      </div>
+      <MetaRow label="id"><Hash value={detail.artifact.id} n={20} /></MetaRow>
+      <MetaRow label="content hash"><Hash value={detail.artifact.content_hash} n={16} /></MetaRow>
       {#if detail.artifact.aliases && detail.artifact.aliases.length}
-        <div class="meta-row">
-          <span class="k">aliases</span>
-          <div class="v aliases">
+        <MetaRow label="aliases">
+          <div class="aliases">
             {#each detail.artifact.aliases as a}
               <span class="alias">{a}</span>
             {/each}
           </div>
-        </div>
+        </MetaRow>
       {/if}
-      <div class="meta-row">
-        <span class="k">created</span>
-        <span class="v"><RelativeTime ts={detail.artifact.created_at} /></span>
-      </div>
-      <div class="meta-row">
-        <span class="k">path</span>
-        <span class="v mono path" title={detail.artifact.path}>{detail.artifact.path}</span>
-      </div>
+      <MetaRow label="created"><RelativeTime ts={detail.artifact.created_at} /></MetaRow>
+      <MetaRow label="path" path={detail.artifact.path} />
     </section>
 
     <div class="action-row">
-      <button type="button" class="primary" onclick={openLineage}>
+      <button type="button" class="btn-primary" onclick={openLineage}>
         <span>Open lineage</span>
         <Icon name="external" size={12} />
       </button>
@@ -169,6 +158,15 @@
         </div>
       {/if}
     </section>
+
+    {#if detail.artifact.kind === "dataset"}
+      <section class="block">
+        <header class="block-h">
+          <h3>Browse</h3>
+        </header>
+        <DatasetExplorer artifactId={detail.artifact.id} />
+      </section>
+    {/if}
   {/if}
 </SidePanel>
 
@@ -176,13 +174,11 @@
   .title-row { display: flex; align-items: center; gap: 10px; overflow: hidden; }
   .kind {
     font-family: theme("fontFamily.mono");
-    font-size: 10px;
+    font-size: 11px;
     color: theme("colors.accent.dim");
     background: theme("colors.accent.soft");
     padding: 2px 6px;
     border-radius: 3px;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
   }
   .name {
     font-size: 14px;
@@ -193,59 +189,23 @@
   }
   .title-error { color: theme("colors.status.failed.fg"); font-size: 13px; }
 
-  .loading { padding: 24px 18px; }
-  .error { padding: 24px 18px; color: theme("colors.status.failed.fg"); font-size: 13px; }
+  .loading { padding: 24px 16px; }
+  .error { padding: 24px 16px; color: theme("colors.status.failed.fg"); font-size: 13px; }
 
-  .meta { padding: 14px 18px 6px 18px; }
-  .meta-row {
-    display: grid;
-    grid-template-columns: 110px 1fr;
-    align-items: baseline;
-    padding: 4px 0;
-    font-size: 13px;
-  }
-  .meta-row .k {
-    font-family: theme("fontFamily.mono");
-    font-size: 11px;
-    color: theme("colors.fg.3");
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-  }
-  .meta-row .v.mono {
-    font-family: theme("fontFamily.mono");
-    font-size: 12px;
-    color: theme("colors.fg.1");
-  }
-  .meta-row .v.path {
-    overflow-wrap: anywhere;
-    line-height: 1.45;
-  }
-  .meta-row .v.aliases { display: flex; gap: 4px; flex-wrap: wrap; }
+  .meta { padding: 12px 16px 4px 16px; }
+  .aliases { display: flex; gap: 4px; flex-wrap: wrap; }
   .alias {
     font-family: theme("fontFamily.mono");
     font-size: 11px;
-    color: theme("colors.accent.dim");
-    background: theme("colors.accent.soft");
+    color: var(--accent-dim);
+    background: var(--accent-soft);
     padding: 1px 6px;
     border-radius: 3px;
   }
 
-  .action-row { padding: 10px 18px 14px 18px; border-bottom: 1px solid theme("colors.line.0"); }
-  .primary {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    padding: 5px 10px;
-    border-radius: 4px;
-    cursor: pointer;
-    background: theme("colors.bg.2");
-    color: theme("colors.fg.1");
-    border: 1px solid theme("colors.line.1");
-  }
-  .primary:hover { color: theme("colors.fg.0"); border-color: theme("colors.line.2"); }
+  .action-row { padding: 8px 16px 12px 16px; border-bottom: 1px solid var(--line-0); }
 
-  .block { padding: 16px 18px; border-top: 1px solid theme("colors.line.0"); }
+  .block { padding: 16px; border-top: 1px solid theme("colors.line.0"); }
   .block-h {
     display: flex;
     align-items: baseline;
@@ -253,11 +213,9 @@
     margin: 0 0 10px 0;
   }
   .block-h h3 {
-    font-size: 11px;
-    font-family: theme("fontFamily.mono");
-    color: theme("colors.fg.3");
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    font-size: 12px;
+    font-weight: 500;
+    color: theme("colors.fg.1");
     margin: 0;
   }
   .block-h .count { font-family: theme("fontFamily.mono"); font-size: 11px; color: theme("colors.fg.2"); }

@@ -6,20 +6,19 @@
 
   import LeftRail from "./components/LeftRail.svelte";
   import TopBar from "./components/TopBar.svelte";
-  import Palette from "./components/Palette.svelte";
   import CompareBar from "./components/CompareBar.svelte";
 
   import RunsView from "./views/RunsView.svelte";
   import RunPanel from "./views/RunPanel.svelte";
   import PipelinesView from "./views/PipelinesView.svelte";
   import ArtifactsView from "./views/ArtifactsView.svelte";
-  import EvalsView from "./views/EvalsView.svelte";
+  import PoliciesView from "./views/PoliciesView.svelte";
+  import PolicyDetailView from "./views/PolicyDetailView.svelte";
   import LineageView from "./views/LineageView.svelte";
   import RecipeView from "./views/RecipeView.svelte";
   import CompareView from "./views/CompareView.svelte";
 
   let cluster = $derived(store.cluster);
-  let paletteOpen = $state(false);
 
   onMount(() => {
     connectStream();
@@ -38,25 +37,10 @@
     const target = e.target as HTMLElement | null;
     const inField =
       target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
-
-    // Cmd/Ctrl-K opens palette.
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-      e.preventDefault();
-      paletteOpen = true;
-      return;
-    }
-    // "/" opens palette too (familiar from many apps).
-    if (e.key === "/" && !inField && !paletteOpen) {
-      e.preventDefault();
-      paletteOpen = true;
-      return;
-    }
-    // While the palette is open, it owns the keyboard. Don't double-handle.
-    if (paletteOpen) return;
     if (inField) return;
 
     if (gPending) {
-      const map: Record<string, View> = { r: "runs", p: "pipelines", a: "artifacts", e: "evals" };
+      const map: Record<string, View> = { r: "runs", p: "pipelines", a: "artifacts", e: "policies" };
       const v = map[e.key.toLowerCase()];
       if (v) {
         e.preventDefault();
@@ -95,8 +79,8 @@
 <div class="shell">
   <LeftRail />
   <main>
-    {#if router.view !== "lineage" && router.view !== "recipes" && router.view !== "compare"}
-      <TopBar {cluster} onOpenPalette={() => (paletteOpen = true)} />
+    {#if router.view !== "lineage" && router.view !== "recipes" && router.view !== "compare" && !(router.view === "policies" && router.selected)}
+      <TopBar {cluster} />
     {/if}
     <div class="content">
       <!-- All four list views are always mounted; we only toggle which one
@@ -113,10 +97,14 @@
       <div class="view" data-active={router.view === "artifacts"}>
         <ArtifactsView />
       </div>
-      <div class="view" data-active={router.view === "evals"}>
-        <EvalsView />
+      <div class="view" data-active={router.view === "policies" && !router.selected}>
+        <PoliciesView />
       </div>
-      {#if router.view === "lineage" && router.selected}
+      {#if router.view === "policies" && router.selected}
+        <div class="view" data-active="true">
+          <PolicyDetailView policyName={router.selected} />
+        </div>
+      {:else if router.view === "lineage" && router.selected}
         <div class="view" data-active="true">
           <LineageView artifactId={router.selected} />
         </div>
@@ -131,7 +119,6 @@
       {/if}
     </div>
   </main>
-  <Palette open={paletteOpen} onClose={() => (paletteOpen = false)} />
   <CompareBar />
 </div>
 

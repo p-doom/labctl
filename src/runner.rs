@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     config::{ClusterConfig, InputSpec, LoadedPipeline, LoadedStage, Recipe, SchedulerKind},
-    provenance,
+    fs_layout, provenance,
     store::{InputResolution, NewRun, Store, is_terminal},
     template::{RenderContext, render_value},
     util,
@@ -70,8 +70,10 @@ pub fn submit_recipe(
     store: &mut Store,
     recipe: &Recipe,
     overrides: Option<SubmitOverrides>,
+    submitted_by: &str,
 ) -> Result<SubmittedRun> {
-    submit_recipe_inner(cluster, store, recipe, overrides, None, &[], None)
+    fs_layout::validate_user(submitted_by)?;
+    submit_recipe_inner(cluster, store, recipe, overrides, None, &[], None, submitted_by, None)
 }
 
 #[derive(Debug, Clone)]
@@ -80,7 +82,7 @@ pub struct StageContext<'a> {
     pub stage_run_ids: &'a BTreeMap<String, String>,
     /// Loaded recipes for every stage in the current pipeline. Required so
     /// downstream stages can compute the path of an upstream stage's
-    /// output: ``artifact_roots[upstream.kind] / rendered(upstream.alias)``.
+    /// output: ``output_roots[upstream.kind] / rendered(upstream.alias)``.
     pub stages: &'a BTreeMap<String, LoadedStage>,
 }
 
@@ -92,20 +94,22 @@ fn submit_recipe_inner(
     stage_ctx: Option<&StageContext<'_>>,
     parent_job_ids: &[String],
     preallocated_run_id: Option<&str>,
+    submitted_by: &str,
+    array_sweep: Option<&ArraySweepInfo>,
 ) -> Result<SubmittedRun> {
     let overrides = overrides.unwrap_or_default();
     let run_id = preallocated_run_id
         .map(|s| s.to_string())
         .unwrap_or_else(|| util::new_id("run"));
-    let run_dir = cluster.filesystem.runs_base.join(&run_id);
-    let lab_dir = run_dir.join(".lab");
+    let run_dir = fs_layout::run_dir(&cluster.filesystem.runs_base, submitted_by, &run_id);
+    let lab_dir = run_dir.join(fs_layout::LAB_DIRNAME);
     let source_root = run_dir.join("source");
     let source_path = source_root.join(&recipe.repo);
 
     fs::create_dir_all(&lab_dir)?;
 
     // Inputs first: alias templates may reference {inputs.X.path}.
-    let inputs = resolve_inputs(cluster, store, recipe, &overrides, stage_ctx)?;
+    let inputs = resolve_inputs(cluster, store, recipe, &overrides, stage_ctx, submitted_by)?;
 
     // Render output aliases against a partial context (no outputs yet — they
     // are what we are computing). An alias that references {outputs.*} would
@@ -118,7 +122,7 @@ fn submit_recipe_inner(
         inputs: &inputs,
         outputs: &empty_outputs,
     };
-    let outputs = output_paths(cluster, recipe, &alias_ctx)?;
+    let outputs = output_paths(cluster, recipe, &alias_ctx, submitted_by)?;
 
     // Materialize each output's directory so the recipe's command can write
     // into it without having to mkdir -p itself. Refuse only if the marker
@@ -197,7 +201,7 @@ fn submit_recipe_inner(
         "parent_job_ids": parent_job_ids,
     });
     util::atomic_write(
-        &lab_dir.join("context.json"),
+        &lab_dir.join(fs_layout::CONTEXT_JSON),
         &serde_json::to_vec_pretty(&ctx)?,
     )?;
 
@@ -210,11 +214,11 @@ fn submit_recipe_inner(
         &inputs,
         &output_paths_map,
         parent_job_ids,
+        array_sweep,
     )?;
-    let script_path = lab_dir.join("submit.sh");
+    let script_path = lab_dir.join(fs_layout::SUBMIT_SH);
     util::atomic_write(&script_path, script.as_bytes())?;
 
-    let submitted_by = std::env::var("USER").ok();
     store.insert_run(
         NewRun {
             id: &run_id,
@@ -224,7 +228,7 @@ fn submit_recipe_inner(
             run_dir: &run_dir,
             source_path: &source_path,
             context_json: &ctx,
-            submitted_by: submitted_by.as_deref(),
+            submitted_by: Some(submitted_by),
         },
         &inputs,
     )?;
@@ -268,12 +272,110 @@ pub struct SubmittedStage {
     pub depends_on: Vec<String>,
 }
 
+/// Submitted result for a sweep — the single array job plus the
+/// optional aggregate run (if `[sweep].aggregate` was set).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmittedSweep {
+    pub sweep_name: String,
+    /// The single SLURM array job representing all sweep tasks.
+    pub array_run: SubmittedRun,
+    pub aggregate: Option<SubmittedRun>,
+}
+
+/// Context passed through `submit_recipe_inner` → `render_script` for
+/// SLURM-array sweeps. When set, `render_script` emits
+/// `#SBATCH --array=start-end[%throttle]` and injects the sweep arg as
+/// `$SLURM_ARRAY_TASK_ID` (with an arithmetic offset when start > 0)
+/// rather than a static value.
+#[derive(Debug, Clone)]
+struct ArraySweepInfo {
+    /// The recipe `[args]` key to inject at runtime.
+    arg: String,
+    start: u32,
+    end: u32,
+    throttle: Option<u32>,
+}
+
+/// Submit the recipe as a single SLURM array job. One labctl registry
+/// entry is created; SLURM spawns (end - start + 1) array tasks, each
+/// receiving `$SLURM_ARRAY_TASK_ID` as the value of the sweep arg. If
+/// the recipe declares `[sweep].aggregate`, a second job is submitted
+/// with `--dependency=afterok:<array_job_id>` so it runs only after ALL
+/// array tasks complete.
+pub fn submit_sweep(
+    cluster: &ClusterConfig,
+    store: &mut Store,
+    recipe: &Recipe,
+    submitted_by: &str,
+) -> Result<SubmittedSweep> {
+    let sweep = recipe
+        .sweep
+        .as_ref()
+        .context("submit_sweep called on recipe without [sweep]")?;
+    fs_layout::validate_user(submitted_by)?;
+
+    // Build a recipe clone with the sweep section stripped (it's handled
+    // by render_script via ArraySweepInfo) and the sweep arg removed from
+    // the static args map (it will be injected as $SLURM_ARRAY_TASK_ID).
+    let mut array_recipe = recipe.clone();
+    array_recipe.sweep = None;
+    array_recipe.args.remove(&sweep.arg);
+
+    let array_info = ArraySweepInfo {
+        arg: sweep.arg.clone(),
+        start: sweep.start,
+        end: sweep.end,
+        throttle: sweep.throttle,
+    };
+
+    let array_run = submit_recipe_inner(
+        cluster,
+        store,
+        &array_recipe,
+        None,
+        None,
+        &[],
+        None,
+        submitted_by,
+        Some(&array_info),
+    )?;
+
+    let aggregate = if let Some(agg_path) = &sweep.aggregate {
+        let agg_recipe = crate::config::Recipe::load(agg_path)
+            .with_context(|| format!("failed to load aggregate recipe {}", agg_path.display()))?;
+        // Depend on the array job ID — SLURM resolves afterok:<array_id>
+        // as "all array elements must complete successfully".
+        let submitted = submit_recipe_inner(
+            cluster,
+            store,
+            &agg_recipe,
+            None,
+            None,
+            &[array_run.job_id.clone()],
+            None,
+            submitted_by,
+            None,
+        )?;
+        Some(submitted)
+    } else {
+        None
+    };
+
+    Ok(SubmittedSweep {
+        sweep_name: recipe.name.clone(),
+        array_run,
+        aggregate,
+    })
+}
+
 pub fn submit_pipeline(
     cluster: &ClusterConfig,
     store: &mut Store,
     pipeline: &LoadedPipeline,
     pipeline_path: Option<&Path>,
+    submitted_by: &str,
 ) -> Result<SubmittedPipeline> {
+    fs_layout::validate_user(submitted_by)?;
     // Allocate run_ids for every stage up-front so downstream stages can render
     // input paths that point at upstream run_dirs that haven't been created yet.
     let stage_run_ids: BTreeMap<String, String> = pipeline
@@ -316,6 +418,8 @@ pub fn submit_pipeline(
             Some(&stage_ctx),
             &parent_job_ids,
             Some(preallocated.as_str()),
+            submitted_by,
+            None,
         )?;
 
         let dependency_on = json!({
@@ -389,7 +493,11 @@ pub struct ReconcileStep {
 pub fn reconcile(cluster: &ClusterConfig, store: &mut Store) -> Result<ReconcileReport> {
     let mut runs_reconciled = 0;
     let mut artifacts_registered = 0;
-    for run in store.list_active_runs()? {
+    // Scope to the invoking user's own runs. `labctl reconcile` is a
+    // user action — folding the user's own SLURM state back into the
+    // registry — and must never touch another user's run rows.
+    let submitted_by = crate::store::current_user()?;
+    for run in store.list_active_runs(&submitted_by)? {
         let step = reconcile_one(cluster, store, &run)?;
         if step.status_changed {
             runs_reconciled += 1;
@@ -485,13 +593,37 @@ pub fn gc(_cluster: &ClusterConfig, store: &mut Store, terminal_snapshots: bool)
     if !terminal_snapshots {
         return Ok(0);
     }
+    gc_terminal_sources(store, 0)
+}
+
+/// Reap `source/` for terminal runs whose `finished_at` is older than
+/// `min_terminal_age_secs`. `.lab/provenance/<repo>/` (git HEAD + diff +
+/// uv.lock copy) is kept regardless, so reproducibility survives.
+///
+/// Used by the CLI (`gc()` wrapper, min_age=0) and by the agent's
+/// gc_loop (min_age>0, gives reconcile time to finalize artifacts
+/// before the working tree is removed).
+pub fn gc_terminal_sources(store: &mut Store, min_terminal_age_secs: u64) -> Result<usize> {
+    let now = util::now_ts();
+    let cutoff = min_terminal_age_secs as i64;
     let mut removed = 0;
     for run in store.list_runs()? {
-        if is_terminal(&run.status) && run.source_path.exists() {
-            fs::remove_dir_all(&run.source_path)
-                .with_context(|| format!("failed to remove {}", run.source_path.display()))?;
-            removed += 1;
+        if !is_terminal(&run.status) {
+            continue;
         }
+        if !run.source_path.exists() {
+            continue;
+        }
+        // If finished_at is missing (rare: pre-finished_at row, or
+        // sacct couldn't parse End), fall back to created_at. Either
+        // way the run is already terminal, so the bound is correct.
+        let stamp = run.finished_at.unwrap_or(run.created_at);
+        if now.saturating_sub(stamp) < cutoff {
+            continue;
+        }
+        fs::remove_dir_all(&run.source_path)
+            .with_context(|| format!("failed to remove {}", run.source_path.display()))?;
+        removed += 1;
     }
     Ok(removed)
 }
@@ -502,6 +634,7 @@ fn resolve_inputs(
     recipe: &Recipe,
     overrides: &SubmitOverrides,
     stage_ctx: Option<&StageContext<'_>>,
+    submitted_by: &str,
 ) -> Result<Vec<InputResolution>> {
     let mut out = Vec::new();
     for (role, spec) in &recipe.inputs {
@@ -558,7 +691,14 @@ fn resolve_inputs(
                 // Render the parent's alias against a partial context bound to
                 // the parent's run_id and params. Aliases must not reference
                 // {inputs.*}/{outputs.*} — render_value will bail if they do.
-                let parent_run_dir = cluster.filesystem.runs_base.join(parent_run_id);
+                // The parent stage is owned by the same submitter (one CLI
+                // invocation submits the whole pipeline), so its run dir
+                // and artifacts live under the same per-user prefix.
+                let parent_run_dir = fs_layout::run_dir(
+                    &cluster.filesystem.runs_base,
+                    submitted_by,
+                    parent_run_id,
+                );
                 let empty_inputs: Vec<InputResolution> = Vec::new();
                 let empty_outputs: BTreeMap<String, PathBuf> = BTreeMap::new();
                 let parent_ctx = RenderContext {
@@ -570,16 +710,17 @@ fn resolve_inputs(
                 };
                 let parent_alias = render_value(&parent_spec.alias, &parent_ctx)?;
                 let parent_root =
-                    cluster.filesystem.artifact_roots.get(&parent_spec.kind).with_context(
+                    cluster.filesystem.output_roots.get(&parent_spec.kind).with_context(
                         || {
                             format!(
                                 "stage {stage:?}.{parent_role:?} has kind {:?} which is \
-                                 not configured in [filesystem.artifact_roots]",
+                                 not configured in [filesystem.output_roots]",
                                 parent_spec.kind,
                             )
                         },
                     )?;
-                let resolved_path = parent_root.join(&parent_alias);
+                let resolved_path =
+                    fs_layout::artifact_dir(parent_root, submitted_by, &parent_alias);
                 InputResolution {
                     role: role.clone(),
                     artifact_id: None, // backfilled by Store::insert_artifact
@@ -596,6 +737,7 @@ fn output_paths(
     cluster: &ClusterConfig,
     recipe: &Recipe,
     render_ctx: &RenderContext<'_>,
+    submitted_by: &str,
 ) -> Result<BTreeMap<String, OutputResolution>> {
     let mut out = BTreeMap::new();
     for (role, spec) in &recipe.outputs {
@@ -607,16 +749,16 @@ fn output_paths(
         })?;
         let root = cluster
             .filesystem
-            .artifact_roots
+            .output_roots
             .get(&spec.kind)
             .with_context(|| {
                 format!(
                     "recipe {:?}: output {role:?} has kind {:?} which is not configured \
-                     in cluster {:?} [filesystem.artifact_roots]",
+                     in cluster {:?} [filesystem.output_roots]",
                     recipe.name, spec.kind, cluster.name,
                 )
             })?;
-        let path = root.join(&alias);
+        let path = fs_layout::artifact_dir(root, submitted_by, &alias);
         out.insert(
             role.clone(),
             OutputResolution {
@@ -640,6 +782,7 @@ fn render_script(
     inputs: &[InputResolution],
     outputs: &BTreeMap<String, PathBuf>,
     parent_job_ids: &[String],
+    array_sweep: Option<&ArraySweepInfo>,
 ) -> Result<String> {
     let ctx = RenderContext {
         run_id,
@@ -652,12 +795,25 @@ fn render_script(
     for (key, value) in &recipe.args {
         command.push(format!("--{}={}", key, render_value(value, &ctx)?));
     }
-    let rendered_command = command
+    // Shell-quote all static parts; the array sweep arg is appended below
+    // as a raw bash expression so $SLURM_ARRAY_TASK_ID is expanded by the
+    // sbatch wrapper, not treated as a literal string.
+    let mut rendered_command = command
         .iter()
         .map(|part| util::shell_quote(part))
         .collect::<Vec<_>>()
         .join(" ");
-    let status_path = run_dir.join(".lab/status.json");
+    if let Some(arr) = array_sweep {
+        let expr = if arr.start == 0 {
+            "$SLURM_ARRAY_TASK_ID".to_string()
+        } else {
+            format!("$((SLURM_ARRAY_TASK_ID + {}))", arr.start)
+        };
+        rendered_command.push_str(&format!(" --{}={}", arr.arg, expr));
+    }
+    let status_path = run_dir
+        .join(fs_layout::LAB_DIRNAME)
+        .join(fs_layout::STATUS_JSON);
 
     let mut script = String::new();
     if cluster.scheduler.kind == SchedulerKind::Slurm {
@@ -716,6 +872,15 @@ fn render_script(
             run_dir.display(),
             run_dir.display()
         ));
+        // Array sweep: emit --array before sbatch_extra so the user can
+        // layer additional directives on top if needed.
+        if let Some(arr) = array_sweep {
+            let array_spec = match arr.throttle {
+                Some(t) => format!("--array={}-{}%{}", arr.start, arr.end, t),
+                None => format!("--array={}-{}", arr.start, arr.end),
+            };
+            script.push_str(&format!("#SBATCH {}\n", array_spec));
+        }
         // Power-user escape hatch. Rendered last so it can layer atop the
         // typed directives, but cannot reorder them.
         for extra in &recipe.resources.sbatch_extra {
@@ -784,7 +949,13 @@ write_status running 0
     ));
     script.push_str(&format!(
         "export LABCTL_CONTEXT={}\n",
-        util::shell_quote(&run_dir.join(".lab/context.json").display().to_string())
+        util::shell_quote(
+            &run_dir
+                .join(fs_layout::LAB_DIRNAME)
+                .join(fs_layout::CONTEXT_JSON)
+                .display()
+                .to_string(),
+        )
     ));
     // Tracker env injection. Schema-declared, set after recipe.env so the
     // recipe can't accidentally clobber it. WANDB_RUN_ID = labctl run id is
@@ -903,15 +1074,37 @@ fn scheduler_outcome(
     if !output.status.success() {
         return None;
     }
+    // Aggregate all sacct rows: handles both normal jobs (one row) and
+    // array jobs (one row per element). Priority: any failure trumps all;
+    // running > submitted > succeeded (so partial completion stays "running").
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().next()?;
-    let mut parts = line.split('|');
-    let state = parts.next()?.split_whitespace().next()?.trim();
-    let end_field = parts.next().unwrap_or("").trim();
-    Some(SchedulerOutcome {
-        status: map_slurm_state(state),
-        finished_at: parse_sacct_end_utc(end_field),
-    })
+    let mut best: Option<String> = None;
+    let mut latest_end: Option<i64> = None;
+    for line in stdout.lines() {
+        let mut parts = line.split('|');
+        let Some(state_field) = parts.next() else { continue };
+        let state = state_field.split_whitespace().next().unwrap_or("").trim();
+        let end_field = parts.next().unwrap_or("").trim();
+        let status = map_slurm_state(state);
+        if let Some(ts) = parse_sacct_end_utc(end_field) {
+            latest_end = Some(latest_end.map_or(ts, |prev: i64| prev.max(ts)));
+        }
+        best = Some(match (best.as_deref(), status.as_str()) {
+            // Failure is terminal — short-circuit once seen.
+            (_, "failed" | "timeout" | "oom" | "cancelled" | "unknown_terminal") => {
+                return Some(SchedulerOutcome { status, finished_at: latest_end });
+            }
+            (None, _) => status,
+            (Some("running"), _) => "running".to_string(),
+            (Some("submitted"), "running") => "running".to_string(),
+            (Some("submitted"), _) => best.unwrap(),
+            (Some("succeeded"), "running") => "running".to_string(),
+            (Some("succeeded"), "submitted") => "running".to_string(),
+            _ => best.unwrap(),
+        });
+    }
+    let status = best?;
+    Some(SchedulerOutcome { status, finished_at: latest_end })
 }
 
 fn parse_sacct_end_utc(s: &str) -> Option<i64> {
@@ -947,7 +1140,9 @@ fn map_slurm_state(state: &str) -> String {
 }
 
 fn status_file_outcome(run_dir: &Path) -> Option<(String, Option<i64>)> {
-    let path = run_dir.join(".lab/status.json");
+    let path = run_dir
+        .join(fs_layout::LAB_DIRNAME)
+        .join(fs_layout::STATUS_JSON);
     let text = fs::read_to_string(path).ok()?;
     let status: StatusFile = serde_json::from_str(&text).ok()?;
     Some((status.status, status.updated_at))
@@ -974,9 +1169,17 @@ fn register_outputs(store: &mut Store, run: &crate::store::RunRow) -> Result<usi
                 }
                 let step_dir = entry.path();
                 let step_name = entry.file_name().to_string_lossy().to_string();
-                if !step_name.chars().all(|c| c.is_ascii_digit()) {
-                    continue;
-                }
+                // Accept any "<non-digit prefix><trailing digits>" dir name.
+                // Covers omegalax `step9000`, slime `rollout_49`, Megatron
+                // `iter_0000049`, DeepSpeed `global_step49`, HF Trainer
+                // `checkpoint-49`, and bare numeric `49`. Anything else
+                // (mixed-digit names, no trailing digits) is silently
+                // skipped — the marker filter below catches truly-stray
+                // dirs.
+                let step = match parse_trailing_step(&step_name) {
+                    Some(n) => n,
+                    None => continue,
+                };
                 if !step_dir.join(&resolution.marker).exists() {
                     continue;
                 }
@@ -999,7 +1202,6 @@ fn register_outputs(store: &mut Store, run: &crate::store::RunRow) -> Result<usi
                 // ``register-external``.
                 let canonical = step_dir.canonicalize().unwrap_or_else(|_| step_dir.clone());
                 let content_hash = util::sha256_bytes(canonical.display().to_string().as_bytes());
-                let step = step_name.parse::<u64>().unwrap_or(0);
                 let artifact = store.insert_artifact(
                     "checkpoint",
                     &step_dir,
@@ -1046,6 +1248,17 @@ fn register_outputs(store: &mut Store, run: &crate::store::RunRow) -> Result<usi
         }
     }
     Ok(count)
+}
+
+/// Extract the trailing digit run from a per-step checkpoint dir name and
+/// parse it as a u64. Returns None when the name has no trailing digits.
+/// See the call site in `register_outputs` for accepted naming conventions.
+fn parse_trailing_step(name: &str) -> Option<u64> {
+    let suffix_len = name.bytes().rev().take_while(|b| b.is_ascii_digit()).count();
+    if suffix_len == 0 {
+        return None;
+    }
+    name[name.len() - suffix_len..].parse::<u64>().ok()
 }
 
 /// Last 8 chars of a labctl run id, used for short human-readable run names

@@ -1,5 +1,7 @@
 //! `labctl service install / uninstall / status` — manage the systemd
-//! user unit that keeps `labctl serve` alive.
+//! user unit that keeps `labctl serve` alive. One unit, one process:
+//! the UI and dispatch loops (reconcile + evald + throttle) share a
+//! single in-memory cache and run inside the same tokio runtime.
 //!
 //! Why an explicit subcommand and not auto-install on first run: labctl
 //! runs on HPC login nodes, dev laptops, containers, CI. systemd is one
@@ -25,9 +27,25 @@ use anyhow::{Context, Result, bail};
 const DEFAULT_UNIT_NAME: &str = "labctl";
 const DEFAULT_BIND: &str = "127.0.0.1:8765";
 
+/// Which long-running labctl process the systemd unit should start.
+///
+/// - `Serve { no_dispatch: false }` — all-in-one (HTTP + dispatch in
+///   one process). The single-user default; install via
+///   `labctl service install`.
+/// - `Serve { no_dispatch: true }` — pure read-only HTTP window. The
+///   shared UI host in a multi-tenant rollout; install via
+///   `labctl service install --no-dispatch`.
+/// - `Agent` — dispatch-only, no HTTP listener. Each user's own
+///   reconcile + evald in the multi-tenant model; install via
+///   `labctl service install --agent`.
+pub enum UnitMode {
+    Serve { bind: String, no_dispatch: bool },
+    Agent,
+}
+
 pub struct InstallOptions {
     pub cluster_path: PathBuf,
-    pub bind: String,
+    pub mode: UnitMode,
     pub unit_name: String,
     pub force: bool,
 }
@@ -36,7 +54,10 @@ impl InstallOptions {
     pub fn new(cluster_path: PathBuf) -> Self {
         Self {
             cluster_path,
-            bind: DEFAULT_BIND.to_string(),
+            mode: UnitMode::Serve {
+                bind: DEFAULT_BIND.to_string(),
+                no_dispatch: false,
+            },
             unit_name: DEFAULT_UNIT_NAME.to_string(),
             force: false,
         }
@@ -48,19 +69,26 @@ impl InstallOptions {
 pub fn render_unit(
     binary_path: &Path,
     cluster_path: &Path,
-    bind: &str,
+    mode: &UnitMode,
     unit_name: &str,
 ) -> String {
+    let exec_args = match mode {
+        UnitMode::Serve { bind, no_dispatch } => {
+            let suffix = if *no_dispatch { " --no-dispatch" } else { "" };
+            format!("serve --bind {bind}{suffix}")
+        }
+        UnitMode::Agent => "agent".to_string(),
+    };
     format!(
         "[Unit]
-Description=labctl ({unit_name}) — UI + dispatch
+Description=labctl ({unit_name})
 After=network-online.target
 StartLimitIntervalSec=120
 StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart={binary} --cluster {cluster} serve --bind {bind}
+ExecStart={binary} --cluster {cluster} {exec_args}
 Restart=on-failure
 RestartSec=5
 # Capture stdout/stderr through journalctl so it's `journalctl --user -u {unit_name}`-able.
@@ -72,8 +100,6 @@ WantedBy=default.target
 ",
         binary = binary_path.display(),
         cluster = cluster_path.display(),
-        bind = bind,
-        unit_name = unit_name,
     )
 }
 
@@ -94,7 +120,7 @@ pub fn install(opts: InstallOptions) -> Result<()> {
             unit_path.display()
         );
     }
-    let unit = render_unit(&binary, &cluster, &opts.bind, &opts.unit_name);
+    let unit = render_unit(&binary, &cluster, &opts.mode, &opts.unit_name);
     if let Some(parent) = unit_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -256,15 +282,50 @@ mod tests {
         let unit = render_unit(
             &PathBuf::from("/usr/local/bin/labctl"),
             &PathBuf::from("/etc/labctl/cluster.toml"),
-            "127.0.0.1:8765",
+            &UnitMode::Serve {
+                bind: "127.0.0.1:8765".to_string(),
+                no_dispatch: false,
+            },
             "labctl",
         );
-        assert!(unit.contains("ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml serve --bind 127.0.0.1:8765"));
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml serve --bind 127.0.0.1:8765"
+        ));
+        assert!(!unit.contains("--no-dispatch"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
-        // No relative paths in the unit — those break when systemd
-        // launches the service from a different cwd.
         assert!(!unit.contains("ExecStart=labctl"));
+    }
+
+    #[test]
+    fn agent_unit_omits_bind_and_uses_agent_subcommand() {
+        let unit = render_unit(
+            &PathBuf::from("/usr/local/bin/labctl"),
+            &PathBuf::from("/etc/labctl/cluster.toml"),
+            &UnitMode::Agent,
+            "labctl-agent",
+        );
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml agent"
+        ));
+        assert!(!unit.contains("--bind"));
+        assert!(!unit.contains("serve"));
+    }
+
+    #[test]
+    fn ui_unit_appends_no_dispatch_flag() {
+        let unit = render_unit(
+            &PathBuf::from("/usr/local/bin/labctl"),
+            &PathBuf::from("/etc/labctl/cluster.toml"),
+            &UnitMode::Serve {
+                bind: "127.0.0.1:8765".to_string(),
+                no_dispatch: true,
+            },
+            "labctl-ui",
+        );
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml serve --bind 127.0.0.1:8765 --no-dispatch"
+        ));
     }
 
     #[test]
@@ -272,7 +333,10 @@ mod tests {
         let unit = render_unit(
             &PathBuf::from("/x"),
             &PathBuf::from("/y"),
-            "127.0.0.1:9000",
+            &UnitMode::Serve {
+                bind: "127.0.0.1:9000".to_string(),
+                no_dispatch: false,
+            },
             "labctl-staging",
         );
         assert!(unit.contains("labctl (labctl-staging)"));

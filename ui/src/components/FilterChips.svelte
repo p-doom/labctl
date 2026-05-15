@@ -56,10 +56,8 @@
     flex-wrap: wrap;
   }
   .label {
-    font-size: 10px;
-    color: theme("colors.fg.3");
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
+    font-size: 11px;
+    color: theme("colors.fg.2");
     flex-shrink: 0;
   }
   .chips {

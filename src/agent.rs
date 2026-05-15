@@ -1,19 +1,27 @@
-//! In-process dispatch loop.
+//! Per-user dispatch loops: reconcile + evald + throttle, plus the
+//! periodic filesystem→cache refresh task that keeps the in-memory
+//! cache aligned with sidecars written by other processes.
 //!
-//! When `[dispatch]` is set in the cluster config, `labctl serve` spawns
-//! these tokio tasks as a sidecar to the HTTP server:
+//! Spawned as tokio tasks either alongside the HTTP server inside
+//! `server::serve` (all-in-one mode) or standalone from `labctl agent`
+//! (per-user agent mode, no HTTP — pairs with one shared read-only
+//! `labctl serve --no-dispatch`). Every loop operates exclusively on
+//! its user's runs:
 //!
-//! - **reconcile_loop** — every `reconcile_interval_secs`, walk active
-//!   runs and call `runner::reconcile_one` per run. Acquires the store
-//!   mutex for one run at a time so HTTP requests interleave between
-//!   iterations.
-//! - **evald_loop** — every `evald_interval_secs`, walk
-//!   `policies_dir/*.toml`, call `evald::run_once` for each, then
-//!   enforce the optional throttle.
+//! - **reconcile_loop** — every `reconcile_interval_secs`, walks active
+//!   runs and calls `runner::reconcile_one` per run. `sacct -j <jobid>`
+//!   is user-agnostic, but writes only go to runs in this user's
+//!   `runs/<user>/` subtree because that's the only place this `Store`
+//!   has rows for.
+//! - **evald_loop** — every `evald_interval_secs`, walks
+//!   `policies_dir/*.toml` and submits eval recipes via the same all-CLI
+//!   path the user's `labctl run` uses, so the eval job is owned by the
+//!   running user in SLURM.
+//! - **throttle** — `squeue -u $USER` is naturally per-user.
 //!
-//! Each task wraps its body in error-tolerant logging — a transient
-//! `sacct` flake doesn't kill the daemon. systemd's `Restart=on-failure`
-//! is the safety net for genuine panics.
+//! Each loop body wraps in error-tolerant logging — a transient `sacct`
+//! flake doesn't kill the daemon. systemd's `Restart=on-failure` is the
+//! safety net for panics.
 
 use std::{
     path::PathBuf,
@@ -32,22 +40,87 @@ use crate::{
     util,
 };
 
-/// Spawn the dispatch tasks. Returns immediately; the tasks live on the
-/// tokio runtime until `shutdown` fires.
+/// Periodically re-walk the registry from disk so the cache reflects
+/// sidecars written by other processes (CLI submissions, other users'
+/// daemons in a multi-tenant deployment).
+///
+/// The work is split into three phases so the Store's std::Mutex is
+/// held only for microseconds at a time — never for the duration of
+/// the slow filesystem walk:
+///
+///   1. **Snapshot** (brief lock): copy `runs_base` / `artifact_roots`
+///      out of the Store, plus the live events table. ~ms.
+///   2. **Build** (no lock): on a blocking thread, construct a fresh
+///      in-memory SQLite cache from disk, then re-insert the
+///      preserved events (with their original ids so the SSE tailer's
+///      cursor stays valid). This is the 1-5s walk; concurrent HTTP
+///      readers and dispatch writers proceed normally because no lock
+///      is held during it.
+///   3. **Swap** (brief lock): atomically replace the Store's cache
+///      field with the new Connection. The previous Connection is
+///      dropped at the end of this scope. ~microseconds.
+///
+/// Net effect: a /api/runs request is no longer occasionally stuck
+/// behind a 1-5s refresh; reads consistently hit the cache directly.
+pub async fn periodic_refresh(store: Arc<Mutex<Store>>, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Drop the first tick — the indexer just ran during `Store::open`.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let store = store.clone();
+        let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            // Phase 1 — brief lock.
+            let (runs_base, artifact_roots, events) = {
+                let s = store.lock().unwrap();
+                let (rb, ar) = s.snapshot_paths();
+                let ev = s.snapshot_events()?;
+                (rb, ar, ev)
+            };
+            // Phase 2 — no lock; this is the 1-5s filesystem walk.
+            let new_cache = Store::build_disk_snapshot(&runs_base, &artifact_roots, &events)?;
+            // Phase 3 — brief lock for the swap.
+            store.lock().unwrap().replace_cache(new_cache);
+            Ok(())
+        });
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("periodic_refresh: refresh failed: {e:#}"),
+            Err(e) => eprintln!("periodic_refresh: join failed: {e}"),
+        }
+    }
+}
+
+/// Spawn reconcile + evald + gc tokio tasks. Returns immediately; the
+/// tasks live until `shutdown` fires. With no `[dispatch]` block
+/// configured, logs a notice and returns without spawning anything.
 pub fn spawn(
     cluster: Arc<ClusterConfig>,
     store: Arc<Mutex<Store>>,
     shutdown: Arc<Notify>,
 ) {
     let Some(dispatch) = cluster.dispatch.clone() else {
+        eprintln!(
+            "labctl: no [dispatch] block in cluster config; reconcile + evald disabled"
+        );
         return;
     };
     eprintln!(
-        "labctl dispatch: reconcile every {}s, evald every {}s, policies={}",
+        "labctl: dispatch — reconcile every {}s, evald every {}s, policies={}",
         dispatch.reconcile_interval_secs,
         dispatch.evald_interval_secs,
         dispatch.policies_dir.display(),
     );
+    if dispatch.gc.enabled {
+        eprintln!(
+            "labctl: dispatch — gc every {}s (min_terminal_age={}s)",
+            dispatch.gc.interval_secs, dispatch.gc.min_terminal_age_secs,
+        );
+    } else {
+        eprintln!("labctl: dispatch — gc disabled");
+    }
+
     let cluster_r = cluster.clone();
     let store_r = store.clone();
     let shutdown_r = shutdown.clone();
@@ -56,12 +129,44 @@ pub fn spawn(
         reconcile_loop(cluster_r, store_r, dispatch_r, shutdown_r).await;
     });
 
+    let cluster_g = cluster.clone();
+    let store_g = store.clone();
+    let shutdown_g = shutdown.clone();
+    let dispatch_g = dispatch.clone();
+    tokio::spawn(async move {
+        gc_loop(cluster_g, store_g, dispatch_g, shutdown_g).await;
+    });
+
     let cluster_e = cluster;
     let store_e = store;
     let shutdown_e = shutdown;
     tokio::spawn(async move {
         evald_loop(cluster_e, store_e, dispatch, shutdown_e).await;
     });
+}
+
+/// Standalone agent entrypoint: build a tokio runtime, spawn the
+/// periodic refresh task and the dispatch loops, then block on SIGINT.
+/// Used by the `labctl agent` subcommand — paired with one shared
+/// `labctl serve --no-dispatch` for the multi-tenant rollout model
+/// described in `docs/ONBOARDING.md`. Owns no HTTP listener; this
+/// process never accepts a network connection.
+pub fn run_standalone(cluster: ClusterConfig, store: Store) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build tokio runtime: {e}"))?;
+    runtime.block_on(async move {
+        let store = Arc::new(Mutex::new(store));
+        let shutdown = Arc::new(Notify::new());
+        tokio::spawn(periodic_refresh(store.clone(), Duration::from_secs(10)));
+        spawn(Arc::new(cluster), store.clone(), shutdown.clone());
+        eprintln!("labctl agent running (no HTTP listener; ctrl-c to stop)");
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("\nshutting down");
+        shutdown.notify_waiters();
+    });
+    Ok(())
 }
 
 async fn reconcile_loop(
@@ -91,9 +196,21 @@ fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Mutex<Store>>) {
     // Snapshot the active-run list under one short lock, then iterate
     // outside the lock — taking the mutex per run. UI requests can
     // interleave between runs instead of waiting for the whole pass.
+    // Scope to runs this daemon's OS user submitted: in a multi-tenant
+    // deployment each user runs their own daemon over a shared
+    // filesystem-truth registry, and a daemon that reconciles another
+    // user's runs would race with that user's daemon on every status
+    // write.
+    let submitted_by = match crate::store::current_user() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("labctl dispatch: cannot resolve current user: {e:#}");
+            return;
+        }
+    };
     let runs = match {
         let s = store.lock().unwrap();
-        s.list_active_runs()
+        s.list_active_runs(&submitted_by)
     } {
         Ok(rs) => rs,
         Err(e) => {
@@ -127,6 +244,52 @@ fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Mutex<Store>>) {
         eprintln!(
             "labctl dispatch: reconciled {runs_reconciled} run(s), registered {artifacts_registered} artifact(s)"
         );
+    }
+}
+
+/// Reap `<run_dir>/source/<repo>/` for terminal runs that have been
+/// settled for at least `dispatch.gc.min_terminal_age_secs`. Skipped
+/// entirely when the agent is configured with `[dispatch.gc] enabled =
+/// false`. The provenance bundle under `.lab/provenance/<repo>/` is
+/// independent and never touched here — losing source/ doesn't lose
+/// reproducibility, just the convenience of a pre-built working tree.
+async fn gc_loop(
+    cluster: Arc<ClusterConfig>,
+    store: Arc<Mutex<Store>>,
+    dispatch: DispatchConfig,
+    shutdown: Arc<Notify>,
+) {
+    if !dispatch.gc.enabled {
+        // Don't even tick — pin the task to shutdown so it parks
+        // cleanly when the daemon stops.
+        shutdown.notified().await;
+        eprintln!("labctl dispatch: gc_loop shutdown (was disabled)");
+        return;
+    }
+    let interval = Duration::from_secs(dispatch.gc.interval_secs);
+    let min_age = dispatch.gc.min_terminal_age_secs;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {
+                do_gc(&cluster, &store, min_age);
+            }
+            _ = shutdown.notified() => {
+                eprintln!("labctl dispatch: gc_loop shutdown");
+                return;
+            }
+        }
+    }
+}
+
+fn do_gc(_cluster: &ClusterConfig, store: &Arc<Mutex<Store>>, min_terminal_age_secs: u64) {
+    let removed = {
+        let mut s = store.lock().unwrap();
+        runner::gc_terminal_sources(&mut s, min_terminal_age_secs)
+    };
+    match removed {
+        Ok(0) => {}
+        Ok(n) => eprintln!("labctl dispatch: gc reaped {n} source snapshot(s)"),
+        Err(e) => eprintln!("labctl dispatch: gc failed: {e:#}"),
     }
 }
 

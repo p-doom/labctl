@@ -16,4 +16,8 @@ fn main() {
     println!("cargo:rustc-env=LABCTL_GIT_SHA={sha}");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
+    // rust-embed embeds ui/dist/ at compile time. Cargo fingerprints sources
+    // by content, so without these hints a fresh `vite build` doesn't trigger
+    // a rebuild and the binary keeps serving stale assets.
+    println!("cargo:rerun-if-changed=ui/dist");
 }

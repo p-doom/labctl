@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use crate::{
     config::{ClusterConfig, EvalPolicy, Recipe},
+    fs_layout,
     runner::{self, SubmitOverrides},
     store::{ArtifactRow, EvalRequestSlot, Store},
     util,
@@ -39,7 +40,21 @@ pub fn run_once(
 ) -> Result<EvaldReport> {
     let recipe = Recipe::load(&policy.recipe)?;
     let recipe_hash = util::sha256_bytes(&serde_json::to_vec(&recipe)?);
-    let checkpoints = store.artifacts_by_kind(&policy.applies_to.kind)?;
+    // Eval submissions are owned by the OS user the agent runs as. The
+    // path-canonical layout requires a real `$USER`; a sentinel like
+    // "evald" would not validate.
+    let submitted_by = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .map_err(|_| anyhow::anyhow!("USER not set; cannot run evald"))?;
+    fs_layout::validate_user(&submitted_by)?;
+    // Scope candidates to checkpoints produced by this daemon's own
+    // user. In a multi-tenant deployment (one daemon per user, shared
+    // filesystem-truth registry) each evald must only dispatch evals
+    // for checkpoints it owns — otherwise user A's daemon would submit
+    // evals against user B's checkpoints, charging A's SLURM account
+    // and double-dispatching against B's daemon's work.
+    let checkpoints = store
+        .artifacts_by_kind_for_producer_user(&policy.applies_to.kind, &submitted_by)?;
     let mut report = EvaldReport {
         considered: 0,
         submitted: 0,
@@ -81,7 +96,15 @@ pub fn run_once(
         overrides
             .input_artifacts
             .insert("checkpoint".to_string(), checkpoint.id.clone());
-        let submitted = runner::submit_recipe(cluster, store, &recipe, Some(overrides))?;
+        // Mark the submitter so the UI's user filter chip can distinguish
+        // dispatcher-fired evals from human-submitted runs.
+        let submitted = runner::submit_recipe(
+            cluster,
+            store,
+            &recipe,
+            Some(overrides),
+            &submitted_by,
+        )?;
         match slot {
             EvalRequestSlot::Fresh => {
                 store.insert_eval_request(

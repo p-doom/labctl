@@ -29,8 +29,8 @@
       <span class="hint">pick another to compare</span>
     {/if}
     <div class="spacer"></div>
-    <button type="button" class="ghost" onclick={clear}>Clear</button>
-    <button type="button" class="primary" onclick={go} disabled={count < 2}>
+    <button type="button" class="btn-ghost pill-shape" onclick={clear}>Clear</button>
+    <button type="button" class="btn-primary pill-shape" onclick={go} disabled={count < 2}>
       <span>Compare</span>
       <Icon name="chevron-right" size={12} />
     </button>
@@ -87,37 +87,8 @@
     color: var(--fg-3);
   }
   .spacer { width: 12px; }
-  .ghost,
-  .primary {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    padding: 5px 12px;
+  .pill-shape {
     border-radius: 999px;
-    cursor: pointer;
-    border: 1px solid transparent;
-  }
-  .ghost {
-    background: transparent;
-    color: var(--fg-1);
-  }
-  .ghost:hover {
-    color: var(--fg-0);
-  }
-  .primary {
-    background: var(--accent-soft);
-    color: var(--accent-dim);
-    border-color: var(--accent-soft);
-  }
-  .primary:hover {
-    background: var(--accent);
-    color: var(--bg-0);
-    border-color: var(--accent);
-  }
-  .primary:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-    pointer-events: none;
+    padding: 5px 12px;
   }
 </style>

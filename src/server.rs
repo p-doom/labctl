@@ -1,11 +1,15 @@
 //! HTTP API + embedded SPA. Behind the `ui` feature.
 //!
-//! The daemon is the **single writer** to the registry — `labctl run` and
-//! `labctl run-pipeline` POST here by default; admin commands still write
-//! directly. We expect this to bind 127.0.0.1 on a login node and be reached
-//! over an SSH tunnel. No auth today; access control is "who can SSH in."
+//! Read-only window onto the filesystem-truth registry. The CLI is the
+//! only writer in the new model — every `labctl run` / `labctl
+//! run-pipeline` writes sidecars directly under its own uid, never
+//! through here. This server's job is to surface the in-memory cache
+//! (built by the indexer at startup) over HTTP for the SPA. Bind to
+//! 127.0.0.1 on a login node and reach it over an SSH tunnel; access
+//! control is "who can SSH in."
 
 use std::{
+    collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
     path::PathBuf,
@@ -32,8 +36,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
 
 use crate::{
-    config::{ClusterConfig, LoadedPipeline, Recipe},
-    runner,
+    config::ClusterConfig,
     store::{ArtifactRow, RunRow, Store, is_terminal},
 };
 
@@ -48,6 +51,10 @@ struct AppState {
     /// Broadcast channel for SSE clients. The events-table tail task posts
     /// here; each connected client subscribes via `/api/stream`.
     events_tx: broadcast::Sender<StreamEvent>,
+    /// Per-artifact dataset summary cache. Datasets are immutable post-
+    /// completion so we walk once and reuse. Keyed by artifact id; entry is
+    /// `None` if the artifact has no browseable per-segment layout.
+    dataset_cache: Arc<Mutex<HashMap<String, Arc<Option<DatasetSummary>>>>>,
 }
 
 /// Outbound SSE message. Kept tiny — just enough for the client cache to
@@ -74,11 +81,12 @@ pub fn serve(
         store: Arc::new(Mutex::new(store)),
         cluster: Arc::new(cluster),
         events_tx: events_tx.clone(),
+        dataset_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let api = Router::new()
-        .route("/runs", get(list_runs).post(submit_run))
-        .route("/pipelines", get(list_pipelines).post(submit_pipeline))
+        .route("/runs", get(list_runs))
+        .route("/pipelines", get(list_pipelines))
         .route("/runs/:id", get(get_run))
         .route("/runs/:id/log", get(get_run_log))
         .route("/runs/:id/events", get(get_run_events))
@@ -91,11 +99,25 @@ pub fn serve(
         .route("/artifacts", get(list_artifacts))
         .route("/artifacts/:id", get(get_artifact))
         .route("/artifacts/:id/lineage", get(get_artifact_lineage))
+        .route("/artifacts/:id/rollout", get(get_artifact_rollout))
+        .route("/artifacts/:id/frames/:n", get(get_artifact_frame))
+        .route("/artifacts/:id/dataset", get(get_artifact_dataset))
+        .route(
+            "/artifacts/:id/dataset/segments/:split/:seg",
+            get(get_artifact_dataset_segment),
+        )
+        .route(
+            "/artifacts/:id/dataset/frames/:split/:seg/:n",
+            get(get_artifact_dataset_frame),
+        )
         .route("/evals", get(list_evals))
+        .route("/policies", get(list_policies))
+        .route("/policies/:name", get(get_policy))
         .route("/cluster", get(get_cluster))
         .route("/stream", get(stream_handler));
 
     let tail_store = state.store.clone();
+    let refresh_store = state.store.clone();
     let dispatch_cluster = state.cluster.clone();
     let dispatch_store = state.store.clone();
     let app = Router::new()
@@ -110,32 +132,36 @@ pub fn serve(
         .context("failed to build tokio runtime")?;
 
     runtime.block_on(async move {
-        // Background task: tail the events table and broadcast deltas to
-        // SSE subscribers. Single SQLite query per tick, regardless of
-        // client count. 500ms is the user-perceptible threshold for "live."
+        // Background task: tail the in-process events table for SSE
+        // subscribers. Since dispatch and the HTTP handlers share one
+        // Store in this process, dispatch writes are immediately
+        // visible — the tailer just queries the cache for new rows
+        // since its last cursor.
         tokio::spawn(events_tailer(tail_store, events_tx));
 
-        // In-process dispatch loop, when configured. Spawned only if
-        // [dispatch] is set in the cluster config and the operator
-        // didn't pass --no-dispatch. Replaces the standalone
-        // eval_dispatcher.sh script: same loops, supervised by tokio
-        // and the OS service manager (systemd Restart=on-failure)
-        // instead of a long-lived nohup'd bash.
+        // Background task: re-walk the filesystem-truth registry on a
+        // timer so the in-memory cache stays current with sidecars
+        // written by out-of-process CLI invocations (`labctl run`,
+        // `labctl run-pipeline`). Without this, the cache only learns
+        // about runs submitted in-process and silently diverges from
+        // disk between daemon restarts.
+        tokio::spawn(crate::agent::periodic_refresh(refresh_store, Duration::from_secs(10)));
+
         let dispatch_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-        if !no_dispatch && dispatch_cluster.dispatch.is_some() {
-            crate::dispatch::spawn(
+        if !no_dispatch {
+            crate::agent::spawn(
                 dispatch_cluster,
                 dispatch_store,
                 dispatch_shutdown.clone(),
             );
-        } else if no_dispatch {
+        } else {
             eprintln!("labctl: dispatch disabled by --no-dispatch");
         }
 
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("failed to bind {addr}"))?;
-        eprintln!("labctl ui listening on http://{addr}");
+        eprintln!("labctl listening on http://{addr}");
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await
@@ -153,8 +179,10 @@ async fn events_tailer(
     store: Arc<Mutex<Store>>,
     tx: broadcast::Sender<StreamEvent>,
 ) {
-    // Start at the current tip so we don't replay the entire backlog on
-    // every server restart. New events from this point forward are pushed.
+    // Start at the current tip so we don't replay the entire backlog
+    // on every server restart. New events are appended to the cache
+    // synchronously by dispatch writes (Store::event), so the tailer
+    // just polls for ids strictly greater than its last cursor.
     let mut last_id: i64 = {
         let s = store.lock().unwrap();
         s.max_event_id().unwrap_or(0)
@@ -163,8 +191,6 @@ async fn events_tailer(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        // No subscribers → don't even hit SQLite. Saves wakeup work when
-        // nobody has the UI open.
         if tx.receiver_count() == 0 {
             continue;
         }
@@ -302,45 +328,6 @@ async fn list_runs(State(state): State<AppState>) -> Result<axum::Json<Value>, A
     let store = state.store.lock().unwrap();
     let runs: Vec<Value> = store.list_runs()?.iter().map(run_summary).collect();
     Ok(axum::Json(json!({ "runs": runs })))
-}
-
-/// Submit a single recipe. Body: a fully-parsed ``Recipe`` JSON. The CLI
-/// parses the user's TOML so the daemon doesn't need read access to the
-/// user's filesystem; the daemon owns the registry write and the sbatch
-/// invocation.
-async fn submit_run(
-    State(state): State<AppState>,
-    axum::Json(recipe): axum::Json<Recipe>,
-) -> Result<axum::Json<Value>, ApiError> {
-    let mut store = state.store.lock().unwrap();
-    let submitted = runner::submit_recipe(&state.cluster, &mut store, &recipe, None)
-        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    Ok(axum::Json(json!({
-        "run_id": submitted.run_id,
-        "job_id": submitted.job_id,
-        "run_dir": submitted.run_dir.display().to_string(),
-    })))
-}
-
-#[derive(Debug, Deserialize)]
-struct SubmitPipelineBody {
-    pipeline: LoadedPipeline,
-    /// Optional path the CLI loaded the pipeline from. Recorded in the
-    /// registry for provenance. The daemon does not read it.
-    pipeline_path: Option<String>,
-}
-
-async fn submit_pipeline(
-    State(state): State<AppState>,
-    axum::Json(body): axum::Json<SubmitPipelineBody>,
-) -> Result<axum::Json<Value>, ApiError> {
-    let mut store = state.store.lock().unwrap();
-    let path = body.pipeline_path.as_deref().map(std::path::Path::new);
-    let submitted = runner::submit_pipeline(&state.cluster, &mut store, &body.pipeline, path)
-        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let body = serde_json::to_value(&submitted)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    Ok(axum::Json(body))
 }
 
 async fn get_run(
@@ -1275,12 +1262,702 @@ async fn list_evals(State(state): State<AppState>) -> Result<axum::Json<Value>, 
     Ok(axum::Json(json!({ "evals": evals })))
 }
 
+/// One row per distinct policy with aggregate counts and a small sparkline
+/// trajectory for each of the most recent training runs that ran under
+/// this policy. Sparkline points carry just (step, value) of the policy's
+/// most-common metric — enough to draw the row at a glance without
+/// fetching the full detail.
+async fn list_policies(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
+    let store = state.store.lock().unwrap();
+    let summaries = store.policy_summaries()?;
+    let mut out: Vec<Value> = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let card = build_policy_card(&store, &summary)?;
+        out.push(card);
+    }
+    Ok(axum::Json(json!({ "policies": out })))
+}
+
+/// Policy detail: every training run that has eval data for this policy,
+/// pivoted by metric the same way the recipe/compare views are pivoted.
+/// Plus the raw eval_requests list for the activity drawer at the bottom
+/// of the page.
+async fn get_policy(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let store = state.store.lock().unwrap();
+    let requests = store.eval_requests_by_policy(&name)?;
+    if requests.is_empty() {
+        return Err(not_found(format!("policy not found: {name}")));
+    }
+
+    // Distinct training runs that produced the checkpoints referenced by
+    // these requests. Order by created_at desc so the leaderboard and the
+    // chart's legend feel consistent.
+    let mut run_ids: Vec<String> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for req in &requests {
+        let Some(ckpt_id) = req.get("checkpoint_artifact_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(producer) = store
+            .get_artifact_optional(ckpt_id)
+            .ok()
+            .flatten()
+            .and_then(|a| a.producer_run_id)
+        else {
+            continue;
+        };
+        if seen.insert(producer.clone()) {
+            run_ids.push(producer);
+        }
+    }
+    let mut runs: Vec<crate::store::RunRow> = Vec::with_capacity(run_ids.len());
+    for id in &run_ids {
+        if let Ok(r) = store.get_run(id) {
+            runs.push(r);
+        }
+    }
+    runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let mut body = build_metric_pivot_for_policy(&store, &runs, &name);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("policy_name".into(), Value::String(name));
+        obj.insert("requests".into(), Value::Array(requests));
+    }
+    Ok(axum::Json(body))
+}
+
+/// Header card for the policies list. Picks the most-common metric across
+/// this policy's eval runs as the headline and emits up to N sparkline
+/// trajectories (one per recent training run).
+fn build_policy_card(
+    store: &Store,
+    summary: &crate::store::PolicySummaryRow,
+) -> Result<Value, ApiError> {
+    const SPARK_RUNS: usize = 4;
+
+    let requests = store.eval_requests_by_policy(&summary.name)?;
+
+    // Group eval_requests by the producer run of the checkpoint. We only
+    // need recent producers; cap at SPARK_RUNS distinct most-recent ones.
+    let mut producer_order: Vec<String> = Vec::new();
+    let mut producer_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for req in &requests {
+        let Some(ckpt_id) = req.get("checkpoint_artifact_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(producer) = store
+            .get_artifact_optional(ckpt_id)
+            .ok()
+            .flatten()
+            .and_then(|a| a.producer_run_id)
+        else {
+            continue;
+        };
+        if producer_seen.insert(producer.clone()) {
+            producer_order.push(producer);
+        }
+    }
+
+    // Sort producer runs by created_at desc, keep the top N.
+    let mut runs: Vec<crate::store::RunRow> = producer_order
+        .iter()
+        .filter_map(|id| store.get_run(id).ok())
+        .collect();
+    runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    runs.truncate(SPARK_RUNS);
+
+    // Pivot to find the policy's primary metric (most-common across recent
+    // runs) — sparklines render only that metric so all rows are comparable.
+    let pivot = build_metric_pivot(store, &runs);
+    let primary_metric = pivot
+        .get("metrics")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let primary_series = match primary_metric.as_deref() {
+        Some(metric) => pivot
+            .get("series_by_metric")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter().find(|s| {
+                    s.get("metric_name").and_then(|m| m.as_str()) == Some(metric)
+                })
+            })
+            .cloned()
+            .unwrap_or(Value::Null),
+        None => Value::Null,
+    };
+
+    Ok(json!({
+        "name": summary.name,
+        "primary_metric": primary_metric,
+        "total_count": summary.total,
+        "failed_count": summary.failed,
+        "running_count": summary.running,
+        "last_fired_at": summary.last_fired_at,
+        "series": primary_series,
+    }))
+}
+
+/// Like `build_metric_pivot` but restricted to metric points that came
+/// from eval runs whose `policy_id` matches `policy`. Cross-policy noise
+/// on the same training runs is filtered out so the chart for `mmlu`
+/// doesn't accidentally include points emitted by an `ifeval` policy.
+fn build_metric_pivot_for_policy(
+    store: &Store,
+    runs: &[crate::store::RunRow],
+    policy: &str,
+) -> Value {
+    use std::collections::BTreeMap;
+
+    type RunPoints = Vec<(Option<i64>, Value, Option<String>, String, String)>;
+    let mut by_metric: BTreeMap<String, BTreeMap<String, RunPoints>> = BTreeMap::new();
+
+    for run in runs {
+        let points = metric_points_for_run(store, &run.id);
+        for p in points {
+            if p.metric_name.is_empty() || p.value.is_none() {
+                continue;
+            }
+            if p.policy_id != policy {
+                continue;
+            }
+            by_metric
+                .entry(p.metric_name)
+                .or_default()
+                .entry(run.id.clone())
+                .or_default()
+                .push((
+                    p.step,
+                    p.value.unwrap(),
+                    p.eval_run_id,
+                    p.state,
+                    p.checkpoint_artifact_id,
+                ));
+        }
+    }
+
+    let mut run_meta_map: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
+    for r in runs {
+        run_meta_map.insert(
+            r.id.clone(),
+            (r.recipe_name.clone(), r.status.clone(), r.created_at),
+        );
+    }
+
+    let mut series: Vec<Value> = by_metric
+        .into_iter()
+        .map(|(metric, runs_map)| {
+            let runs_vec: Vec<Value> = runs_map
+                .into_iter()
+                .map(|(run_id, mut pts)| {
+                    pts.sort_by(|a, b| match (a.0, b.0) {
+                        (Some(x), Some(y)) => x.cmp(&y),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    });
+                    let (recipe, status, created) = run_meta_map
+                        .get(&run_id)
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), String::new(), 0));
+                    let latest = pts.last().cloned();
+                    let prev = if pts.len() >= 2 {
+                        pts.get(pts.len() - 2).cloned()
+                    } else {
+                        None
+                    };
+                    let count = pts.len();
+                    json!({
+                        "run_id": run_id,
+                        "run_recipe_name": recipe,
+                        "run_status": status,
+                        "run_created_at": created,
+                        "count": count,
+                        "latest_value": latest.as_ref().map(|p| p.1.clone()).unwrap_or(Value::Null),
+                        "latest_step": latest.as_ref().and_then(|p| p.0).map(Value::from).unwrap_or(Value::Null),
+                        "previous_value": prev.as_ref().map(|p| p.1.clone()).unwrap_or(Value::Null),
+                        "points": pts.into_iter().map(|(step, value, eval_run_id, state, ckpt_id)| json!({
+                            "step": step,
+                            "value": value,
+                            "eval_run_id": eval_run_id,
+                            "state": state,
+                            "checkpoint_artifact_id": ckpt_id,
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            json!({
+                "metric_name": metric,
+                "run_count": runs_vec.len(),
+                "runs": runs_vec,
+            })
+        })
+        .collect();
+
+    series.sort_by(|a, b| {
+        let na = a.get("run_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let nb = b.get("run_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ma = a.get("metric_name").and_then(|v| v.as_str()).unwrap_or("");
+        let mb = b.get("metric_name").and_then(|v| v.as_str()).unwrap_or("");
+        nb.cmp(&na)
+            .then_with(|| {
+                let pa = is_preferred_metric_name(ma);
+                let pb = is_preferred_metric_name(mb);
+                pb.cmp(&pa)
+            })
+            .then_with(|| ma.cmp(mb))
+    });
+
+    let metrics: Vec<Value> = series
+        .iter()
+        .filter_map(|s| s.get("metric_name").cloned())
+        .collect();
+    let runs_summary: Vec<Value> = runs.iter().map(run_summary).collect();
+
+    json!({
+        "runs": runs_summary,
+        "metrics": metrics,
+        "series_by_metric": series,
+    })
+}
+
 async fn get_cluster(State(state): State<AppState>) -> axum::Json<Value> {
     axum::Json(json!({
         "name": state.cluster.name,
-        "registry_db": state.cluster.filesystem.registry_db.display().to_string(),
         "runs_base": state.cluster.filesystem.runs_base.display().to_string(),
     }))
+}
+
+// ---------- rollout viewer ----------
+
+/// Return parsed traj.jsonl + frame count for an eval_result artifact that
+/// recorded a GUI rollout. The artifact's metadata.result must contain
+/// `traj_path` (absolute path to traj.jsonl) written by the runner.
+async fn get_artifact_rollout(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let artifact = {
+        let store = state.store.lock().unwrap();
+        store
+            .get_artifact_optional(&id)?
+            .ok_or_else(|| not_found(format!("artifact not found: {id}")))?
+    };
+
+    let traj_path_str = artifact
+        .metadata_json
+        .get("result")
+        .and_then(|r| r.get("traj_path"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| not_found("artifact has no traj_path in result".to_string()))?
+        .to_string();
+
+    let traj_path = std::path::Path::new(&traj_path_str);
+    let steps_dir = traj_path
+        .parent()
+        .ok_or_else(|| not_found("invalid traj_path: no parent dir".to_string()))?
+        .join("steps");
+
+    let content = std::fs::read_to_string(traj_path).map_err(|e| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("traj.jsonl not readable: {e}"),
+        )
+    })?;
+
+    let steps: Vec<Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+
+    let frame_count: u32 = std::fs::read_dir(&steps_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |ext| ext == "png"))
+                .count() as u32
+        })
+        .unwrap_or(0);
+
+    Ok(axum::Json(json!({
+        "steps": steps,
+        "frame_count": frame_count,
+    })))
+}
+
+/// Serve step_NNN.png for a GUI rollout artifact. Frame index N is
+/// zero-based and must match a file written by the runner.
+async fn get_artifact_frame(
+    State(state): State<AppState>,
+    Path((id, n)): Path<(String, u32)>,
+) -> Result<Response, ApiError> {
+    let artifact = {
+        let store = state.store.lock().unwrap();
+        store
+            .get_artifact_optional(&id)?
+            .ok_or_else(|| not_found(format!("artifact not found: {id}")))?
+    };
+
+    let traj_path_str = artifact
+        .metadata_json
+        .get("result")
+        .and_then(|r| r.get("traj_path"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| not_found("artifact has no traj_path in result".to_string()))?
+        .to_string();
+
+    let steps_dir = std::path::Path::new(&traj_path_str)
+        .parent()
+        .ok_or_else(|| not_found("invalid traj_path: no parent dir".to_string()))?
+        .join("steps");
+
+    let frame_path = steps_dir.join(format!("step_{n:03}.png"));
+
+    let bytes = std::fs::read(&frame_path)
+        .map_err(|_| not_found(format!("frame {n} not found at {}", frame_path.display())))?;
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .body(axum::body::Body::from(bytes))
+        .unwrap())
+}
+
+// ---------- dataset explorer ----------
+//
+// Crowd-cast SFT datasets land on disk as
+//   <artifact.path>/<split>/<segment_id>/{frames/frame_<N>.jpg, meta.json,
+//                                        chat_line.json}
+// for splits in {train, val, test}. Stage A and Stage B emit this shape;
+// Stage C/D outputs are opaque Grain shards and are detected as
+// "not browseable" by feature-detecting the per-segment meta.json files.
+
+#[derive(Clone, Debug, Serialize)]
+struct DatasetSegment {
+    split: String,
+    segment_id: String,
+    contributor_hash: String,
+    n_frames: u32,
+    n_no_op: u32,
+    frame_width: u32,
+    frame_height: u32,
+    target_fps: u32,
+    /// ISO8601 UTC, or empty when meta.json had no creation_time.
+    creation_time: String,
+    /// Selected counts pulled out of meta.json's `stats` block. Anything
+    /// the explorer's tables/sidebars use sits here so the client doesn't
+    /// re-derive from the raw blob.
+    stats: DatasetSegmentStats,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct DatasetSegmentStats {
+    n_keypress: u32,
+    n_keyrelease: u32,
+    n_mousepress: u32,
+    n_mouserelease: u32,
+    n_mousemove: u32,
+    n_scroll: u32,
+    n_context_changed: u32,
+    n_dangling_release: u32,
+    n_held_at_end: u32,
+    max_simultaneous_keys: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DatasetSummary {
+    splits: Vec<String>,
+    n_segments: u32,
+    n_contributors: u32,
+    total_hours: f64,
+    /// (earliest, latest) creation_time as ISO dates; empty strings if no
+    /// segment had a parseable timestamp.
+    date_range: (String, String),
+    /// Flat list. The client groups by contributor/day on demand — keeps
+    /// the wire format simple and lets us add more facets without a
+    /// schema change.
+    segments: Vec<DatasetSegment>,
+}
+
+fn parse_segment_meta(split: &str, meta_path: &std::path::Path) -> Option<DatasetSegment> {
+    let raw = std::fs::read(meta_path).ok()?;
+    let v: Value = serde_json::from_slice(&raw).ok()?;
+    let segment_id = v.get("segment_id")?.as_str()?.to_string();
+    let contributor_hash = v
+        .get("contributor_hash")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let n_frames = v.get("n_frames").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let n_no_op = v.get("n_no_op").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let frame_width = v
+        .get("frame_width")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0) as u32;
+    let frame_height = v
+        .get("frame_height")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0) as u32;
+    let target_fps = v
+        .get("target_fps")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0) as u32;
+    let creation_time = v
+        .get("creation_time")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let s = v.get("stats").and_then(|x| x.as_object());
+    let pick = |k: &str| -> u32 {
+        s.and_then(|m| m.get(k))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32
+    };
+    let stats = DatasetSegmentStats {
+        n_keypress: pick("n_keypress"),
+        n_keyrelease: pick("n_keyrelease"),
+        n_mousepress: pick("n_mousepress"),
+        n_mouserelease: pick("n_mouserelease"),
+        n_mousemove: pick("n_mousemove"),
+        n_scroll: pick("n_scroll"),
+        n_context_changed: pick("n_context_changed"),
+        n_dangling_release: pick("n_dangling_release"),
+        n_held_at_end: pick("n_held_at_end"),
+        max_simultaneous_keys: pick("max_simultaneous_keys"),
+    };
+
+    Some(DatasetSegment {
+        split: split.to_string(),
+        segment_id,
+        contributor_hash,
+        n_frames,
+        n_no_op,
+        frame_width,
+        frame_height,
+        target_fps,
+        creation_time,
+        stats,
+    })
+}
+
+/// Walk `<root>/{train,val,test}/<seg>/meta.json`. Returns `None` when no
+/// meta.json is found at the expected depth — that is the signal for
+/// "this dataset artifact isn't a browseable per-segment dataset" (e.g.
+/// Stage C/D outputs). Bounded depth: we don't recurse into `frames/`.
+fn walk_dataset(root: &std::path::Path) -> Option<DatasetSummary> {
+    let mut segments: Vec<DatasetSegment> = Vec::new();
+    let mut splits_present: Vec<String> = Vec::new();
+    for split in &["train", "val", "test"] {
+        let split_dir = root.join(split);
+        if !split_dir.is_dir() {
+            continue;
+        }
+        splits_present.push((*split).to_string());
+        let entries = match std::fs::read_dir(&split_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let meta = p.join("meta.json");
+            if !meta.is_file() {
+                continue;
+            }
+            if let Some(seg) = parse_segment_meta(split, &meta) {
+                segments.push(seg);
+            }
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+
+    let mut contributors = std::collections::BTreeSet::new();
+    let mut total_seconds: f64 = 0.0;
+    let mut earliest = String::new();
+    let mut latest = String::new();
+    for s in &segments {
+        if !s.contributor_hash.is_empty() {
+            contributors.insert(s.contributor_hash.clone());
+        }
+        if s.target_fps > 0 {
+            total_seconds += f64::from(s.n_frames) / f64::from(s.target_fps);
+        }
+        if !s.creation_time.is_empty() {
+            if earliest.is_empty() || s.creation_time < earliest {
+                earliest = s.creation_time.clone();
+            }
+            if s.creation_time > latest {
+                latest = s.creation_time.clone();
+            }
+        }
+    }
+    let n_segments = segments.len() as u32;
+    let n_contributors = contributors.len() as u32;
+
+    Some(DatasetSummary {
+        splits: splits_present,
+        n_segments,
+        n_contributors,
+        total_hours: total_seconds / 3600.0,
+        date_range: (earliest, latest),
+        segments,
+    })
+}
+
+/// Build (or fetch from cache) the dataset summary for an artifact, and
+/// at the same time return the on-disk root path. Returns `None` if the
+/// artifact exists but isn't a browseable per-segment dataset.
+fn dataset_summary_for(
+    state: &AppState,
+    id: &str,
+) -> Result<Option<(PathBuf, Arc<Option<DatasetSummary>>)>, ApiError> {
+    let artifact = {
+        let store = state.store.lock().unwrap();
+        match store.get_artifact_optional(id)? {
+            Some(a) => a,
+            None => return Ok(None),
+        }
+    };
+    if artifact.kind != "dataset" {
+        return Ok(Some((artifact.path.clone(), Arc::new(None))));
+    }
+
+    {
+        let cache = state.dataset_cache.lock().unwrap();
+        if let Some(entry) = cache.get(id) {
+            return Ok(Some((artifact.path.clone(), entry.clone())));
+        }
+    }
+    // Walk outside the lock — a cold scan can take a few hundred ms on a
+    // dataset with thousands of segments, no point blocking concurrent
+    // requests for unrelated artifacts.
+    let summary = walk_dataset(&artifact.path);
+    let entry = Arc::new(summary);
+    {
+        let mut cache = state.dataset_cache.lock().unwrap();
+        cache.insert(id.to_string(), entry.clone());
+    }
+    Ok(Some((artifact.path, entry)))
+}
+
+async fn get_artifact_dataset(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let (_, entry) = dataset_summary_for(&state, &id)?
+        .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
+    match entry.as_ref() {
+        Some(summary) => Ok(axum::Json(serde_json::to_value(summary).unwrap())),
+        None => Err(not_found(
+            "artifact has no browseable per-segment dataset layout".to_string(),
+        )),
+    }
+}
+
+async fn get_artifact_dataset_segment(
+    State(state): State<AppState>,
+    Path((id, split, seg)): Path<(String, String, String)>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let (root, _) = dataset_summary_for(&state, &id)?
+        .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
+    let seg_dir = root.join(&split).join(&seg);
+    let meta_path = seg_dir.join("meta.json");
+    let chat_path = seg_dir.join("chat_line.json");
+
+    let meta_bytes = std::fs::read(&meta_path).map_err(|e| {
+        not_found(format!(
+            "segment meta.json not readable: {} ({e})",
+            meta_path.display()
+        ))
+    })?;
+    let meta: Value = serde_json::from_slice(&meta_bytes)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid meta.json: {e}")))?;
+
+    // Extract action strings from chat_line.json. Stage A writes:
+    //   {"messages": [
+    //      {"role": "user",      "content": [{"type":"image","image":"<path>"}]},
+    //      {"role": "assistant", "content": [{"type":"text","text":"<action>"}]},
+    //      ...repeats once per frame...
+    //   ]}
+    // The action string lives on the assistant turn; one assistant turn
+    // per frame, in source order.
+    let actions: Vec<String> = std::fs::read(&chat_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .map(|chat| {
+            chat.get("messages")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+                        .map(|m| {
+                            let c = m.get("content");
+                            // content may be a string (post-flatten) or a
+                            // block list with one or more {"type":"text",
+                            // "text": "<action>"} entries.
+                            if let Some(s) = c.and_then(|x| x.as_str()) {
+                                return s.to_string();
+                            }
+                            if let Some(blocks) = c.and_then(|x| x.as_array()) {
+                                for b in blocks {
+                                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
+                                            return t.to_string();
+                                        }
+                                    }
+                                }
+                            }
+                            String::new()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    Ok(axum::Json(json!({
+        "split": split,
+        "segment_id": seg,
+        "meta": meta,
+        "actions": actions,
+    })))
+}
+
+async fn get_artifact_dataset_frame(
+    State(state): State<AppState>,
+    Path((id, split, seg, n)): Path<(String, String, String, u32)>,
+) -> Result<Response, ApiError> {
+    // We resolve the artifact root via dataset_summary_for so the path
+    // goes through the same artifact-exists/kind check the other dataset
+    // endpoints use, and the cache walk fires once at first frame fetch
+    // even before the summary endpoint is hit.
+    let (root, _) = dataset_summary_for(&state, &id)?
+        .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
+
+    // Stage A writes frames as 6-digit-zero-padded JPEG filenames.
+    let frame_path = root
+        .join(&split)
+        .join(&seg)
+        .join("frames")
+        .join(format!("frame_{n:06}.jpg"));
+    let bytes = std::fs::read(&frame_path)
+        .map_err(|_| not_found(format!("frame {n} not found at {}", frame_path.display())))?;
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .body(axum::body::Body::from(bytes))
+        .unwrap())
 }
 
 // ---------- static SPA ----------
