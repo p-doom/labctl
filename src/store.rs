@@ -64,7 +64,8 @@ CREATE TABLE runs (
     pipeline_id TEXT,
     dependency_on TEXT,
     stage_name TEXT,
-    submitted_by TEXT NOT NULL
+    submitted_by TEXT NOT NULL,
+    cache_key TEXT
 );
 
 CREATE TABLE pipelines (
@@ -158,6 +159,7 @@ CREATE INDEX idx_run_inputs_path ON run_inputs(resolved_path);
 CREATE INDEX idx_run_inputs_artifact ON run_inputs(artifact_id);
 CREATE INDEX idx_run_outputs_run ON run_outputs(run_id);
 CREATE INDEX idx_aliases_artifact ON artifact_aliases(artifact_id);
+CREATE INDEX idx_runs_cache_key ON runs(cache_key);
 "#;
 
 // ---------- public types ----------
@@ -185,6 +187,7 @@ pub struct RunRow {
     pub stage_name: Option<String>,
     pub dependency_on: Option<Value>,
     pub submitted_by: Option<String>,
+    pub cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +258,10 @@ pub struct NewRun<'a> {
     /// `$USER` inside `insert_run`. Callers that already know who the
     /// submitter is (CLI side) should pass `Some(...)`.
     pub submitted_by: Option<&'a str>,
+    /// Stage-level cache key (sha256 of recipe + provenance + inputs + args).
+    /// Used at submit time to short-circuit re-execution of an already-
+    /// materialized stage. None disables cache-hit lookup for this run.
+    pub cache_key: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,7 +284,7 @@ pub struct PolicySummaryRow {
 pub fn is_terminal(status: &str) -> bool {
     matches!(
         status,
-        "succeeded" | "failed" | "cancelled" | "timeout" | "oom" | "unknown_terminal"
+        "succeeded" | "failed" | "cancelled" | "timeout" | "oom" | "unknown_terminal" | "cache_hit"
     )
 }
 
@@ -451,6 +458,7 @@ impl Store {
             status: run.status.to_string(),
             job_id: None,
             finished_at: None,
+            cache_key: run.cache_key.map(|s| s.to_string()),
         };
         fs_layout::atomic_write_json(&lab_dir.join(fs_layout::RUN_JSON), &sidecar)?;
 
@@ -469,8 +477,8 @@ impl Store {
         tx.execute(
             "INSERT INTO runs
              (id, recipe_name, recipe_hash, status, run_dir, repo, source_path,
-              recipe_json, context_json, created_at, submitted_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              recipe_json, context_json, created_at, submitted_by, cache_key)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 run.id,
                 run.recipe.name,
@@ -483,6 +491,7 @@ impl Store {
                 serde_json::to_string(run.context_json)?,
                 now,
                 submitted_by,
+                run.cache_key,
             ],
         )?;
         for input in inputs {
@@ -957,6 +966,61 @@ impl Store {
         Ok(stmt
             .query_map(params![run_id], row_to_artifact)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Look up the most-recent succeeded or cache-hit run with this cache key.
+    /// Returns None if no prior run matches. Caller must still verify the
+    /// run's outputs are on disk before declaring a real cache hit.
+    pub fn find_cache_hit_candidate(&self, cache_key: &str) -> Result<Option<RunRow>> {
+        let mut stmt = self.cache.prepare(
+            "SELECT * FROM runs
+             WHERE cache_key = ? AND status IN ('succeeded', 'cache_hit')
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )?;
+        let row = stmt
+            .query_map(params![cache_key], row_to_run)?
+            .next()
+            .transpose()?;
+        Ok(row)
+    }
+
+    pub fn append_stage_cache_hit_event(
+        &mut self,
+        run_id: &str,
+        cache_key: &str,
+        source_run_id: &str,
+    ) -> Result<()> {
+        self.append_event(EventLine {
+            run_id: Some(run_id.to_string()),
+            event_type: "stage_cache_hit".to_string(),
+            payload: json!({
+                "cache_key": cache_key,
+                "source_run_id": source_run_id,
+            }),
+            created_at: util::now_ts(),
+        })
+    }
+
+    /// Copy the run_outputs rows from `source_run_id` to `dest_run_id`,
+    /// preserving role and artifact_id. Used by cache-hit submission to
+    /// link existing artifacts as the new run's outputs without touching
+    /// the artifacts table (so producer_run_id stays pointing at the
+    /// original producer).
+    pub fn copy_run_outputs(&mut self, source_run_id: &str, dest_run_id: &str) -> Result<()> {
+        let rows: Vec<(String, String)> = {
+            let mut stmt = self.cache.prepare(
+                "SELECT role, artifact_id FROM run_outputs WHERE run_id = ?",
+            )?;
+            stmt.query_map(params![source_run_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (role, artifact_id) in rows {
+            self.link_run_output(dest_run_id, &role, &artifact_id)?;
+        }
+        Ok(())
     }
 
     fn aliases_for_run_outputs(&self, run_id: &str) -> Result<Vec<(String, String)>> {
@@ -1518,6 +1582,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         stage_name: row.get("stage_name").ok().flatten(),
         dependency_on,
         submitted_by: row.get("submitted_by").ok(),
+        cache_key: row.get("cache_key").ok().flatten(),
     })
 }
 

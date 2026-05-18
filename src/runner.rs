@@ -37,8 +37,12 @@ pub struct SubmitOverrides {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmittedRun {
     pub run_id: String,
+    /// Empty string when the run was a cache-hit (no SLURM job submitted).
+    /// Otherwise the SLURM job id. Use ``cache_hit`` to distinguish.
     pub job_id: String,
     pub run_dir: PathBuf,
+    #[serde(default)]
+    pub cache_hit: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,6 +90,168 @@ pub struct StageContext<'a> {
     pub stages: &'a BTreeMap<String, LoadedStage>,
 }
 
+/// Stage-level cache key: a stable digest of "the exact computation this
+/// stage will perform". Two submissions with the same key represent the
+/// same computation and may share outputs.
+///
+/// Components: recipe content (recipe_hash), code state (git HEAD +
+/// sha256 of uncommitted diff), runtime deps (uv.lock hash), declared
+/// inputs (their artifact IDs or resolved paths), and recipe args.
+/// Source-tree contents are NOT hashed — git provenance is the
+/// authoritative source-state identity.
+fn compute_cache_key(
+    recipe_hash: &str,
+    provenance: &provenance::RepoProvenance,
+    inputs: &[crate::store::InputResolution],
+    params: &BTreeMap<String, Value>,
+) -> Result<String> {
+    let diff_hash = provenance
+        .git_diff_head
+        .as_deref()
+        .map(|s| util::sha256_bytes(s.as_bytes()))
+        .unwrap_or_else(|| util::sha256_bytes(b""));
+    let mut input_keys: Vec<String> = inputs
+        .iter()
+        .map(|i| {
+            format!(
+                "{}={}",
+                i.role,
+                i.artifact_id
+                    .clone()
+                    .unwrap_or_else(|| i.resolved_path.display().to_string())
+            )
+        })
+        .collect();
+    input_keys.sort();
+    let params_canonical = serde_json::to_string(params)?;
+    let payload = serde_json::json!({
+        "recipe_hash": recipe_hash,
+        "git_head": provenance.git_head,
+        "diff_hash": diff_hash,
+        "uv_lock_hash": provenance.uv_lock_hash,
+        "inputs": input_keys,
+        "params": params_canonical,
+    });
+    Ok(util::sha256_bytes(&serde_json::to_vec(&payload)?))
+}
+
+/// Check that every artifact in `prior_outputs` is still materialized on
+/// disk with its marker file present. Cache-hit only valid when this
+/// returns true.
+fn cache_hit_outputs_valid(
+    prior_outputs: &[crate::store::ArtifactRow],
+    outputs: &BTreeMap<String, OutputResolution>,
+) -> bool {
+    // Build a map of role -> expected marker so we can verify each artifact
+    // still has its completion marker (in case someone scrubbed the content
+    // but left a stray dir).
+    let role_to_marker: BTreeMap<&str, &str> = outputs
+        .iter()
+        .map(|(r, res)| (r.as_str(), res.marker.as_str()))
+        .collect();
+    for art in prior_outputs {
+        // Find the role this artifact filled. The artifact's `metadata_json`
+        // includes the role under "role".
+        let role = art
+            .metadata_json
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let marker = match role_to_marker.get(role) {
+            Some(m) => *m,
+            None => return false,
+        };
+        if !art.path.exists() {
+            return false;
+        }
+        if !art.path.join(marker).exists() {
+            return false;
+        }
+    }
+    !prior_outputs.is_empty()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_cache_hit(
+    cluster: &ClusterConfig,
+    store: &mut Store,
+    recipe: &Recipe,
+    run_id: &str,
+    run_dir: &Path,
+    lab_dir: &Path,
+    recipe_hash: &str,
+    cache_key: &str,
+    prior_run_id: &str,
+    inputs: &[crate::store::InputResolution],
+    outputs: &BTreeMap<String, OutputResolution>,
+    repo_provenance: &provenance::RepoProvenance,
+    stage_ctx: Option<&StageContext<'_>>,
+    parent_job_ids: &[String],
+    submitted_by: &str,
+) -> Result<SubmittedRun> {
+    let source_root = run_dir.join("source");
+    let source_path = source_root.join(&recipe.repo);
+    let ctx = json!({
+        "schema_version": 1,
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "recipe_name": recipe.name,
+        "recipe_hash": recipe_hash,
+        "repo": recipe.repo,
+        // source_path is set but not materialized; cache-hit reuses prior outputs.
+        "source_path": source_path,
+        "source_hash": Value::Null,
+        "inputs": inputs,
+        "outputs": outputs,
+        "params": recipe.params,
+        "provenance": repo_provenance,
+        "stage_name": stage_ctx.map(|c| c.stage_name),
+        "parent_job_ids": parent_job_ids,
+        "cache_hit": true,
+        "cache_hit_source_run_id": prior_run_id,
+    });
+    util::atomic_write(
+        &lab_dir.join(fs_layout::CONTEXT_JSON),
+        &serde_json::to_vec_pretty(&ctx)?,
+    )?;
+
+    store.insert_run(
+        crate::store::NewRun {
+            id: run_id,
+            recipe,
+            recipe_hash,
+            status: "created",
+            run_dir,
+            source_path: &source_path,
+            context_json: &ctx,
+            submitted_by: Some(submitted_by),
+            cache_key: Some(cache_key),
+        },
+        inputs,
+    )?;
+
+    // Link the prior run's output artifacts into this new run's output set.
+    store.copy_run_outputs(prior_run_id, run_id)?;
+
+    // Emit the explanatory event before flipping to the terminal state so
+    // downstream tooling can distinguish "skipped due to cache hit" from
+    // "completed normally".
+    store.append_stage_cache_hit_event(run_id, cache_key, prior_run_id)?;
+    store.update_status(run_id, "cache_hit", Some(util::now_ts()))?;
+
+    // Optional: silence the unused-param warning when cluster isn't needed
+    // for cache-hit. Keeping the arg in the signature mirrors the regular
+    // path and leaves room for future per-cluster cache policies.
+    let _ = cluster;
+
+    Ok(SubmittedRun {
+        run_id: run_id.to_string(),
+        job_id: String::new(),
+        run_dir: run_dir.to_path_buf(),
+        cache_hit: true,
+    })
+}
+
 fn submit_recipe_inner(
     cluster: &ClusterConfig,
     store: &mut Store,
@@ -124,24 +290,64 @@ fn submit_recipe_inner(
     };
     let outputs = output_paths(cluster, recipe, &alias_ctx, submitted_by)?;
 
+    // recipe_hash + provenance need to land BEFORE the cache-hit / marker
+    // check so we can compute a cache_key without paying the source-copy
+    // cost on cache hits.
+    let repo_path = cluster
+        .repos
+        .get(&recipe.repo)
+        .with_context(|| format!("cluster has no repo mapping for {:?}", recipe.repo))?;
+    let recipe_hash = util::sha256_bytes(&serde_json::to_vec(recipe)?);
+    let provenance_dir = lab_dir.join("provenance").join(&recipe.repo);
+    let repo_provenance = provenance::capture_repo(repo_path, &provenance_dir)?;
+    let cache_key = compute_cache_key(&recipe_hash, &repo_provenance, &inputs, &recipe.params)?;
+
+    // Cache hit: a prior run with the same cache_key still has its outputs
+    // on disk. Link them and skip the entire submit / source-copy / sbatch
+    // path. The recipe is unchanged; the registry IS the cache.
+    if let Some(prior_run) = store.find_cache_hit_candidate(&cache_key)? {
+        let prior_outputs = store.run_outputs(&prior_run.id)?;
+        if cache_hit_outputs_valid(&prior_outputs, &outputs) {
+            return register_cache_hit(
+                cluster,
+                store,
+                recipe,
+                &run_id,
+                &run_dir,
+                &lab_dir,
+                &recipe_hash,
+                &cache_key,
+                &prior_run.id,
+                &inputs,
+                &outputs,
+                &repo_provenance,
+                stage_ctx,
+                parent_job_ids,
+                submitted_by,
+            );
+        }
+    }
+
     // Materialize each output's directory so the recipe's command can write
     // into it without having to mkdir -p itself. Refuse only if the marker
-    // file is already present — that's the explicit success signal of a
-    // prior run. An empty or partially-populated directory (failed run, or
-    // labctl-pre-created shell) is safe to reuse: re-submission of a failed
-    // recipe should "just work" without forcing the operator to rm output
-    // dirs by hand. For checkpoint_stream outputs, the marker lives one
-    // step deeper (under <stream>/<step>/<marker>), so the top-level
-    // directory existing means nothing — let it through.
+    // file is already present AND we couldn't satisfy it via cache hit —
+    // that's the explicit success signal of a prior run whose cache_key
+    // differs from ours (e.g. recipe or inputs changed; user must
+    // explicitly delete to re-run). An empty or partially-populated
+    // directory (failed run, or labctl-pre-created shell) is safe to
+    // reuse: re-submission of a failed recipe should "just work" without
+    // forcing the operator to rm output dirs by hand. For checkpoint_stream
+    // outputs, the marker lives one step deeper (under <stream>/<step>/<marker>),
+    // so the top-level directory existing means nothing — let it through.
     for resolution in outputs.values() {
         if resolution.kind != "checkpoint_stream" {
             let marker_path = resolution.path.join(&resolution.marker);
             if marker_path.exists() {
                 bail!(
-                    "output marker already present: {} (role={:?}, alias={:?}, kind={:?}). \
-                     Refusing to overwrite a completed prior artifact. Delete the path \
-                     explicitly or template the alias with {{run.id}} for per-submission \
-                     uniqueness.",
+                    "output marker already present: {} (role={:?}, alias={:?}, kind={:?}) and \
+                     no matching cache_key in registry. The path holds a stale artifact from a \
+                     different recipe/input combination. Delete the path explicitly or template \
+                     the alias with {{run.id}} for per-submission uniqueness.",
                     marker_path.display(),
                     resolution.role,
                     resolution.alias,
@@ -165,15 +371,6 @@ fn submit_recipe_inner(
         .iter()
         .map(|(role, res)| (role.clone(), res.path.clone()))
         .collect();
-
-    let repo_path = cluster
-        .repos
-        .get(&recipe.repo)
-        .with_context(|| format!("cluster has no repo mapping for {:?}", recipe.repo))?;
-
-    let recipe_hash = util::sha256_bytes(&serde_json::to_vec(recipe)?);
-    let provenance_dir = lab_dir.join("provenance").join(&recipe.repo);
-    let repo_provenance = provenance::capture_repo(repo_path, &provenance_dir)?;
 
     util::copy_dir_filtered(repo_path, &source_path).with_context(|| {
         format!(
@@ -229,6 +426,7 @@ fn submit_recipe_inner(
             source_path: &source_path,
             context_json: &ctx,
             submitted_by: Some(submitted_by),
+            cache_key: Some(&cache_key),
         },
         &inputs,
     )?;
@@ -254,6 +452,7 @@ fn submit_recipe_inner(
         run_id,
         job_id,
         run_dir,
+        cache_hit: false,
     })
 }
 
@@ -387,7 +586,12 @@ pub fn submit_pipeline(
     let pipeline_id = util::new_id("pipeline");
     store.insert_pipeline(&pipeline_id, &pipeline.name, pipeline_path)?;
 
-    let mut stage_job_ids: BTreeMap<String, String> = BTreeMap::new();
+    // Track each stage's SLURM job_id, or None when the stage was a
+    // cache-hit (no SLURM job submitted). Downstream stages must filter
+    // out cache-hit parents when building their afterok dependency list,
+    // otherwise `--dependency=afterok:` would reference a non-existent
+    // job and SLURM would refuse to schedule.
+    let mut stage_job_ids: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut submitted_stages = Vec::with_capacity(pipeline.topo_order.len());
 
     for stage_name in &pipeline.topo_order {
@@ -398,10 +602,16 @@ pub fn submit_pipeline(
             .map(|p| {
                 stage_job_ids
                     .get(p)
-                    .cloned()
-                    .with_context(|| format!("missing parent job_id for {p:?}"))
+                    .with_context(|| format!("missing parent stage {p:?}"))
+                    .map(|jid| jid.clone())
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            // Cache-hit parents have already produced their outputs on
+            // disk; downstream stages can read them immediately, no
+            // afterok required.
+            .flatten()
+            .collect();
 
         let stage_ctx = StageContext {
             stage_name,
@@ -430,7 +640,7 @@ pub fn submit_pipeline(
                     json!({
                         "stage": p,
                         "run_id": stage_run_ids[p],
-                        "job_id": stage_job_ids[p],
+                        "job_id": stage_job_ids[p].clone(),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -441,7 +651,14 @@ pub fn submit_pipeline(
             stage_name,
             &dependency_on,
         )?;
-        stage_job_ids.insert(stage_name.clone(), submitted.job_id.clone());
+        // Cache-hit stages don't get a SLURM job; track None so downstream
+        // afterok filtering works correctly.
+        let recorded_job_id = if submitted.cache_hit {
+            None
+        } else {
+            Some(submitted.job_id.clone())
+        };
+        stage_job_ids.insert(stage_name.clone(), recorded_job_id);
         submitted_stages.push(SubmittedStage {
             stage_name: stage_name.clone(),
             run_id: submitted.run_id,

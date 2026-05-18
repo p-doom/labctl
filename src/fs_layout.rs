@@ -167,6 +167,9 @@ pub struct RunSidecar {
     pub job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
+    /// Stage-level cache key. See ``store::NewRun::cache_key``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
 }
 
 fn default_status() -> String {
