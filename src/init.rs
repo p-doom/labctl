@@ -519,11 +519,12 @@ fn create_user_dirs(cfg: &ClusterConfig) -> Result<()> {
 }
 
 fn install_agent_unit(cluster_path: &Path, force: bool) -> Result<()> {
-    let mut opts = service::InstallOptions::new(cluster_path.to_path_buf());
-    opts.mode = service::UnitMode::Agent;
-    opts.unit_name = "labctl-agent".to_string();
-    opts.force = force;
-    service::install(opts).context("agent install")
+    service::install(service::InstallOptions {
+        cluster_path: cluster_path.to_path_buf(),
+        mode: service::UnitMode::Agent,
+        force,
+    })
+    .context("agent install")
 }
 
 fn run_doctor_subprocess(cluster_path: &Path) -> Result<bool> {

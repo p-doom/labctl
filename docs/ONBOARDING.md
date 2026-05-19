@@ -215,12 +215,13 @@ or `$LABCTL_CLUSTER` for multi-cluster work.
 or control it:
 
 ```bash
-labctl service status                            # systemctl --user is-active labctl-agent
+labctl service status                            # both units (agent + ui)
+labctl service status --agent                    # just the dispatch agent
 systemctl --user restart labctl-agent
 loginctl enable-linger $USER                     # survive logout
 ```
 
-If you skipped `--agent` during init, install later:
+If you skipped `--no-agent` during init, install later:
 
 ```bash
 labctl service install --agent
@@ -231,11 +232,17 @@ submits eval recipes under your uid.
 
 ## 5. Reach the UI from your laptop
 
-The UI is a separate `labctl serve` process. Anyone can run one — it's
-read-only and stateless. Bind it to loopback:
+The UI is a separate `labctl serve` process — read-only HTTP, no
+dispatch loops. Either run it ad-hoc:
 
 ```bash
 labctl serve --bind 127.0.0.1:8765
+```
+
+…or install it as a long-running unit (`labctl-ui.service`):
+
+```bash
+labctl service install --ui
 ```
 
 Tunnel from your laptop:
@@ -249,18 +256,19 @@ Then open `http://127.0.0.1:8765`.
 ## 6. Sharing the registry with your team
 
 labctl is built for multi-tenant use over a single shared
-filesystem-truth registry. The model splits the two concerns of the
-single-user setup:
+filesystem-truth registry. Two unit shapes:
 
-- **One shared read-only UI**: `labctl serve --no-dispatch`. Runs on
-  one host, anyone tunnels to it. Pure HTTP read window over the
-  shared registry; no auth needed (still SSH-gated).
-- **Per-user dispatch agents**: `labctl agent`. Each user runs their
-  own. No HTTP listener, just the reconcile + evald + periodic-refresh
-  loops, scoped to their own runs. Each writes only its own subtree
-  (`runs/<user>/`, `eval_state/<user>/`, `pipelines/<user>/`), and the
-  OS enforces isolation — there is no RPC layer, no shared service
-  account, no impersonation.
+- **Per-user dispatch agent**: `labctl-agent.service`. Each user runs
+  their own (auto-installed by `labctl init`). No HTTP listener, just
+  the reconcile + evald + periodic-refresh loops, scoped to their own
+  runs. Each writes only its own subtree (`runs/<user>/`,
+  `eval_state/<user>/`, `pipelines/<user>/`), and the OS enforces
+  isolation — there is no RPC layer, no shared service account, no
+  impersonation.
+- **Read-only UI**: `labctl-ui.service`. Pure HTTP read window over the
+  shared registry; no auth needed (still SSH-gated). Run one shared
+  instance on a designated login node, or run one per teammate — both
+  work because writes never go through the UI.
 
 Aliases and artifact metadata are global so teammates can reference
 each other's work directly via `[inputs.X] type = "artifact" artifact =
@@ -282,16 +290,15 @@ rotated (new path, additional kind), each teammate just re-runs
 One person, once — install the shared read-only UI:
 
 ```bash
-labctl service install --no-dispatch
+labctl service install --ui
 ```
 
 This writes `~/.config/systemd/user/labctl-ui.service` whose
-`ExecStart` is `labctl serve --bind 127.0.0.1:8765 --no-dispatch`.
-`--no-dispatch` is the key bit: this process is pure HTTP read-only,
-no reconcile, no evald — those happen in each user's own agent. Pick
-one teammate to host it (or run it under a service account); everyone
-else SSH-tunnels to `127.0.0.1:8765` on that host. Linger
-(`loginctl enable-linger $USER`) keeps it up across logouts.
+`ExecStart` is `labctl serve --bind 127.0.0.1:8765`. `labctl serve` is
+HTTP-only — no reconcile, no evald (those happen in each user's own
+agent). Pick one teammate to host it (or run it under a service
+account); everyone else SSH-tunnels to `127.0.0.1:8765` on that host.
+Linger (`loginctl enable-linger $USER`) keeps it up across logouts.
 
 Three operational details when onboarding a second user:
 
@@ -380,8 +387,8 @@ and Jülich), each gets its own filesystem-truth registry. There is no
 unified daemon or sync layer — the right model is **one registry per
 cluster, full stop.** Visit each cluster's UI separately when you
 need its history; archive a decommissioned cluster's registry tree
-with `rsync` and serve it later via `labctl serve --no-dispatch
---cluster <archived.toml>`.
+with `rsync` and serve it later via `labctl serve --cluster
+<archived.toml>`.
 
 The one workflow worth codifying is **importing an artifact** from
 another cluster into the local one — typically "I want to fine-tune

@@ -2,11 +2,11 @@
 //! periodic filesystem→cache refresh task that keeps the in-memory
 //! cache aligned with sidecars written by other processes.
 //!
-//! Spawned as tokio tasks either alongside the HTTP server inside
-//! `server::serve` (all-in-one mode) or standalone from `labctl agent`
-//! (per-user agent mode, no HTTP — pairs with one shared read-only
-//! `labctl serve --no-dispatch`). Every loop operates exclusively on
-//! its user's runs:
+//! Run inside the standalone `labctl agent` process (no HTTP listener)
+//! — auto-installed as `labctl-agent.service` by `labctl init`. The UI
+//! (`labctl serve`, optionally installed as `labctl-ui.service`) is
+//! read-only and never runs these loops. Every loop operates
+//! exclusively on its user's runs:
 //!
 //! - **reconcile_loop** — every `reconcile_interval_secs`, walks active
 //!   runs and calls `runner::reconcile_one` per run. `sacct -j <jobid>`
@@ -95,7 +95,7 @@ pub async fn periodic_refresh(store: Arc<Mutex<Store>>, interval: Duration) {
 /// Spawn reconcile + evald + gc tokio tasks. Returns immediately; the
 /// tasks live until `shutdown` fires. With no `[dispatch]` block
 /// configured, logs a notice and returns without spawning anything.
-pub fn spawn(
+fn spawn(
     cluster: Arc<ClusterConfig>,
     store: Arc<Mutex<Store>>,
     shutdown: Arc<Notify>,
@@ -147,10 +147,11 @@ pub fn spawn(
 
 /// Standalone agent entrypoint: build a tokio runtime, spawn the
 /// periodic refresh task and the dispatch loops, then block on SIGINT.
-/// Used by the `labctl agent` subcommand — paired with one shared
-/// `labctl serve --no-dispatch` for the multi-tenant rollout model
-/// described in `docs/ONBOARDING.md`. Owns no HTTP listener; this
-/// process never accepts a network connection.
+/// Used by the `labctl agent` subcommand. Auto-installed by
+/// `labctl init` as a per-user systemd unit (`labctl-agent.service`).
+/// Owns no HTTP listener; this process never accepts a network
+/// connection. Pair with `labctl serve` (HTTP-only) running on the same
+/// or another host for the UI.
 pub fn run_standalone(cluster: ClusterConfig, store: Store) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

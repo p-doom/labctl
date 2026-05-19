@@ -1,7 +1,14 @@
 //! `labctl service install / uninstall / status` — manage the systemd
-//! user unit that keeps `labctl serve` alive. One unit, one process:
-//! the UI and dispatch loops (reconcile + evald + throttle) share a
-//! single in-memory cache and run inside the same tokio runtime.
+//! user units that keep labctl's two long-running processes alive.
+//!
+//! Two unit shapes only:
+//!   - `labctl-agent.service` (auto-installed by `labctl init`) — the
+//!     per-user dispatch loop (reconcile + evald + throttle).
+//!   - `labctl-ui.service` (opt-in) — the read-only HTTP window.
+//!
+//! Per-user vs shared: the agent is always per-user. The UI is loopback-
+//! by-default and either ships per-user or as one shared instance on
+//! a designated login node, depending on rollout.
 //!
 //! Why an explicit subcommand and not auto-install on first run: labctl
 //! runs on HPC login nodes, dev laptops, containers, CI. systemd is one
@@ -24,60 +31,45 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-const DEFAULT_UNIT_NAME: &str = "labctl";
-const DEFAULT_BIND: &str = "127.0.0.1:8765";
+pub const DEFAULT_BIND: &str = "127.0.0.1:8765";
+pub const AGENT_UNIT_NAME: &str = "labctl-agent";
+pub const UI_UNIT_NAME: &str = "labctl-ui";
 
 /// Which long-running labctl process the systemd unit should start.
 ///
-/// - `Serve { no_dispatch: false }` — all-in-one (HTTP + dispatch in
-///   one process). The single-user default; install via
-///   `labctl service install`.
-/// - `Serve { no_dispatch: true }` — pure read-only HTTP window. The
-///   shared UI host in a multi-tenant rollout; install via
-///   `labctl service install --no-dispatch`.
-/// - `Agent` — dispatch-only, no HTTP listener. Each user's own
-///   reconcile + evald in the multi-tenant model; install via
-///   `labctl service install --agent`.
+/// - `Agent` — dispatch-only (reconcile + evald + throttle), no HTTP
+///   listener. Auto-installed by `labctl init`. Unit: `labctl-agent`.
+/// - `Ui { bind }` — pure read-only HTTP window. Opt-in via
+///   `labctl service install --ui`. Unit: `labctl-ui`.
 pub enum UnitMode {
-    Serve { bind: String, no_dispatch: bool },
     Agent,
+    Ui { bind: String },
+}
+
+impl UnitMode {
+    /// Canonical unit name for this mode. Encoding the mapping here
+    /// keeps `install` and `uninstall` from disagreeing about names.
+    pub fn unit_name(&self) -> &'static str {
+        match self {
+            UnitMode::Agent => AGENT_UNIT_NAME,
+            UnitMode::Ui { .. } => UI_UNIT_NAME,
+        }
+    }
 }
 
 pub struct InstallOptions {
     pub cluster_path: PathBuf,
     pub mode: UnitMode,
-    pub unit_name: String,
     pub force: bool,
-}
-
-impl InstallOptions {
-    pub fn new(cluster_path: PathBuf) -> Self {
-        Self {
-            cluster_path,
-            mode: UnitMode::Serve {
-                bind: DEFAULT_BIND.to_string(),
-                no_dispatch: false,
-            },
-            unit_name: DEFAULT_UNIT_NAME.to_string(),
-            force: false,
-        }
-    }
 }
 
 /// Render the systemd unit file as a string. Pure function — exposed for
 /// tests so we can verify the unit shape without touching the filesystem.
-pub fn render_unit(
-    binary_path: &Path,
-    cluster_path: &Path,
-    mode: &UnitMode,
-    unit_name: &str,
-) -> String {
+pub fn render_unit(binary_path: &Path, cluster_path: &Path, mode: &UnitMode) -> String {
+    let unit_name = mode.unit_name();
     let exec_args = match mode {
-        UnitMode::Serve { bind, no_dispatch } => {
-            let suffix = if *no_dispatch { " --no-dispatch" } else { "" };
-            format!("serve --bind {bind}{suffix}")
-        }
         UnitMode::Agent => "agent".to_string(),
+        UnitMode::Ui { bind } => format!("serve --bind {bind}"),
     };
     format!(
         "[Unit]
@@ -113,14 +105,15 @@ pub fn install(opts: InstallOptions) -> Result<()> {
         .cluster_path
         .canonicalize()
         .with_context(|| format!("cluster config not found: {}", opts.cluster_path.display()))?;
-    let unit_path = unit_path(&opts.unit_name)?;
+    let unit_name = opts.mode.unit_name();
+    let unit_path = unit_path(unit_name)?;
     if unit_path.exists() && !opts.force {
         bail!(
             "{} already exists. Re-run with --force to overwrite, or `labctl service uninstall` first.",
             unit_path.display()
         );
     }
-    let unit = render_unit(&binary, &cluster, &opts.mode, &opts.unit_name);
+    let unit = render_unit(&binary, &cluster, &opts.mode);
     if let Some(parent) = unit_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -130,7 +123,7 @@ pub fn install(opts: InstallOptions) -> Result<()> {
     eprintln!("wrote {}", unit_path.display());
 
     run_systemctl(&["daemon-reload"])?;
-    run_systemctl(&["enable", "--now", &opts.unit_name])?;
+    run_systemctl(&["enable", "--now", unit_name])?;
 
     if !linger_enabled() {
         eprintln!(
@@ -140,8 +133,8 @@ pub fn install(opts: InstallOptions) -> Result<()> {
     }
 
     eprintln!(
-        "\nlabctl service installed and started.\n  status:  systemctl --user status {name}\n  logs:    journalctl --user -u {name} -f\n  stop:    systemctl --user stop {name}\n  remove:  labctl service uninstall",
-        name = opts.unit_name,
+        "\nlabctl service installed and started.\n  status:  systemctl --user status {unit_name}\n  logs:    journalctl --user -u {unit_name} -f\n  stop:    systemctl --user stop {unit_name}\n  remove:  labctl service uninstall {flag}",
+        flag = match opts.mode { UnitMode::Agent => "--agent", UnitMode::Ui { .. } => "--ui" },
     );
     Ok(())
 }
@@ -161,6 +154,23 @@ pub fn uninstall(unit_name: &str) -> Result<()> {
         eprintln!("no unit file at {} (already removed)", unit_path.display());
     }
     let _ = run_systemctl(&["daemon-reload"]);
+    Ok(())
+}
+
+/// Restart one or more installed units. Passes every name in a single
+/// `systemctl --user restart` call so the action is atomic from the
+/// user's perspective. Caller is responsible for choosing the right
+/// units (the CLI gates this on `is_installed` for the default-both
+/// path).
+pub fn restart(unit_names: &[&str]) -> Result<()> {
+    require_systemd()?;
+    if unit_names.is_empty() {
+        bail!("no units to restart");
+    }
+    let mut args: Vec<&str> = vec!["restart"];
+    args.extend_from_slice(unit_names);
+    run_systemctl(&args)?;
+    eprintln!("restarted: {}", unit_names.join(", "));
     Ok(())
 }
 
@@ -278,69 +288,37 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn unit_renders_with_absolute_paths_and_correct_exec_start() {
-        let unit = render_unit(
-            &PathBuf::from("/usr/local/bin/labctl"),
-            &PathBuf::from("/etc/labctl/cluster.toml"),
-            &UnitMode::Serve {
-                bind: "127.0.0.1:8765".to_string(),
-                no_dispatch: false,
-            },
-            "labctl",
-        );
-        assert!(unit.contains(
-            "ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml serve --bind 127.0.0.1:8765"
-        ));
-        assert!(!unit.contains("--no-dispatch"));
-        assert!(unit.contains("Restart=on-failure"));
-        assert!(unit.contains("WantedBy=default.target"));
-        assert!(!unit.contains("ExecStart=labctl"));
-    }
-
-    #[test]
     fn agent_unit_omits_bind_and_uses_agent_subcommand() {
         let unit = render_unit(
             &PathBuf::from("/usr/local/bin/labctl"),
             &PathBuf::from("/etc/labctl/cluster.toml"),
             &UnitMode::Agent,
-            "labctl-agent",
         );
         assert!(unit.contains(
             "ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml agent"
         ));
         assert!(!unit.contains("--bind"));
         assert!(!unit.contains("serve"));
+        assert!(unit.contains("labctl (labctl-agent)"));
+        assert!(unit.contains("-u labctl-agent"));
     }
 
     #[test]
-    fn ui_unit_appends_no_dispatch_flag() {
+    fn ui_unit_serves_http_only() {
         let unit = render_unit(
             &PathBuf::from("/usr/local/bin/labctl"),
             &PathBuf::from("/etc/labctl/cluster.toml"),
-            &UnitMode::Serve {
-                bind: "127.0.0.1:8765".to_string(),
-                no_dispatch: true,
-            },
-            "labctl-ui",
+            &UnitMode::Ui { bind: "127.0.0.1:8765".to_string() },
         );
         assert!(unit.contains(
-            "ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml serve --bind 127.0.0.1:8765 --no-dispatch"
+            "ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml serve --bind 127.0.0.1:8765"
         ));
-    }
-
-    #[test]
-    fn unit_name_appears_in_description_and_log_hints() {
-        let unit = render_unit(
-            &PathBuf::from("/x"),
-            &PathBuf::from("/y"),
-            &UnitMode::Serve {
-                bind: "127.0.0.1:9000".to_string(),
-                no_dispatch: false,
-            },
-            "labctl-staging",
-        );
-        assert!(unit.contains("labctl (labctl-staging)"));
-        assert!(unit.contains("-u labctl-staging"));
+        // `serve` is HTTP-only now; the old --no-dispatch flag is gone.
+        assert!(!unit.contains("--no-dispatch"));
+        assert!(unit.contains("labctl (labctl-ui)"));
+        assert!(unit.contains("-u labctl-ui"));
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("WantedBy=default.target"));
     }
 
     #[test]
@@ -349,8 +327,8 @@ mod tests {
         // SAFETY: tests run single-threaded under cargo test --bin labctl
         // by default; this set/restore pattern is fine.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg") };
-        let p = unit_path("labctl").unwrap();
-        assert_eq!(p, PathBuf::from("/tmp/xdg/systemd/user/labctl.service"));
+        let p = unit_path("labctl-ui").unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/xdg/systemd/user/labctl-ui.service"));
         match prev_xdg {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },

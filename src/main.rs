@@ -160,29 +160,21 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
-    /// Serve the web UI and run the per-user dispatch loops
-    /// (reconcile + evald + throttle) in one process, sharing one
-    /// in-memory cache. This is the canonical long-running daemon —
-    /// `labctl service install` writes a systemd user unit whose
-    /// ExecStart points here. Bind 127.0.0.1 and reach the UI via an
-    /// SSH tunnel from your laptop.
+    /// Serve the read-only web UI. HTTP-only — no dispatch loops live
+    /// here; reconcile + evald + throttle run in `labctl agent` (the
+    /// per-user systemd unit `labctl init` installs). Install this as a
+    /// long-running unit via `labctl service install --ui`. Binds
+    /// 127.0.0.1 by default; reach the UI via an SSH tunnel from your
+    /// laptop.
     #[cfg(feature = "ui")]
     Serve {
         #[arg(long, default_value = "127.0.0.1:8765")]
         bind: String,
-        /// Skip the dispatch loops; the process becomes a read-only
-        /// HTTP front. Useful for an extra UI replica that shouldn't
-        /// also try to reconcile.
-        #[arg(long)]
-        no_dispatch: bool,
     },
-    /// Run only the per-user dispatch loops (reconcile + evald +
-    /// periodic refresh) — no HTTP listener. Pairs with one shared
-    /// `labctl serve --no-dispatch` as the multi-tenant rollout model:
-    /// each user runs their own tiny agent; one host runs the shared
-    /// read-only UI. Install as a systemd user unit via
-    /// `labctl service install --agent`. Use `labctl serve` (all-in-one)
-    /// instead for single-user setups.
+    /// Run the per-user dispatch loops (reconcile + evald + periodic
+    /// refresh) — no HTTP listener. Auto-installed as
+    /// `labctl-agent.service` by `labctl init`; this subcommand is the
+    /// unit's ExecStart and also runnable directly for debugging.
     Agent,
     /// Full bootstrap for a new-cluster setup: write/adopt a
     /// cluster.toml, pre-create per-user subdirs under runs_base +
@@ -284,45 +276,79 @@ enum EvaldCommand {
     Once { policy: PathBuf },
 }
 
+/// Which labctl unit a service subcommand is acting on. The CLI surfaces
+/// this as mutually-exclusive `--agent` / `--ui` flags so users don't
+/// have to remember unit-name strings.
+#[derive(Debug, Clone, Copy)]
+enum UnitKind {
+    Agent,
+    Ui,
+}
+
+impl UnitKind {
+    fn unit_name(self) -> &'static str {
+        match self {
+            UnitKind::Agent => service::AGENT_UNIT_NAME,
+            UnitKind::Ui => service::UI_UNIT_NAME,
+        }
+    }
+}
+
+fn pick_unit_kind(agent: bool, ui: bool) -> Result<UnitKind> {
+    match (agent, ui) {
+        (true, false) => Ok(UnitKind::Agent),
+        (false, true) => Ok(UnitKind::Ui),
+        (true, true) => unreachable!("clap's ArgGroup prevents both"),
+        (false, false) => anyhow::bail!(
+            "specify which unit to target: --agent or --ui"
+        ),
+    }
+}
+
 #[derive(Subcommand)]
 enum ServiceCommand {
-    /// Generate a systemd user unit, enable it, and start it. Defaults
-    /// to the all-in-one `labctl serve` (HTTP + dispatch). Pass
-    /// `--agent` for the dispatch-only agent (no HTTP) — pairs with
-    /// one shared `labctl serve --no-dispatch` for multi-tenant
-    /// deployments. Survives logout when linger is enabled
-    /// (`loginctl enable-linger $USER`).
+    /// Install a labctl systemd user unit. Pick exactly one of `--agent`
+    /// (the per-user dispatch loop; auto-installed by `labctl init`) or
+    /// `--ui` (the read-only HTTP window). Survives logout when linger
+    /// is enabled (`loginctl enable-linger $USER`).
     Install {
-        #[arg(long, default_value = "127.0.0.1:8765")]
-        bind: String,
-        /// Install the dispatch-only agent (no HTTP listener). `--bind`
-        /// is ignored. Default unit name becomes `labctl-agent`.
-        /// Mutually exclusive with `--no-dispatch`.
-        #[arg(long, conflicts_with = "no_dispatch")]
+        /// Install the per-user dispatch agent (`labctl-agent.service`).
+        #[arg(long, group = "kind")]
         agent: bool,
-        /// Install the read-only shared UI (HTTP only, no reconcile or
-        /// evald). The shared UI host in a multi-tenant rollout — pair
-        /// with per-user `--agent` installs. Default unit name becomes
-        /// `labctl-ui`. Mutually exclusive with `--agent`.
-        #[arg(long)]
-        no_dispatch: bool,
-        /// Override the unit name. Defaults to `labctl` (all-in-one),
-        /// `labctl-agent` (--agent), or `labctl-ui` (--no-dispatch).
-        #[arg(long)]
-        name: Option<String>,
+        /// Install the read-only UI (`labctl-ui.service`).
+        #[arg(long, group = "kind")]
+        ui: bool,
+        /// Bind address for the UI unit. Ignored when `--agent`.
+        #[arg(long, default_value = service::DEFAULT_BIND)]
+        bind: String,
         /// Overwrite an existing unit file with the same name.
         #[arg(long)]
         force: bool,
     },
-    /// Stop, disable, and remove the unit.
+    /// Stop, disable, and remove a labctl unit. Pick exactly one of
+    /// `--agent` or `--ui`.
     Uninstall {
-        #[arg(long, default_value = "labctl")]
-        name: String,
+        #[arg(long, group = "kind")]
+        agent: bool,
+        #[arg(long, group = "kind")]
+        ui: bool,
     },
-    /// Pass through to `systemctl --user status <name>`.
+    /// Show status of both labctl units (agent + ui). Pass `--agent` or
+    /// `--ui` to scope to one.
     Status {
-        #[arg(long, default_value = "labctl")]
-        name: String,
+        #[arg(long, group = "kind")]
+        agent: bool,
+        #[arg(long, group = "kind")]
+        ui: bool,
+    },
+    /// Restart installed labctl units. With no flag, restarts whichever
+    /// of (agent, ui) are installed — the canonical post-rebuild
+    /// command. Errors if neither is installed.
+    Restart {
+        #[arg(long, group = "kind")]
+        agent: bool,
+        #[arg(long, group = "kind")]
+        ui: bool,
     },
 }
 
@@ -389,34 +415,50 @@ fn main() -> Result<()> {
     }
     if let Command::Service { command } = cli.command {
         return match command {
-            ServiceCommand::Install {
-                bind,
-                agent,
-                no_dispatch,
-                name,
-                force,
-            } => {
-                let mut opts = service::InstallOptions::new(cluster_path);
-                opts.mode = if agent {
-                    service::UnitMode::Agent
-                } else {
-                    service::UnitMode::Serve { bind, no_dispatch }
+            ServiceCommand::Install { agent, ui, bind, force } => {
+                let mode = pick_unit_kind(agent, ui)?;
+                let mode = match mode {
+                    UnitKind::Agent => service::UnitMode::Agent,
+                    UnitKind::Ui => service::UnitMode::Ui { bind },
                 };
-                opts.unit_name = name.unwrap_or_else(|| {
-                    if agent {
-                        "labctl-agent"
-                    } else if no_dispatch {
-                        "labctl-ui"
-                    } else {
-                        "labctl"
-                    }
-                    .to_string()
-                });
-                opts.force = force;
-                service::install(opts)
+                service::install(service::InstallOptions {
+                    cluster_path,
+                    mode,
+                    force,
+                })
             }
-            ServiceCommand::Uninstall { name } => service::uninstall(&name),
-            ServiceCommand::Status { name } => service::status(&name),
+            ServiceCommand::Uninstall { agent, ui } => {
+                let kind = pick_unit_kind(agent, ui)?;
+                service::uninstall(kind.unit_name())
+            }
+            ServiceCommand::Status { agent, ui } => {
+                if !agent && !ui {
+                    // No filter — show both units.
+                    service::status(service::AGENT_UNIT_NAME)?;
+                    service::status(service::UI_UNIT_NAME)
+                } else {
+                    let kind = pick_unit_kind(agent, ui)?;
+                    service::status(kind.unit_name())
+                }
+            }
+            ServiceCommand::Restart { agent, ui } => {
+                let targets: Vec<&str> = match (agent, ui) {
+                    (true, false) => vec![service::AGENT_UNIT_NAME],
+                    (false, true) => vec![service::UI_UNIT_NAME],
+                    (true, true) => unreachable!("clap ArgGroup prevents both"),
+                    (false, false) => [service::AGENT_UNIT_NAME, service::UI_UNIT_NAME]
+                        .into_iter()
+                        .filter(|n| service::is_installed(n))
+                        .collect(),
+                };
+                if targets.is_empty() {
+                    anyhow::bail!(
+                        "no labctl units installed (run `labctl init` for the \
+                         agent, `labctl service install --ui` for the UI)"
+                    );
+                }
+                service::restart(&targets)
+            }
         };
     }
     // Run and RunPipeline are handled before opening the local registry —
@@ -525,11 +567,11 @@ fn main() -> Result<()> {
             }
         },
         #[cfg(feature = "ui")]
-        Command::Serve { bind, no_dispatch } => {
+        Command::Serve { bind } => {
             let addr: std::net::SocketAddr = bind
                 .parse()
                 .with_context(|| format!("invalid --bind address {bind:?}"))?;
-            server::serve(cluster, store, addr, no_dispatch)?;
+            server::serve(cluster, store, addr)?;
         }
         Command::Agent => {
             agent::run_standalone(cluster, store)?;
@@ -750,13 +792,12 @@ fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
             "not available (service install/status will not work)"
         },
     );
-    // Recognize all three unit shapes labctl knows how to install:
-    //   labctl         (all-in-one: HTTP + dispatch)
-    //   labctl-agent   (dispatch-only, per-user, multi-tenant rollout)
-    //   labctl-ui      (HTTP-only, --no-dispatch; the shared read window)
-    // Any of these can be present; doctor reports every installed one.
+    // Two unit shapes labctl installs:
+    //   labctl-agent   (per-user dispatch — auto-installed by `labctl init`)
+    //   labctl-ui      (HTTP-only — opt-in via `labctl service install --ui`)
+    // Doctor reports each independently.
     if systemd_ok {
-        let candidates = ["labctl", "labctl-agent", "labctl-ui"];
+        let candidates = [service::AGENT_UNIT_NAME, service::UI_UNIT_NAME];
         let installed: Vec<&str> = candidates
             .iter()
             .copied()
@@ -766,9 +807,8 @@ fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
             emit(
                 "labctl unit",
                 true,
-                "not installed (run `labctl service install` for single-user, \
-                 `service install --agent` for multi-tenant per-user agent, \
-                 or `service install --no-dispatch` for the shared read-only UI)",
+                "not installed (run `labctl init` for the per-user agent, \
+                 `labctl service install --ui` for the read-only UI)",
             );
         } else {
             for unit in installed {

@@ -75,12 +75,7 @@ struct StreamEvent {
     id: String,
 }
 
-pub fn serve(
-    cluster: ClusterConfig,
-    store: Store,
-    addr: SocketAddr,
-    no_dispatch: bool,
-) -> Result<()> {
+pub fn serve(cluster: ClusterConfig, store: Store, addr: SocketAddr) -> Result<()> {
     // 256 is plenty — broadcast is for live deltas, not a queue. Slow
     // subscribers get lagged out and re-sync via REST on next focus.
     let (events_tx, _) = broadcast::channel::<StreamEvent>(256);
@@ -126,8 +121,6 @@ pub fn serve(
 
     let tail_store = state.store.clone();
     let refresh_store = state.store.clone();
-    let dispatch_cluster = state.cluster.clone();
-    let dispatch_store = state.store.clone();
     let app = Router::new()
         .nest("/api", api)
         .fallback(static_handler)
@@ -150,34 +143,17 @@ pub fn serve(
         // Background task: re-walk the filesystem-truth registry on a
         // timer so the in-memory cache stays current with sidecars
         // written by out-of-process CLI invocations (`labctl run`,
-        // `labctl run-pipeline`). Without this, the cache only learns
-        // about runs submitted in-process and silently diverges from
-        // disk between daemon restarts.
+        // `labctl run-pipeline`) and by the per-user `labctl agent`.
         tokio::spawn(crate::agent::periodic_refresh(refresh_store, Duration::from_secs(10)));
-
-        let dispatch_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-        if !no_dispatch {
-            crate::agent::spawn(
-                dispatch_cluster,
-                dispatch_store,
-                dispatch_shutdown.clone(),
-            );
-        } else {
-            eprintln!("labctl: dispatch disabled by --no-dispatch");
-        }
 
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("failed to bind {addr}"))?;
         eprintln!("labctl listening on http://{addr}");
-        let result = axum::serve(listener, app)
+        axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await
-            .context("server error");
-        // Notify dispatch tasks to wind down so the runtime can exit
-        // cleanly. They each `select!` against this Notify.
-        dispatch_shutdown.notify_waiters();
-        result
+            .context("server error")
     })?;
 
     Ok(())
