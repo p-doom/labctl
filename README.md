@@ -37,60 +37,38 @@ Re-run after `git pull` to refresh the installed binary.
 
 ## Quick start
 
-1. Bootstrap a `cluster.toml`. On a new cluster, the fastest path is
-   `labctl init` — it probes local SLURM for partitions / QoS / GPU
-   gres syntax and writes a templated `cluster.<name>.toml`:
+```bash
+./scripts/install.sh   # cargo install + git hook setup
+labctl init            # interactive bootstrap — config, dirs, agent, doctor
+labctl run path/to/recipe.toml
+```
 
-   ```bash
-   labctl init \
-       --name berlin \
-       --runs-base /fast/.../labctl_runs \
-       --artifact-root checkpoint=/fast/.../checkpoints \
-       --artifact-root dataset=/fast/.../datasets \
-       --artifact-root eval_result=/fast/.../eval_logs \
-       --repo omegalax=/fast/home/<you>/omegalax
-   ```
+`labctl init` is a full setup wizard, not just a config writer. It
+picks one of four modes — interactively or via flag — and does
+*everything* needed to leave you with a working setup:
 
-   On a second cluster, copy the schema from your first cluster's
-   identity card and only override the site-local paths:
+| Situation | Command | What it does |
+| --- | --- | --- |
+| Brand-new cluster, no template | `labctl init` | Greenfield: SLURM probe + prompts → fresh cluster.toml, per-user dirs, agent unit, doctor. |
+| You already wrote a cluster.toml | `labctl init --use ~/cluster.toml` | Symlinks it into the default config location; creates dirs; installs agent; doctor. |
+| Standing labctl up at a new site (had one at site A, now at site B) | `labctl init --migrate-from /path/to/cluster.berlin.toml` | Schema carries over; site-local paths reviewed interactively. |
+| Joining a colleague's shared registry on this cluster | `labctl init --join /shared/cluster.berlin.toml` | Paths kept verbatim; per-user agent + per-user subdirs only. |
 
-   ```bash
-   labctl init --from cluster.berlin.toml --name julich \
-       --runs-base /scratch/<you>/labctl_runs
-   ```
+The config is written to `~/.config/labctl/cluster.toml` by default,
+so all later `labctl <cmd>` invocations work without `--cluster`.
+Override with `--cluster <path>` or `$LABCTL_CLUSTER`.
 
-   See `examples/clusters/` for templates and `cluster.berlin.toml`
-   (the in-repo identity card for the HMGU/berlin cluster) for what
-   a populated config looks like in practice. Verify the result:
+Once set up:
 
-   ```bash
-   labctl --cluster cluster.berlin.toml doctor
-   ```
+```bash
+labctl run path/to/recipe.toml                   # submit
+labctl serve --bind 127.0.0.1:8765               # UI (ssh -L from your laptop)
+labctl doctor                                    # re-verify anytime
+```
 
-2. Submit a recipe under your own uid:
-
-   ```bash
-   labctl --cluster cluster.berlin.toml run my_recipe.toml
-   ```
-
-3. Install the per-user agent (reconcile + evald + throttle):
-
-   ```bash
-   labctl --cluster cluster.berlin.toml service install --agent
-   ```
-
-4. Run the UI ad-hoc when you want to look at runs:
-
-   ```bash
-   labctl --cluster cluster.berlin.toml serve --bind 127.0.0.1:8765
-   ```
-
-   Tunnel from your laptop: `ssh -L 8765:127.0.0.1:8765 <login-node>`,
-   then open `http://127.0.0.1:8765`.
-
-See `docs/ONBOARDING.md` for the full walkthrough and
+See `docs/ONBOARDING.md` for the full walkthrough,
 `docs/RECIPE_CONTRACT.md` for the contract between labctl and your
-recipes.
+recipes, and `examples/` for cluster / recipe / policy templates.
 
 ## Status
 

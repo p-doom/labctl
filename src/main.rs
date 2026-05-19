@@ -4,6 +4,7 @@ mod config;
 mod evald;
 mod fs_layout;
 mod init;
+mod prompt;
 mod provenance;
 mod remote;
 mod runner;
@@ -34,11 +35,40 @@ const BUILD_VERSION: &str = concat!(
 #[command(version = BUILD_VERSION)]
 #[command(about = "Reproducible lab run envelope and artifact lineage control plane")]
 struct Cli {
-    #[arg(long, global = true, default_value = "labctl.toml")]
-    cluster: PathBuf,
+    /// Path to cluster.toml. Defaults to $XDG_CONFIG_HOME/labctl/cluster.toml
+    /// (or ~/.config/labctl/cluster.toml). Override per invocation or set
+    /// $LABCTL_CLUSTER. `labctl init` writes the default location so plain
+    /// `labctl <cmd>` Just Works after setup.
+    #[arg(long, global = true)]
+    cluster: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
+}
+
+/// Resolve the cluster path: explicit `--cluster` > $LABCTL_CLUSTER > XDG default.
+/// XDG honors $XDG_CONFIG_HOME if set, else $HOME/.config/labctl/cluster.toml.
+/// Falls back to `./labctl.toml` if HOME isn't set (CI / system contexts).
+fn resolve_cluster_path(arg: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = arg {
+        return p;
+    }
+    if let Ok(env) = std::env::var("LABCTL_CLUSTER") {
+        if !env.is_empty() {
+            return PathBuf::from(env);
+        }
+    }
+    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
+        if !x.is_empty() {
+            return PathBuf::from(x).join("labctl").join("cluster.toml");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".config/labctl/cluster.toml");
+        }
+    }
+    PathBuf::from("labctl.toml")
 }
 
 #[derive(Subcommand)]
@@ -159,44 +189,81 @@ enum Command {
     /// `labctl service install --agent`. Use `labctl serve` (all-in-one)
     /// instead for single-user setups.
     Agent,
-    /// Bootstrap a cluster.toml for a new site. Probes the local
-    /// SLURM controller (sinfo / sacctmgr / scontrol) for partition,
-    /// QoS, and GresTypes, then writes a cluster.<name>.toml in CWD.
-    /// Use `--from <foreign.toml>` to copy schema from another
-    /// cluster's identity card (the "import the config from this
-    /// cluster" workflow); flag overrides apply on top.
-    /// Always paired with a follow-up `labctl --cluster <new> doctor`.
+    /// Full bootstrap for a new-cluster setup: write/adopt a
+    /// cluster.toml, pre-create per-user subdirs under runs_base +
+    /// artifact_roots, install the per-user systemd agent unit, and
+    /// run doctor — interactively by default, scriptable via `--yes`.
+    /// Four modes, picked by mutually exclusive flag:
+    ///   (default)        greenfield — write a fresh config from a
+    ///                    SLURM probe + interactive prompts.
+    ///   --use <path>     adopt an existing cluster.toml you wrote.
+    ///   --migrate-from <path>
+    ///                    copy schema from another cluster, adapt
+    ///                    paths interactively.
+    ///   --join <path>    join a colleague's shared registry on this
+    ///                    cluster. Paths kept verbatim.
     Init {
-        /// Path to an existing cluster.toml to copy schema from.
-        /// Paths in the copy are surfaced verbatim — the user must
-        /// edit them. Validation of the source is skipped so foreign
-        /// configs whose paths don't exist locally still work.
-        #[arg(long)]
-        from: Option<PathBuf>,
-        /// Cluster name. Defaults to "untitled" (skeleton) or the
-        /// foreign cluster's name (when `--from` is set).
+        /// Adopt an existing cluster.toml as-is. Symlinks it into
+        /// the default config location so plain `labctl <cmd>` works.
+        #[arg(long, group = "init_source")]
+        r#use: Option<PathBuf>,
+        /// Adapt a foreign cluster's identity card to this site.
+        /// Schema (kinds, repos, dispatch, throttle, env) carries
+        /// over; site-local paths are surfaced for interactive edit.
+        #[arg(long, group = "init_source")]
+        migrate_from: Option<PathBuf>,
+        /// Join a colleague's shared registry on this cluster.
+        /// Paths kept verbatim — your runs land alongside theirs.
+        /// Per-user agent unit and per-user subdirs are still created.
+        #[arg(long, group = "init_source")]
+        join: Option<PathBuf>,
+
+        /// Cluster name. Defaults to the foreign config's name or
+        /// "untitled" for greenfield.
         #[arg(long)]
         name: Option<String>,
-        /// runs_base path override. Required if not in `--from`.
+        /// runs_base path override (interactive default if absent).
         #[arg(long)]
         runs_base: Option<PathBuf>,
         /// Artifact root override, repeatable. Format: `kind=path`,
         /// e.g. `--artifact-root checkpoint=/scratch/me/ckpts`.
         #[arg(long = "artifact-root", value_parser = parse_kv_pathbuf)]
         artifact_root: Vec<(String, PathBuf)>,
-        /// Repo override, repeatable. Format: `name=path`,
-        /// e.g. `--repo myrepo=/home/me/myrepo`.
+        /// Repo override, repeatable. Format: `name=path`.
         #[arg(long, value_parser = parse_kv_pathbuf)]
         repo: Vec<(String, PathBuf)>,
-        /// Output path. Defaults to `cluster.<name>.toml` in CWD.
+        /// Output path. Defaults to ~/.config/labctl/cluster.toml.
         #[arg(long)]
         output: Option<PathBuf>,
-        /// Overwrite an existing output file.
+
+        /// Non-interactive: accept all defaults, override only via
+        /// flags. Auto-enabled when stdin isn't a TTY.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Overwrite an existing output file / replace an existing
+        /// agent unit without prompting.
         #[arg(long)]
         force: bool,
-        /// Skip the SLURM probes. Useful in CI / non-SLURM hosts.
+        /// Skip the SLURM probes (CI, non-SLURM hosts, or when
+        /// `--migrate-from` / `--use` / `--join` carry the values).
         #[arg(long)]
         no_detect: bool,
+        /// Skip pre-creating per-user subdirs under runs_base +
+        /// artifact_roots.
+        #[arg(long)]
+        no_create_dirs: bool,
+        /// Skip installing the per-user systemd agent unit.
+        #[arg(long)]
+        no_agent: bool,
+        /// Skip the final `labctl doctor` run.
+        #[arg(long)]
+        no_doctor: bool,
+        /// For `--use` / `--join`: copy the source cluster.toml
+        /// instead of symlinking. Decouples your local config from
+        /// any later rotation of the source. Defaults off — symlink
+        /// is usually what you want for a team-rotated config.
+        #[arg(long)]
+        copy_config: bool,
     },
 }
 
@@ -266,26 +333,43 @@ enum ServiceCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let cluster_path = resolve_cluster_path(cli.cluster.clone());
 
     // Validate is pure file inspection — no cluster, no registry.
     if let Command::Validate { path } = &cli.command {
         return validate_path(path);
     }
-    // Init writes a cluster.toml from flags + optional `--from` + SLURM
-    // auto-detect. It never reads --cluster, never touches the registry.
+    // Init is the full bootstrap (cluster.toml + dirs + agent +
+    // doctor). It chooses its OWN destination — the global --cluster
+    // arg is not read here.
     if let Command::Init {
-        from,
+        r#use,
+        migrate_from,
+        join,
         name,
         runs_base,
         artifact_root,
         repo,
         output,
+        yes,
         force,
         no_detect,
+        no_create_dirs,
+        no_agent,
+        no_doctor,
+        copy_config,
     } = cli.command
     {
+        let mode = match (r#use, migrate_from, join) {
+            (Some(p), None, None) => init::InitMode::Use(p),
+            (None, Some(p), None) => init::InitMode::MigrateFrom(p),
+            (None, None, Some(p)) => init::InitMode::Join(p),
+            (None, None, None) => init::InitMode::Greenfield,
+            _ => unreachable!("clap's mutual-exclusion group prevents this"),
+        };
         return init::run(init::InitOptions {
-            from,
+            mode,
+            yes,
             name,
             runs_base,
             artifact_roots: artifact_root,
@@ -293,6 +377,10 @@ fn main() -> Result<()> {
             output,
             force,
             no_detect,
+            no_create_dirs,
+            no_agent,
+            no_doctor,
+            copy_config,
         });
     }
     // Service install/uninstall/status only needs the cluster path
@@ -305,7 +393,7 @@ fn main() -> Result<()> {
     // Doctor must work even when the cluster config doesn't load — that's
     // exactly the situation it's here to diagnose.
     if let Command::Doctor = &cli.command {
-        return run_doctor(&cli.cluster);
+        return run_doctor(&cluster_path);
     }
     if let Command::Service { command } = cli.command {
         return match command {
@@ -316,7 +404,7 @@ fn main() -> Result<()> {
                 name,
                 force,
             } => {
-                let mut opts = service::InstallOptions::new(cli.cluster);
+                let mut opts = service::InstallOptions::new(cluster_path);
                 opts.mode = if agent {
                     service::UnitMode::Agent
                 } else {
@@ -344,16 +432,16 @@ fn main() -> Result<()> {
     // would race on POSIX locks (broken on parallel filesystems) and
     // corrupt the DB.
     if let Command::Run { recipe } = &cli.command {
-        return run_recipe_command(&cli.cluster, recipe);
+        return run_recipe_command(&cluster_path, recipe);
     }
     if let Command::RunSweep { recipe } = &cli.command {
-        return run_sweep_command(&cli.cluster, recipe);
+        return run_sweep_command(&cluster_path, recipe);
     }
     if let Command::RunPipeline { pipeline } = &cli.command {
-        return run_pipeline_command(&cli.cluster, pipeline);
+        return run_pipeline_command(&cluster_path, pipeline);
     }
 
-    let cluster = config::ClusterConfig::load(&cli.cluster)?;
+    let cluster = config::ClusterConfig::load(&cluster_path)?;
     let mut store = store::Store::open(&cluster)?;
 
     match cli.command {

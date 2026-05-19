@@ -57,63 +57,69 @@ artifact + alias, and the runs/artifacts views populated. `labctl
 returns "all checks passed" — a useful end-to-end smoke check before
 you point labctl at a real cluster.
 
-## 2. Point labctl at your cluster
+## 2. Set up your cluster
 
-The fastest path is `labctl init`. It probes the local SLURM
-controller (`sinfo`, `sacctmgr`, `scontrol show config`) for
-partition, QoS, and `GresTypes`, then writes a templated
-`cluster.<name>.toml` in CWD:
-
-```bash
-labctl init \
-    --name berlin \
-    --runs-base /fast/.../labctl_runs \
-    --artifact-root dataset=/fast/.../datasets \
-    --artifact-root checkpoint=/fast/.../checkpoints \
-    --artifact-root eval_result=/fast/.../eval_logs \
-    --repo omegalax=/fast/home/<you>/omegalax
-```
-
-On a second cluster (HMGU → Jülich, say), copy the schema from your
-first cluster's identity card and only override site-local paths:
+`labctl init` is a full setup wizard, not just a config writer. It
+picks one of four modes — interactively or via flag — and does
+everything needed to leave you with a working setup: writes (or
+adopts) a cluster.toml, pre-creates your per-user subdirs, installs
+the systemd agent unit, and runs doctor.
 
 ```bash
-labctl init --from cluster.berlin.toml --name julich \
-    --runs-base /scratch/<you>/labctl_runs
+labctl init
 ```
 
-`--from` carries artifact kinds, output kinds, repo names, dispatch
-intervals, throttle, and env across verbatim — the foreign paths are
-surfaced so you can see them and rewrite. Flag overrides
-(`--runs-base`, `--artifact-root`, `--repo`) win over both `--from`
-values and the SLURM auto-detect.
+This drops you into an interactive walkthrough that probes local
+SLURM, asks for paths and repos with smart defaults, and at the end
+runs `labctl doctor` for you. Pass `--yes` (or pipe stdin from a
+script) to accept defaults non-interactively.
 
-The three SLURM probes `labctl init` runs (skippable via
-`--no-detect`):
+### Pick the right mode
 
-| Probe                                 | Fills                       |
-| ------------------------------------- | --------------------------- |
-| `sinfo -h -o '%R'`                    | `[slurm].partition`         |
-| `sacctmgr -nP list qos format=Name`   | `[slurm].qos`               |
-| `scontrol show config` → `GresTypes`  | `[slurm].gres_gpu_syntax`   |
+| Situation | Mode | What it does |
+| --- | --- | --- |
+| Brand-new cluster, no template | `labctl init` (default) | SLURM probe → fresh cluster.toml → per-user dirs → agent → doctor. |
+| You already wrote a cluster.toml | `labctl init --use ~/cluster.toml` | Symlinks your file to the default location → dirs → agent → doctor. No edits to your source. |
+| Standing labctl up at a new site, had it at another | `labctl init --migrate-from /path/to/cluster.berlin.toml` | Carries schema (kinds, repos, dispatch, env, throttle) from the foreign config; reviews site-local paths interactively. |
+| Joining a colleague's shared registry on this cluster | `labctl init --join /shared/cluster.berlin.toml` | Symlinks the team config in. **Paths kept verbatim** — your runs land in the same registry as your colleague's. Per-user agent + per-user subdirs only. |
 
-Each is best-effort: missing binary, non-SLURM cluster, or
-permission-denied all degrade to a note in the output rather than an
-error. The full list of detected partitions / QoS values is printed,
-so even if init picks the wrong default you can see your options.
+The default destination is `~/.config/labctl/cluster.toml`, which is
+also the default for the `--cluster` global flag, so plain `labctl
+<cmd>` works after setup. Override with `--output <path>` at init
+time or `--cluster <path>` (or `$LABCTL_CLUSTER`) per command.
 
-What `labctl init` never does: touch the registry (`runs_base/` and
-the artifact roots are not created — that's the first `labctl run`'s
-job, plus your filesystem permissions setup for multi-tenant
-rollouts), run the scheduler (no `sbatch`, no `scancel`), or
-overwrite an existing file (use `--force` to allow it). The only
-side effect is writing one TOML file.
+### What the wizard does in greenfield mode
 
-See `examples/clusters/` for templates (`single-user.toml`,
-`multi-tenant.toml`, `with-remote.toml`) and `labctl init --help`
-for the flag reference.
+1. **SLURM probe** — `sinfo`, `sacctmgr`, and `scontrol show config`
+   suggest partition / QoS / GresTypes. Best-effort; missing binary
+   degrades to a note, not an error.
+2. **Interactive review** — name, runs_base, each artifact_root,
+   repos, slurm fields. Defaults are pre-filled from the probe.
+3. **Pre-create per-user subdirs** — `mkdir -p
+   runs_base/runs/$USER`, one per artifact_root for `$USER`. Failed
+   mkdirs (permissions) get surfaced but don't abort.
+4. **Install per-user agent** — `~/.config/systemd/user/labctl-agent.service`
+   runs `labctl agent` as you (reconcile + evald + throttle).
+   Enables linger if you want it to survive logout.
+5. **Run doctor** — full self-check against the new config.
 
-If you'd rather hand-write the config, the minimal shape is:
+### Skipping steps
+
+Each step has an off switch for scripted / cautious runs:
+
+- `--no-detect` — skip the SLURM probes
+- `--no-create-dirs` — don't `mkdir -p` per-user subdirs
+- `--no-agent` — don't install the systemd unit
+- `--no-doctor` — skip the final self-check
+
+### When you'd hand-write the file instead
+
+If you want full control, write a `cluster.toml` directly (minimal
+shape below), then run `labctl init --use <that-file>` to bootstrap
+dirs + agent + doctor around it. The committed
+`cluster.berlin.toml` at the repo root is a real populated example;
+`examples/clusters/` has `single-user.toml`, `multi-tenant.toml`,
+and `with-remote.toml` templates.
 
 ```toml
 name = "berlin"
@@ -154,24 +160,17 @@ evald_interval_secs     = 300
 policies_dir            = "policies"
 ```
 
-The committed `cluster.berlin.toml` at the repo root is a real
-populated example of this shape — the identity card the HMGU/berlin
-cluster's systemd units point at. See `examples/clusters/` for
-`single-user.toml`, `multi-tenant.toml`, and `with-remote.toml`
-variants.
-
-Verify whichever route you took:
+### Doctor anytime
 
 ```bash
-labctl --cluster cluster.berlin.toml doctor
+labctl doctor
 ```
 
-The doctor walks the cluster config, checks every directory is writable
-by `$USER` (since `labctl run` creates `runs/<user>/...` and
-`<artifact_root>/<user>/...` under your own uid), checks
-`sacct`/`sbatch` are on `$PATH`, reports the agent unit's status, and
-when a unit is failed or inactive tails the last 20 lines of
-`journalctl --user -u <unit>` so you don't have to round-trip.
+Walks the cluster config, checks every directory is writable by
+`$USER`, validates `sacct`/`sbatch` on `$PATH`, reports the agent
+unit's status, and when a unit is failed/inactive tails the last 20
+lines of `journalctl --user -u <unit>` so you don't have to
+round-trip.
 
 ## 3. Submit your first recipe
 
@@ -199,7 +198,7 @@ alias  = "hello_{run.id}"
 Submit it:
 
 ```bash
-labctl --cluster cluster.toml run hello.toml
+labctl run hello.toml
 ```
 
 The CLI runs everything under your uid: it opens the filesystem-truth
@@ -207,20 +206,29 @@ registry, snapshots the source repo, writes `runs/<your_user>/<run_id>/`,
 renders the sbatch script, calls `sbatch`. The SLURM job is owned by
 you; `scancel` works without ceremony.
 
-## 4. Install the agent
+`labctl` reads `~/.config/labctl/cluster.toml` by default — written
+there by `labctl init`. Override per command with `--cluster <path>`
+or `$LABCTL_CLUSTER` for multi-cluster work.
 
-If you have eval policies or want SLURM status to update without a
-manual `labctl reconcile`, install the per-user agent:
+## 4. Manage the agent
+
+`labctl init` already installed the per-user agent for you. Inspect
+or control it:
 
 ```bash
-labctl --cluster cluster.toml service install
-labctl --cluster cluster.toml service status
+labctl service status                            # systemctl --user is-active labctl-agent
+systemctl --user restart labctl-agent
+loginctl enable-linger $USER                     # survive logout
 ```
 
-The unit is per-user: it runs `labctl agent` as you, reconciles only
-your runs, and submits eval recipes under your uid. The unit survives
-logout once your account has linger enabled (`loginctl enable-linger
-$USER`).
+If you skipped `--agent` during init, install later:
+
+```bash
+labctl service install --agent
+```
+
+The unit runs `labctl agent` as you, reconciles only your runs, and
+submits eval recipes under your uid.
 
 ## 5. Reach the UI from your laptop
 
@@ -228,7 +236,7 @@ The UI is a separate `labctl serve` process. Anyone can run one — it's
 read-only and stateless. Bind it to loopback:
 
 ```bash
-labctl --cluster cluster.toml serve --bind 127.0.0.1:8765
+labctl serve --bind 127.0.0.1:8765
 ```
 
 Tunnel from your laptop:
@@ -259,21 +267,23 @@ Aliases and artifact metadata are global so teammates can reference
 each other's work directly via `[inputs.X] type = "artifact" artifact =
 "<their_alias>"`; writes are partitioned by uid.
 
-Each user, once — install their agent unit:
+Each teammate joining the cluster runs one command:
 
 ```bash
-labctl --cluster cluster.toml service install --agent
+labctl init --join /shared/cluster.berlin.toml
 ```
 
-This writes `~/.config/systemd/user/labctl-agent.service` whose
-`ExecStart` is `labctl agent` (no HTTP, no port). The unit name defaults
-to `labctl-agent` so it doesn't collide with a single-user `labctl`
-unit that might exist from a previous install.
+This symlinks the shared config into their default config location,
+creates their per-user subdirs under the existing registry roots,
+installs the `labctl-agent` systemd user unit, and runs doctor. The
+team-shared cluster.toml stays the canonical source — if it gets
+rotated (new path, additional kind), each teammate just re-runs
+`labctl init --join ...` to pick up the changes.
 
 One person, once — install the shared read-only UI:
 
 ```bash
-labctl --cluster cluster.toml service install --no-dispatch
+labctl service install --no-dispatch
 ```
 
 This writes `~/.config/systemd/user/labctl-ui.service` whose
@@ -311,8 +321,8 @@ Each user, once in their shell init:
 umask 002      # files you create are group-writable
 ```
 
-Verify per user: `labctl --cluster cluster.toml doctor` reports every
-`artifact_root[k]` and `output_root[k]` as writable.
+Verify per user: `labctl doctor` reports every `artifact_root[k]`
+and `output_root[k]` as writable.
 
 ### Recipe repos must be reachable by every user
 
