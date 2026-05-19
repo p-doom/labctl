@@ -7,7 +7,7 @@ this tree at startup and builds an in-memory index from it.
 
 Run:
   python3 scripts/seed-demo.py
-  target/release/labctl --cluster /tmp/labctl-demo/labctl.toml serve
+  labctl --cluster /tmp/labctl-demo/labctl.toml serve
 
 Then SSH-tunnel to 127.0.0.1:8765 and open the UI.
 
@@ -131,7 +131,7 @@ kind = "local"
     print(f"  artifacts: 1 (alias: {artifact_alias})")
     print()
     print("Boot the UI:")
-    print(f"  target/release/labctl --cluster {BASE}/labctl.toml serve")
+    print(f"  labctl --cluster {BASE}/labctl.toml serve")
 
 
 if __name__ == "__main__":

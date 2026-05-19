@@ -2198,6 +2198,7 @@ mod tests {
                     source_path: &source_path,
                     context_json: &json!({"hello": 1}),
                     submitted_by: Some("alice"),
+                    cache_key: None,
                 },
                 &[],
             )

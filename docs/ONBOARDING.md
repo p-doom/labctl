@@ -23,20 +23,22 @@ runs_base/
 <artifact_root>/<kind>/<user>/<alias>/   the artifact + .meta.json sidecar
 ```
 
-## 0. Build the binary
+## 0. Install
 
 ```bash
 git clone <this-repo> labctl && cd labctl
-
-# Frontend (the SPA is baked into the binary via rust-embed)
-cd ui && npm ci && npm run build && cd ..
-
-# Release binary with the UI feature on
-cargo build --release --features ui
+./scripts/install.sh
 ```
 
-You now have `target/release/labctl`. Put it on your `$PATH` or symlink
-it into `~/.local/bin/`.
+`scripts/install.sh` does three things: builds the embedded
+frontend (`ui/dist/`), `cargo install --path . --features ui` so
+`labctl` ends up in `~/.cargo/bin/` (on PATH for any normal Rust
+setup), and points `git config core.hooksPath` at `scripts/hooks/`
+so `cargo test --all-features` runs before every `git push`. Bypass
+with `git push --no-verify` if you're pushing a deliberate WIP branch.
+
+Re-run `./scripts/install.sh` after `git pull` to refresh the
+installed binary.
 
 ## 1. Sanity check with the demo seed
 
@@ -46,7 +48,7 @@ data:
 
 ```bash
 python3 scripts/seed-demo.py
-target/release/labctl --cluster /tmp/labctl-demo/labctl.toml serve
+labctl --cluster /tmp/labctl-demo/labctl.toml serve
 ```
 
 Open `http://127.0.0.1:8765`. You should see four fake runs, an

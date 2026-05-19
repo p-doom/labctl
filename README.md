@@ -22,17 +22,18 @@ throttle as a systemd unit. `labctl serve` is a read-only HTTP server
 that anyone can run; it builds an in-memory SQLite cache from the tree
 on startup.
 
-## Build
+## Install
 
 ```bash
-# Frontend (the SPA is baked into the binary via rust-embed)
-cd ui && npm ci && npm run build && cd ..
-
-# Release binary with the UI feature on
-cargo build --release --features ui
+./scripts/install.sh
 ```
 
-Resulting binary: `target/release/labctl`.
+Builds the embedded frontend, runs `cargo install --path . --features ui`
+(so `labctl` lands in `~/.cargo/bin/` and is on PATH for any normal
+Rust setup), and points git at `scripts/hooks/` so `cargo test
+--all-features` runs before every push.
+
+Re-run after `git pull` to refresh the installed binary.
 
 ## Quick start
 
