@@ -37,6 +37,11 @@ pub const ALIASES_DIR: &str = "aliases";
 pub const EVAL_STATE_DIR: &str = "eval_state";
 pub const PIPELINES_DIR: &str = "pipelines";
 pub const EVENTS_DIR: &str = "events";
+/// Per-cache_key claim namespace for in-flight stage coalescing. mkdir of
+/// ``<runs_base>/coalesce_claims/<cache_key>/`` is the first-writer-wins
+/// primitive that picks the producer; followers find the producer via the
+/// ``.target.json`` recorded by the claimer.
+pub const COALESCE_CLAIMS_DIR: &str = "coalesce_claims";
 
 // ---------- file names inside a run's .lab/ ----------
 
@@ -118,6 +123,18 @@ pub fn events_root(runs_base: &Path) -> PathBuf {
     runs_base.join(EVENTS_DIR)
 }
 
+pub fn coalesce_claims_root(runs_base: &Path) -> PathBuf {
+    runs_base.join(COALESCE_CLAIMS_DIR)
+}
+
+pub fn coalesce_claim_dir(runs_base: &Path, cache_key: &str) -> PathBuf {
+    coalesce_claims_root(runs_base).join(cache_key)
+}
+
+pub fn coalesce_claim_target(runs_base: &Path, cache_key: &str) -> PathBuf {
+    coalesce_claim_dir(runs_base, cache_key).join(ALIAS_TARGET)
+}
+
 pub fn events_log_for(runs_base: &Path, ts: i64) -> PathBuf {
     use chrono::TimeZone;
     let dt = chrono::Utc.timestamp_opt(ts, 0).single().unwrap_or_default();
@@ -170,6 +187,11 @@ pub struct RunSidecar {
     /// Stage-level cache key. See ``store::NewRun::cache_key``.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_key: Option<String>,
+    /// Set on follower runs: the producer this run is waiting on. None on
+    /// normal runs. Flipped in tandem with status transitions to
+    /// ``awaiting_peer`` / ``cache_hit`` / ``failed``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coalesced_peer_run_id: Option<String>,
 }
 
 fn default_status() -> String {
@@ -220,6 +242,17 @@ pub struct AliasTargetSidecar {
     pub artifact_id: String,
     pub artifact_path: PathBuf,
     pub created_at: i64,
+}
+
+/// ``.target.json`` for an in-flight coalesce claim. Recorded by the
+/// producer at mkdir time so subsequent followers can identify who they
+/// are waiting on. The actual ``afterok:`` job id is looked up from the
+/// producer's registry row — keeping the claim sidecar minimal avoids
+/// a second flush when the producer's job_id eventually lands.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoalesceClaimSidecar {
+    pub producer_run_id: String,
+    pub claimed_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

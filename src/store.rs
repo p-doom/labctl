@@ -65,7 +65,8 @@ CREATE TABLE runs (
     dependency_on TEXT,
     stage_name TEXT,
     submitted_by TEXT NOT NULL,
-    cache_key TEXT
+    cache_key TEXT,
+    coalesced_peer_run_id TEXT
 );
 
 CREATE TABLE pipelines (
@@ -188,6 +189,11 @@ pub struct RunRow {
     pub dependency_on: Option<Value>,
     pub submitted_by: Option<String>,
     pub cache_key: Option<String>,
+    /// Set on follower runs: the run_id this run is coalesced against.
+    /// When the peer reaches a terminal state, the resolver flips this run
+    /// to ``cache_hit`` (peer succeeded) or ``failed`` (peer failed) and
+    /// links the peer's outputs in. None on producer / non-coalesced runs.
+    pub coalesced_peer_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +294,14 @@ pub fn is_terminal(status: &str) -> bool {
     )
 }
 
+/// Followers waiting on a coalesce peer. Non-terminal: the resolver loop
+/// must keep watching them. Separate from ``is_terminal`` so callers that
+/// gate on "this run can never change" don't accidentally treat a follower
+/// as final.
+pub fn is_awaiting_peer(status: &str) -> bool {
+    status == "awaiting_peer"
+}
+
 // ---------- the store ----------
 
 pub struct Store {
@@ -317,6 +331,7 @@ impl Store {
             fs_layout::EVAL_STATE_DIR,
             fs_layout::PIPELINES_DIR,
             fs_layout::EVENTS_DIR,
+            fs_layout::COALESCE_CLAIMS_DIR,
         ] {
             fs::create_dir_all(runs_base.join(sub))
                 .with_context(|| format!("failed to create {}/{}", runs_base.display(), sub))?;
@@ -459,6 +474,7 @@ impl Store {
             job_id: None,
             finished_at: None,
             cache_key: run.cache_key.map(|s| s.to_string()),
+            coalesced_peer_run_id: None,
         };
         fs_layout::atomic_write_json(&lab_dir.join(fs_layout::RUN_JSON), &sidecar)?;
 
@@ -477,8 +493,9 @@ impl Store {
         tx.execute(
             "INSERT INTO runs
              (id, recipe_name, recipe_hash, status, run_dir, repo, source_path,
-              recipe_json, context_json, created_at, submitted_by, cache_key)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              recipe_json, context_json, created_at, submitted_by, cache_key,
+              coalesced_peer_run_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
             params![
                 run.id,
                 run.recipe.name,
@@ -640,9 +657,10 @@ impl Store {
     /// would race with that user's own daemon.
     pub fn list_active_runs(&self, submitted_by: &str) -> Result<Vec<RunRow>> {
         let mut stmt = self.cache.prepare(
-            "SELECT * FROM runs WHERE status IN ('created', 'submitted', 'running')
-               AND submitted_by = ?
-             ORDER BY created_at ASC",
+            "SELECT * FROM runs
+              WHERE status IN ('created', 'submitted', 'running', 'awaiting_peer')
+                AND submitted_by = ?
+              ORDER BY created_at ASC",
         )?;
         Ok(stmt
             .query_map(params![submitted_by], row_to_run)?
@@ -997,6 +1015,156 @@ impl Store {
             payload: json!({
                 "cache_key": cache_key,
                 "source_run_id": source_run_id,
+            }),
+            created_at: util::now_ts(),
+        })
+    }
+
+    // ---------- in-flight coalescing ----------
+    //
+    // Pairs with the stage cache-hit feature: when a brand-new submission's
+    // cache_key matches an *in-flight* peer's cache_key, register the new
+    // run as a follower instead of duplicating the work. The first writer
+    // wins the slot via atomic mkdir; subsequent writers read the producer
+    // run_id and depend on its job_id.
+
+    /// Find an in-flight producer with this cache_key. Excludes followers
+    /// (status = 'awaiting_peer') so we never form chains of followers, and
+    /// requires a job_id so the caller can build an ``afterok:`` SLURM
+    /// dependency right away. ``find_cache_hit_candidate`` covers the
+    /// already-terminal case; this one is the active-peer counterpart.
+    pub fn find_coalesce_peer(&self, cache_key: &str) -> Result<Option<RunRow>> {
+        let mut stmt = self.cache.prepare(
+            "SELECT * FROM runs
+              WHERE cache_key = ?
+                AND status IN ('submitted', 'running')
+                AND job_id IS NOT NULL
+              ORDER BY created_at ASC
+              LIMIT 1",
+        )?;
+        let row = stmt
+            .query_map(params![cache_key], row_to_run)?
+            .next()
+            .transpose()?;
+        Ok(row)
+    }
+
+    /// Atomically claim the coalesce slot for ``cache_key``. First writer
+    /// wins via mkdir; subsequent writers get ``AlreadyExists`` and should
+    /// look up the producer via ``find_coalesce_peer``. Writes a
+    /// ``.target.json`` recording the claimer; later callers can use it to
+    /// recover from stale slots.
+    pub fn claim_coalesce_slot(
+        &self,
+        cache_key: &str,
+        producer_run_id: &str,
+    ) -> Result<fs_layout::ClaimOutcome> {
+        let dir = fs_layout::coalesce_claim_dir(&self.runs_base, cache_key);
+        let outcome = fs_layout::claim_dir(&dir)?;
+        if outcome == fs_layout::ClaimOutcome::Claimed {
+            let target = fs_layout::coalesce_claim_target(&self.runs_base, cache_key);
+            let sidecar = fs_layout::CoalesceClaimSidecar {
+                producer_run_id: producer_run_id.to_string(),
+                claimed_at: util::now_ts(),
+            };
+            fs_layout::atomic_write_json(&target, &sidecar)?;
+        }
+        Ok(outcome)
+    }
+
+    /// Read the claimer recorded in the slot's ``.target.json``. Used by a
+    /// follower right after it gets ``AlreadyExists`` from
+    /// ``claim_coalesce_slot``. Returns ``None`` if the slot exists but the
+    /// sidecar hasn't been written yet (the claimer is between mkdir and
+    /// atomic_write_json) — caller should treat that as a stale-slot signal.
+    pub fn read_coalesce_claim(
+        &self,
+        cache_key: &str,
+    ) -> Result<Option<fs_layout::CoalesceClaimSidecar>> {
+        let target = fs_layout::coalesce_claim_target(&self.runs_base, cache_key);
+        fs_layout::read_json_optional(&target)
+    }
+
+    /// Force-remove a coalesce slot. Used to clear a stale claim whose
+    /// producer either never inserted a registry row (crashed between
+    /// mkdir and insert_run) or finished long ago without anyone GC'ing
+    /// the dir. Best-effort: missing dir is not an error.
+    pub fn release_coalesce_slot(&self, cache_key: &str) -> Result<()> {
+        let dir = fs_layout::coalesce_claim_dir(&self.runs_base, cache_key);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| {
+                format!("failed to release coalesce slot {}", dir.display())
+            }),
+        }
+    }
+
+    /// Mark a freshly-submitted follower as ``awaiting_peer``. Sets the
+    /// trampoline's ``job_id``, the peer run_id, and flips status all in one
+    /// step — paired with the producer's ``set_submitted`` but for the
+    /// follower path. Emits a ``stage_coalesced`` event so downstream
+    /// tooling can attribute the wait.
+    pub fn set_awaiting_peer(
+        &mut self,
+        run_id: &str,
+        job_id: &str,
+        peer_run_id: &str,
+        cache_key: &str,
+    ) -> Result<()> {
+        let user = self.user_for_run(run_id)?;
+        let lab = fs_layout::run_lab_dir(&self.runs_base, &user, run_id);
+        let mut sidecar: RunSidecar =
+            fs_layout::read_json(&lab.join(fs_layout::RUN_JSON))?;
+        sidecar.status = "awaiting_peer".to_string();
+        sidecar.job_id = Some(job_id.to_string());
+        sidecar.coalesced_peer_run_id = Some(peer_run_id.to_string());
+        fs_layout::atomic_write_json(&lab.join(fs_layout::RUN_JSON), &sidecar)?;
+        self.cache.execute(
+            "UPDATE runs SET status='awaiting_peer', job_id=?, coalesced_peer_run_id=? WHERE id=?",
+            params![job_id, peer_run_id, run_id],
+        )?;
+        self.append_event(EventLine {
+            run_id: Some(run_id.to_string()),
+            event_type: "stage_coalesced".to_string(),
+            payload: json!({
+                "peer_run_id": peer_run_id,
+                "cache_key": cache_key,
+                "job_id": job_id,
+            }),
+            created_at: util::now_ts(),
+        })?;
+        Ok(())
+    }
+
+    pub fn append_stage_coalesce_resolved_event(
+        &mut self,
+        run_id: &str,
+        peer_run_id: &str,
+    ) -> Result<()> {
+        self.append_event(EventLine {
+            run_id: Some(run_id.to_string()),
+            event_type: "stage_coalesce_resolved".to_string(),
+            payload: json!({
+                "peer_run_id": peer_run_id,
+                "outcome": "cache_hit",
+            }),
+            created_at: util::now_ts(),
+        })
+    }
+
+    pub fn append_stage_coalesce_failed_event(
+        &mut self,
+        run_id: &str,
+        peer_run_id: &str,
+        peer_status: &str,
+    ) -> Result<()> {
+        self.append_event(EventLine {
+            run_id: Some(run_id.to_string()),
+            event_type: "stage_coalesce_failed".to_string(),
+            payload: json!({
+                "peer_run_id": peer_run_id,
+                "peer_status": peer_status,
             }),
             created_at: util::now_ts(),
         })
@@ -1583,6 +1751,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         dependency_on,
         submitted_by: row.get("submitted_by").ok(),
         cache_key: row.get("cache_key").ok().flatten(),
+        coalesced_peer_run_id: row.get("coalesced_peer_run_id").ok().flatten(),
     })
 }
 
@@ -1882,8 +2051,9 @@ fn ingest_run_sidecar(
         "INSERT OR REPLACE INTO runs
          (id, recipe_name, recipe_hash, status, job_id, run_dir, repo, source_path,
           recipe_json, context_json, created_at, finished_at,
-          pipeline_id, dependency_on, stage_name, submitted_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          pipeline_id, dependency_on, stage_name, submitted_by,
+          cache_key, coalesced_peer_run_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             sidecar.id,
             sidecar.recipe_name,
@@ -1904,6 +2074,8 @@ fn ingest_run_sidecar(
                 .transpose()?,
             sidecar.stage_name,
             sidecar.submitted_by,
+            sidecar.cache_key,
+            sidecar.coalesced_peer_run_id,
         ],
     )?;
 
@@ -2213,6 +2385,109 @@ mod tests {
         let store2 = Store::open(&cluster).unwrap();
         let row2 = store2.get_run("run_xyz").unwrap();
         assert_eq!(row2.recipe_hash, "deadbeef");
+    }
+
+    #[test]
+    fn claim_coalesce_slot_first_writer_wins() {
+        let dir = tempdir().unwrap();
+        let cluster = test_cluster(dir.path(), BTreeMap::new());
+        let store = Store::open(&cluster).unwrap();
+        let key = "deadbeef".repeat(8); // resembles a real sha256 hex
+        assert_eq!(
+            store.claim_coalesce_slot(&key, "run_first").unwrap(),
+            fs_layout::ClaimOutcome::Claimed
+        );
+        // Subsequent submitters get AlreadyExists with the .target.json
+        // populated by the first writer.
+        assert_eq!(
+            store.claim_coalesce_slot(&key, "run_second").unwrap(),
+            fs_layout::ClaimOutcome::AlreadyExists
+        );
+        let claim = store.read_coalesce_claim(&key).unwrap().unwrap();
+        assert_eq!(claim.producer_run_id, "run_first");
+
+        // Releasing the slot lets a new caller win.
+        store.release_coalesce_slot(&key).unwrap();
+        assert_eq!(
+            store.claim_coalesce_slot(&key, "run_third").unwrap(),
+            fs_layout::ClaimOutcome::Claimed
+        );
+        let claim = store.read_coalesce_claim(&key).unwrap().unwrap();
+        assert_eq!(claim.producer_run_id, "run_third");
+    }
+
+    #[test]
+    fn find_coalesce_peer_excludes_followers_and_jobless_rows() {
+        let dir = tempdir().unwrap();
+        let cluster = test_cluster(dir.path(), BTreeMap::new());
+        let mut store = Store::open(&cluster).unwrap();
+        let recipe = Recipe {
+            name: "demo".into(),
+            repo: "foo".into(),
+            command: vec!["true".into()],
+            resources: Default::default(),
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            params: BTreeMap::new(),
+            args: BTreeMap::new(),
+            env: BTreeMap::new(),
+            tracking: Default::default(),
+            sweep: None,
+        };
+        let cache_key = "feedfeed".repeat(8);
+
+        // A jobless producer (insert_run only — no set_submitted). Won't
+        // match because the follower has no job_id to depend on.
+        let run_a_dir = dir.path().join("runs/alice/run_a");
+        store
+            .insert_run(
+                NewRun {
+                    id: "run_a",
+                    recipe: &recipe,
+                    recipe_hash: "h",
+                    status: "created",
+                    run_dir: &run_a_dir,
+                    source_path: &run_a_dir.join("source/foo"),
+                    context_json: &json!({}),
+                    submitted_by: Some("alice"),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+            )
+            .unwrap();
+        assert!(store.find_coalesce_peer(&cache_key).unwrap().is_none());
+
+        // Now A reaches set_submitted. find_coalesce_peer matches.
+        store.set_submitted("run_a", "job_42").unwrap();
+        let peer = store.find_coalesce_peer(&cache_key).unwrap().unwrap();
+        assert_eq!(peer.id, "run_a");
+        assert_eq!(peer.job_id.as_deref(), Some("job_42"));
+
+        // A second follower (status awaiting_peer) must NOT be a coalesce
+        // target — we never form chains of followers.
+        let run_b_dir = dir.path().join("runs/alice/run_b");
+        store
+            .insert_run(
+                NewRun {
+                    id: "run_b",
+                    recipe: &recipe,
+                    recipe_hash: "h",
+                    status: "created",
+                    run_dir: &run_b_dir,
+                    source_path: &run_b_dir.join("source/foo"),
+                    context_json: &json!({}),
+                    submitted_by: Some("alice"),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+            )
+            .unwrap();
+        store
+            .set_awaiting_peer("run_b", "job_43", "run_a", &cache_key)
+            .unwrap();
+        // Still only A matches.
+        let peer = store.find_coalesce_peer(&cache_key).unwrap().unwrap();
+        assert_eq!(peer.id, "run_a");
     }
 
     #[test]

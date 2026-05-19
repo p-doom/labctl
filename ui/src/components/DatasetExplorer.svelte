@@ -12,6 +12,7 @@
   // section is otherwise empty.
 
   import { api } from "../lib/api";
+  import { router } from "../lib/router.svelte";
   import type {
     DatasetSegment,
     DatasetSummary,
@@ -28,17 +29,52 @@
   let data = $state<DatasetSummary | null>(null);
   let error = $state<string | null>(null);
   let notBrowseable = $state(false);
-  let maximized = $state(false);
-  let tab = $state<Tab>("segments");
 
-  // Filters shared across tabs.
+  // URL-derived navigational state. The explorer's mode (table vs viewer
+  // vs closed) lives in the URL so browser back/forward unwinds the
+  // exact same transitions a user took — push for explorer-open and
+  // segment-select (history-worthy), replace for tab swaps
+  // (URL-visible but not history-worthy).
+  let maximized = $derived(router.query.get("explorer") === "1");
+  let tab = $derived<Tab>(
+    (router.query.get("dstab") as Tab | null) ?? "segments",
+  );
+  let selectedSeg = $derived.by<{ split: string; segment_id: string } | null>(() => {
+    const v = router.query.get("seg");
+    if (!v) return null;
+    const idx = v.indexOf("/");
+    if (idx <= 0 || idx === v.length - 1) return null;
+    return { split: v.slice(0, idx), segment_id: v.slice(idx + 1) };
+  });
+
+  function openExplorer() {
+    router.setQuery({ explorer: "1" });
+  }
+  function closeExplorer() {
+    // Drop every explorer-owned query key so back lands on the bare
+    // artifact panel — not on a stale tab/seg fragment of a prior view.
+    router.setQuery({ explorer: null, dstab: null, seg: null });
+  }
+  function setTab(t: Tab) {
+    // Tab changes are URL-visible (deep-linkable) but not history-
+    // worthy — back should skip them.
+    router.setQueryReplace({ dstab: t === "segments" ? null : t });
+  }
+  function selectSeg(split: string, segment_id: string) {
+    router.setQuery({ seg: `${split}/${segment_id}` });
+  }
+  function deselectSeg() {
+    router.setQuery({ seg: null });
+  }
+
+  // Filters shared across tabs. Local — typing/scrubbing shouldn't churn
+  // the URL or browser history.
   let contributorFilter = $state<string | null>(null);
   let dateFrom = $state<string>("");
   let dateTo = $state<string>("");
   let textFilter = $state("");
 
-  // Segment viewer state.
-  let selectedSeg = $state<{ split: string; segment_id: string } | null>(null);
+  // Segment viewer state (per-selection, transient).
   let segDetail = $state<SegmentDetail | null>(null);
   let segError = $state<string | null>(null);
   let frameIdx = $state(0);
@@ -48,7 +84,6 @@
     data = null;
     error = null;
     notBrowseable = false;
-    maximized = false;
     api
       .dataset(artifactId)
       .then((d) => {
@@ -145,7 +180,13 @@
     }
     const out: ContributorStats[] = [];
     for (const [hash, segs] of by) {
+      // total_hours is computed from frame counts independent of dates,
+      // so it always populates. distinct_days / mean·h/day / max·h/day
+      // require creation_time on each segment — they stay zero when the
+      // dataset's meta.json files don't carry it (older Stage A runs
+      // that never went through enrich_meta_with_recording_time.py).
       const byDay = new Map<string, number>();
+      let total_seconds = 0;
       let n_frames = 0;
       let n_no_op = 0;
       let earliest: string | null = null;
@@ -153,23 +194,26 @@
       for (const s of segs) {
         n_frames += s.n_frames;
         n_no_op += s.n_no_op;
+        const durS = segDurationS(s);
+        total_seconds += durS;
         const d = segDateISO(s);
         if (d) {
-          byDay.set(d, (byDay.get(d) ?? 0) + segDurationS(s) / 3600);
+          byDay.set(d, (byDay.get(d) ?? 0) + durS / 3600);
           if (!earliest || d < earliest) earliest = d;
           if (!latest || d > latest) latest = d;
         }
       }
-      const total_hours = Array.from(byDay.values()).reduce((a, b) => a + b, 0);
+      const total_hours = total_seconds / 3600;
       const distinct_days = byDay.size;
       const max_h = Math.max(0, ...Array.from(byDay.values()));
+      const dated_hours = Array.from(byDay.values()).reduce((a, b) => a + b, 0);
       out.push({
         hash,
         n_segments: segs.length,
         n_frames,
         total_hours,
         distinct_days,
-        mean_hours_per_active_day: distinct_days > 0 ? total_hours / distinct_days : 0,
+        mean_hours_per_active_day: distinct_days > 0 ? dated_hours / distinct_days : 0,
         max_hours_in_a_day: max_h,
         earliest,
         latest,
@@ -257,12 +301,12 @@
   function goPrevSeg() {
     if (!hasPrevSeg) return;
     const s = segmentsFiltered[currentSegIndex - 1];
-    selectedSeg = { split: s.split, segment_id: s.segment_id };
+    selectSeg(s.split, s.segment_id);
   }
   function goNextSeg() {
     if (!hasNextSeg) return;
     const s = segmentsFiltered[currentSegIndex + 1];
-    selectedSeg = { split: s.split, segment_id: s.segment_id };
+    selectSeg(s.split, s.segment_id);
   }
 
   // Windowed list of frame indices we render in the side action list.
@@ -346,8 +390,8 @@
       if (e.key === "Escape") {
         e.preventDefault();
         if (document.fullscreenElement) return; // browser handles its own exit
-        if (selectedSeg) selectedSeg = null;
-        else maximized = false;
+        if (selectedSeg) deselectSeg();
+        else closeExplorer();
         return;
       }
       if (inTextField) return;
@@ -420,7 +464,7 @@
   }
   function pickContributor(hash: string) {
     contributorFilter = hash;
-    tab = "segments";
+    setTab("segments");
   }
 </script>
 
@@ -444,7 +488,7 @@
         {data.date_range[0].slice(0, 10)} → {data.date_range[1].slice(0, 10)}
       </p>
     {/if}
-    <button type="button" class="browse" onclick={() => (maximized = true)}>
+    <button type="button" class="browse" onclick={openExplorer}>
       Browse segments
       <span class="arrow">→</span>
     </button>
@@ -452,11 +496,11 @@
 {/if}
 
 <!-- ── Maximized overlay ──────────────────────────────────────────── -->
-{#if maximized && data}
+{#if maximized}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="backdrop" onclick={() => (maximized = false)}>
+  <div class="backdrop" onclick={closeExplorer}>
     <div class="overlay" role="dialog" aria-label="Dataset explorer" onclick={(e) => e.stopPropagation()}>
-      <button class="close-btn" onclick={() => (maximized = false)} aria-label="close">
+      <button class="close-btn" onclick={closeExplorer} aria-label="close">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
           <path d="M1 1L13 13M13 1L1 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
         </svg>
@@ -467,13 +511,13 @@
         <div class="table-mode">
           <header class="ov-head">
             <nav class="tabs" role="tablist">
-              <button role="tab" aria-selected={tab === "segments"} class:active={tab === "segments"} onclick={() => (tab = "segments")}>
+              <button role="tab" aria-selected={tab === "segments"} class:active={tab === "segments"} onclick={() => setTab("segments")}>
                 Segments <span class="count mono">{segmentsFiltered.length}</span>
               </button>
-              <button role="tab" aria-selected={tab === "contributors"} class:active={tab === "contributors"} onclick={() => (tab = "contributors")}>
+              <button role="tab" aria-selected={tab === "contributors"} class:active={tab === "contributors"} onclick={() => setTab("contributors")}>
                 Contributors <span class="count mono">{contributors.length}</span>
               </button>
-              <button role="tab" aria-selected={tab === "timeline"} class:active={tab === "timeline"} onclick={() => (tab = "timeline")}>
+              <button role="tab" aria-selected={tab === "timeline"} class:active={tab === "timeline"} onclick={() => setTab("timeline")}>
                 Timeline
               </button>
             </nav>
@@ -515,10 +559,10 @@
                   <tbody>
                     {#each segmentsFiltered as s (s.split + "/" + s.segment_id)}
                       <tr
-                        onclick={() => (selectedSeg = { split: s.split, segment_id: s.segment_id })}
+                        onclick={() => selectSeg(s.split, s.segment_id)}
                         role="button"
                         tabindex="0"
-                        onkeydown={(e) => e.key === "Enter" && (selectedSeg = { split: s.split, segment_id: s.segment_id })}
+                        onkeydown={(e) => e.key === "Enter" && selectSeg(s.split, s.segment_id)}
                       >
                         <td class="split">{s.split}</td>
                         <td class="seg mono">{shortHash(s.segment_id, 40)}</td>
@@ -571,7 +615,15 @@
             {:else if tab === "timeline"}
               <div class="heatmap">
                 {#if heatmap.dates.length === 0}
-                  <p class="empty">no dated segments in range</p>
+                  {#if data && data.date_range[0] === "" && data.date_range[1] === ""}
+                    <p class="empty">
+                      No recording dates available — this dataset's per-segment <code>meta.json</code> files don't carry
+                      a <code>creation_time</code> field. Stage A datasets need
+                      <code>enrich_meta_with_recording_time.py</code> run over them for the timeline to populate.
+                    </p>
+                  {:else}
+                    <p class="empty">no dated segments in range</p>
+                  {/if}
                 {:else}
                   <table>
                     <thead>
@@ -620,9 +672,13 @@
           {@const meta = segDetail.meta as Record<string, unknown>}
           {@const cur = segDetail.actions[frameIdx] ?? ""}
           {@const fps = Number(meta.target_fps) || 0}
+          <!-- diskFrame is the on-disk JPEG index — equal to frameIdx for
+               unfiltered datasets, but offset for filtered ones where
+               chat_line.json's image refs skip dropped frames. -->
+          {@const diskFrame = segDetail.frame_indices[frameIdx] ?? frameIdx}
           <div class="viewer-mode">
             <header class="viewer-head">
-              <button class="back-btn" onclick={() => (selectedSeg = null)} title="back to segments (Esc)">
+              <button class="back-btn" onclick={deselectSeg} title="back to segments (Esc)">
                 <span aria-hidden="true">←</span> back
               </button>
               <div class="bread">
@@ -638,10 +694,15 @@
 
             <div class="viewer-body">
               <section class="viewer-main">
-                <div bind:this={frameHostEl} class="frame-host">
-                  <img class="frame" src={api.datasetFrameUrl(artifactId, segDetail.split, segDetail.segment_id, frameIdx)}
-                       alt="frame {frameIdx}" />
-                  <span class="badge mono">frame {frameIdx} / {Math.max(0, n - 1)}</span>
+                <div bind:this={frameHostEl} class="frame-host"
+                     style:aspect-ratio={
+                       Number(meta.frame_width) > 0 && Number(meta.frame_height) > 0
+                         ? `${meta.frame_width} / ${meta.frame_height}`
+                         : "16 / 9"
+                     }>
+                  <img class="frame" src={api.datasetFrameUrl(artifactId, segDetail.split, segDetail.segment_id, diskFrame)}
+                       alt="frame {diskFrame}" />
+                  <span class="badge mono">step {frameIdx} / {Math.max(0, n - 1)} · frame {diskFrame}</span>
                   <button class="fs-btn" onclick={toggleFullscreen} title="fullscreen frame (F)" aria-label="fullscreen">
                     <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
                       <path d="M1 5V1H5M8 1H12V5M12 8V12H8M5 12H1V8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -735,14 +796,16 @@
   .browse:hover .arrow { color: theme("colors.fg.0"); }
 
   /* ── Maximized overlay ──────────────────────────────────────────── */
+  /* No CSS opening animation: the overlay is now URL-state-driven and
+     stays mounted across tab/segment changes, but reactive churn can
+     still trigger CSS animation-restart in some browsers, which looked
+     like the popup "blinking" on every tab click. */
   .backdrop {
     position: fixed; inset: 0; z-index: 9999;
     background: rgba(0, 0, 0, 0.72);
     display: flex; align-items: center; justify-content: center;
     padding: 24px;
-    animation: fade-in 120ms ease;
   }
-  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 
   .overlay {
     position: relative;
@@ -903,19 +966,39 @@
     overflow: hidden;
   }
   .frame-host {
-    flex: 1; min-height: 0;
+    /* aspect-ratio is set inline from the segment's frame_width/height
+       so the host's own box matches the image natively — no letterbox
+       bars, image fills it edge-to-edge. width:100% + max-height:100%
+       lets the host shrink to whichever dimension is the binding
+       constraint in the column. */
     position: relative; border-radius: 6px; overflow: hidden;
-    background: #000; line-height: 0;
-    display: flex; align-items: center; justify-content: center;
+    line-height: 0;
+    width: 100%; max-height: 100%;
+    /* Centered when narrower than the column (capped by max-height). */
+    margin: 0 auto;
   }
   .frame {
-    max-width: 100%; max-height: 100%; width: auto; height: auto;
+    width: 100%; height: 100%;
     display: block; image-rendering: pixelated;
   }
-  /* Browser-fullscreen state: frame fills the viewport, controls hidden. */
-  .frame-host:fullscreen { background: #000; padding: 0; border-radius: 0; }
+  /* Browser-fullscreen state: image fills the entire viewport, no
+     bars. The host's inline aspect-ratio is overridden here because
+     the viewport's own aspect rarely matches the frame's, and we'd
+     rather edge-to-edge with a minor crop than reintroduce the bars
+     the inline view was designed to remove. ::backdrop is themed so
+     any residual space (e.g. on ultrawides) blends with the panel. */
+  .frame-host:fullscreen {
+    width: 100vw; height: 100vh;
+    aspect-ratio: auto;
+    padding: 0; border-radius: 0;
+  }
   .frame-host:fullscreen .frame {
-    max-width: 100vw; max-height: 100vh; object-fit: contain;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  :global(.frame-host:fullscreen::backdrop) {
+    background: var(--bg-0);
   }
 
   .badge {

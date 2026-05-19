@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { store, loadRuns, loadRecipeHistory, loadRunDetail } from "../lib/store.svelte";
   import { router } from "../lib/router.svelte";
   import { compareSelection } from "../lib/compare.svelte";
@@ -13,6 +13,7 @@
   import type { ChipDef } from "../lib/filters";
   import {
     statusGroup,
+    shortStatus,
     shortHash,
     shortId,
     formatDuration,
@@ -114,6 +115,23 @@
 
   function open(r: RunSummary) {
     router.select("runs", r.id);
+  }
+
+  // The 6 px colored dot alone collapses timeout / oom / failed /
+  // unknown_terminal onto the same red and makes cancelled-vs-timeout
+  // hard to read at-a-glance (different colors but tiny). For any
+  // terminal status where the dot is ambiguous, surface the
+  // shortStatus text next to it. Succeeded / running / pending stay
+  // dot-only — the dot color is already unambiguous in those cases
+  // and adding text would just be noise.
+  function showStatusLabel(s: string): boolean {
+    return (
+      s === "failed" ||
+      s === "cancelled" ||
+      s === "timeout" ||
+      s === "oom" ||
+      s === "unknown_terminal"
+    );
   }
 
   // Kick off recipe-history loads as new recipes appear in view. We
@@ -251,17 +269,26 @@
 
   // Cursor scrollIntoView — compute target scrollTop directly because the
   // cursor row may not be in the DOM when virtualized.
+  //
+  // Only `cursor` is a tracked dependency. scrollTop, viewportHeight,
+  // listEl, and filtered.length are read untracked — otherwise the
+  // effect re-fires on every user scroll (because we read scrollTop in
+  // the body) and slams the viewport back to the cursor's row, which
+  // defaults to 0. That made the runs page appear to "jump back to top"
+  // any time you tried to scroll.
   $effect(() => {
     const i = cursor;
-    if (!listEl || filtered.length === 0) return;
-    const rowY = i * ROW_HEIGHT; // row position in row-space (header excluded)
-    const visTop = scrollTop;
-    const visBottom = scrollTop + viewportHeight - HEADER_HEIGHT;
-    if (rowY < visTop) {
-      listEl.scrollTop = rowY;
-    } else if (rowY + ROW_HEIGHT > visBottom) {
-      listEl.scrollTop = rowY + ROW_HEIGHT - viewportHeight + HEADER_HEIGHT;
-    }
+    untrack(() => {
+      if (!listEl || filtered.length === 0) return;
+      const rowY = i * ROW_HEIGHT; // row position in row-space (header excluded)
+      const visTop = scrollTop;
+      const visBottom = scrollTop + viewportHeight - HEADER_HEIGHT;
+      if (rowY < visTop) {
+        listEl.scrollTop = rowY;
+      } else if (rowY + ROW_HEIGHT > visBottom) {
+        listEl.scrollTop = rowY + ROW_HEIGHT - viewportHeight + HEADER_HEIGHT;
+      }
+    });
   });
 </script>
 
@@ -291,7 +318,7 @@
   >
     <div class="list-head run-head">
       <div></div>
-      <div></div>
+      <div>status</div>
       <div>recipe</div>
       <div>id</div>
       <div>history</div>
@@ -370,8 +397,17 @@
               <Icon name="check" size={11} />
             {/if}
           </button>
-          <!-- Pill (dot only): inlined to skip per-row component setup. -->
-          <span class="dot" data-group={group} class:animate-pulse-dot={pulse} aria-label={r.status}></span>
+          <!-- Inlined Pill (dot + optional short status label) — skips
+               per-row Pill component setup, which dominated render
+               cost at thousands of rows. Label only renders for
+               terminal non-success statuses where the dot color alone
+               doesn't disambiguate (e.g. timeout vs failed vs oom). -->
+          <div class="status" aria-label={r.status}>
+            <span class="dot" data-group={group} class:animate-pulse-dot={pulse}></span>
+            {#if showStatusLabel(r.status)}
+              <span class="status-label mono">{shortStatus(r.status)}</span>
+            {/if}
+          </div>
           <div class="recipe">
             <button
               type="button"
@@ -436,10 +472,11 @@
      * worth of rows is actually in the DOM. */
     width: 100%;
   }
-  /* Runs view geometry: check | dot | recipe | id | sparkline | duration | age */
+  /* Runs view geometry: check | status (dot + optional label) | recipe |
+     id | sparkline | duration | age */
   .run-head,
   .run-row {
-    grid-template-columns: 18px 22px 1fr 140px 110px 80px 80px;
+    grid-template-columns: 18px 84px 1fr 140px 110px 80px 80px;
   }
   .check {
     width: 16px;
@@ -526,19 +563,32 @@
   .recipe .user + .repo { margin-left: 6px; }
   .hist { display: flex; align-items: center; }
 
-  /* Inlined Pill dot. */
+  /* Inlined Pill (dot + optional label). */
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow: hidden;
+    min-width: 0;
+  }
   .dot {
     width: 6px;
     height: 6px;
     border-radius: 999px;
     flex-shrink: 0;
-    justify-self: center;
   }
   .dot[data-group="running"]   { --dot: var(--status-running);   background: var(--dot); }
   .dot[data-group="succeeded"] { --dot: var(--status-succeeded); background: var(--dot); }
   .dot[data-group="failed"]    { --dot: var(--status-failed);    background: var(--dot); }
   .dot[data-group="pending"]   { --dot: var(--status-pending);   background: var(--dot); }
   .dot[data-group="neutral"]   { --dot: var(--status-neutral);   background: var(--dot); }
+  .status-label {
+    font-size: 11px;
+    color: var(--fg-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
   /* Inlined Hash. No copied-badge — title attr does the job. */
   .hash {

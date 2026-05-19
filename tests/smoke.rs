@@ -26,7 +26,7 @@ fn example_clusters_parse() {
 
 #[test]
 fn example_recipes_parse() {
-    for name in ["train", "eval", "sweep"] {
+    for name in ["train", "eval", "sweep", "eval_from"] {
         validate(&format!("examples/recipes/{name}.toml"));
     }
 }
@@ -34,6 +34,11 @@ fn example_recipes_parse() {
 #[test]
 fn example_policy_parses() {
     validate("examples/policies/eval_per_checkpoint.toml");
+}
+
+#[test]
+fn example_pipelines_parse() {
+    validate("examples/pipelines/from-pinned.toml");
 }
 
 fn run_init_in_tempdir(args: &[&str]) -> (tempfile::TempDir, PathBuf) {
@@ -66,18 +71,45 @@ fn run_init_in_tempdir(args: &[&str]) -> (tempfile::TempDir, PathBuf) {
     (tmp, out)
 }
 
+// init now bails on /path/to/... placeholders. The example cluster.toml
+// fixtures intentionally use placeholders, so we synthesise a real-path
+// source here for the use/migrate/join tests.
+fn write_fixture_cluster(tmp: &tempfile::TempDir) -> PathBuf {
+    let path = tmp.path().join("source-cluster.toml");
+    let root = tmp.path().display();
+    std::fs::write(&path, format!(
+        r#"name = "fixture"
+
+[filesystem]
+runs_base = "{root}/runs"
+
+[filesystem.artifact_roots]
+dataset     = "{root}/datasets"
+checkpoint  = "{root}/checkpoints"
+eval_result = "{root}/eval_logs"
+
+[scheduler]
+kind = "slurm"
+"#
+    )).unwrap();
+    path
+}
+
 #[test]
 fn labctl_init_greenfield_writes_loadable_config() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let runs_base = tmp.path().join("runs");
-    let artifact_root = tmp.path().join("ck");
+    let r = tmp.path().display();
     let (_keep, out) = run_init_in_tempdir(&[
         "--name",
         "smoke-greenfield",
         "--runs-base",
-        runs_base.to_str().unwrap(),
+        &format!("{r}/runs"),
         "--artifact-root",
-        &format!("checkpoint={}", artifact_root.display()),
+        &format!("checkpoint={r}/ck"),
+        "--artifact-root",
+        &format!("dataset={r}/ds"),
+        "--artifact-root",
+        &format!("eval_result={r}/er"),
     ]);
     let val = Command::new(labctl_bin())
         .args(["validate", out.to_str().unwrap()])
@@ -93,9 +125,11 @@ fn labctl_init_greenfield_writes_loadable_config() {
 
 #[test]
 fn labctl_init_migrate_from_carries_schema() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_fixture_cluster(&tmp);
     let (_keep, out) = run_init_in_tempdir(&[
         "--migrate-from",
-        "examples/clusters/single-user.toml",
+        src.to_str().unwrap(),
         "--name",
         "smoke-migrate",
         "--runs-base",
@@ -110,6 +144,7 @@ fn labctl_init_migrate_from_carries_schema() {
 #[test]
 fn labctl_init_join_symlinks_source() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_fixture_cluster(&tmp);
     let out = tmp.path().join("cluster.smoke.toml");
     let result = Command::new(labctl_bin())
         .args([
@@ -120,7 +155,7 @@ fn labctl_init_join_symlinks_source() {
             "--no-agent",
             "--no-doctor",
             "--join",
-            "examples/clusters/single-user.toml",
+            src.to_str().unwrap(),
             "--output",
             out.to_str().unwrap(),
         ])
@@ -144,6 +179,7 @@ fn labctl_init_join_symlinks_source() {
 #[test]
 fn labctl_init_use_copy_config_creates_regular_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_fixture_cluster(&tmp);
     let out = tmp.path().join("cluster.smoke.toml");
     let result = Command::new(labctl_bin())
         .args([
@@ -154,7 +190,7 @@ fn labctl_init_use_copy_config_creates_regular_file() {
             "--no-agent",
             "--no-doctor",
             "--use",
-            "examples/clusters/single-user.toml",
+            src.to_str().unwrap(),
             "--copy-config",
             "--output",
             out.to_str().unwrap(),
@@ -168,5 +204,39 @@ fn labctl_init_use_copy_config_creates_regular_file() {
         "expected {} to be a regular file, got {:?}",
         out.display(),
         meta.file_type(),
+    );
+}
+
+#[test]
+fn labctl_init_rejects_placeholder_paths() {
+    // --yes greenfield with no --runs-base / --artifact-root flags
+    // should bail rather than silently write a config full of
+    // /path/to/... that the user has to fix later.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = tmp.path().join("cluster.smoke.toml");
+    let result = Command::new(labctl_bin())
+        .args([
+            "init",
+            "--yes",
+            "--no-detect",
+            "--no-create-dirs",
+            "--no-agent",
+            "--no-doctor",
+            "--name",
+            "would-have-placeholders",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("invoke labctl init");
+    assert!(
+        !result.status.success(),
+        "labctl init should have failed on placeholders, but succeeded.\nstdout:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("placeholders"),
+        "expected stderr to mention placeholders, got:\n{stderr}",
     );
 }

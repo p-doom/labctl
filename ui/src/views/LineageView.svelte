@@ -16,6 +16,7 @@
   import ArtifactNode from "../components/ArtifactNode.svelte";
   import RunDagNode from "../components/RunDagNode.svelte";
   import DetailHeader from "../components/DetailHeader.svelte";
+  import LineageAutoFit from "../components/LineageAutoFit.svelte";
 
   interface Props {
     artifactId: string;
@@ -97,6 +98,19 @@
   // Node + edge arrays. Position via dagre, L→R orientation.
   let nodes = $state<Node[]>([]);
   let edges = $state<Edge[]>([]);
+
+  // Node ids that should be framed by the initial fit-view: the focal
+  // artifact plus its immediate neighborhood (hopDistance ≤ 2). For a
+  // typical linear chain that's the focal + 2 runs + their other-side
+  // artifacts ≈ 5 nodes. The actual fitView call happens inside
+  // <LineageAutoFit>, which is rendered as a child of <SvelteFlow> so
+  // it can grab the SvelteFlow instance via `useSvelteFlow()`.
+  let initialFitIds = $derived.by(() => {
+    if (!lineage) return [] as string[];
+    return nodes
+      .map((n) => n.id)
+      .filter((id) => (hopDistance.get(id) ?? Infinity) <= 2);
+  });
 
   // Cached layout — only depends on the filtered topology, not the hover.
   // Hover state is composited in afterwards as opacity, so dragging the
@@ -268,8 +282,6 @@
         bind:nodes
         bind:edges
         nodeTypes={{ artifact: ArtifactNode, run: RunDagNode }}
-        fitView
-        fitViewOptions={{ padding: 0.25, minZoom: 0.4, maxZoom: 1.5 }}
         minZoom={0.2}
         maxZoom={2}
         panOnDrag
@@ -283,6 +295,7 @@
         onnodepointerleave={onNodeMouseLeave}
       >
         <Background variant={BackgroundVariant.Dots} gap={24} size={1} bgColor="#0a0b0d" />
+        <LineageAutoFit targetIds={initialFitIds} fitKey={artifactId} />
         <MiniMap
           pannable
           zoomable

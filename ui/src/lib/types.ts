@@ -282,6 +282,15 @@ export interface SegmentDetail {
   split: string;
   segment_id: string;
   meta: Record<string, unknown>;
-  /** One action string per frame, in source order. */
+  /** One action string per kept frame, in source order. */
   actions: string[];
+  /**
+   * On-disk frame index for each action — extracted from chat_line.json's
+   * user→image ref. For datasets where Stage A wrote every raw frame but
+   * only kept a subset in chat_line.json (older inline-filter Stage A
+   * outputs), this is the index to use when fetching the JPEG, NOT the
+   * action's positional index. Same length as `actions`. Equal to
+   * `[0, 1, …, actions.length - 1]` for unfiltered datasets.
+   */
+  frame_indices: number[];
 }

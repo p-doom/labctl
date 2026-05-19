@@ -1,0 +1,15 @@
+# Build a new pipeline on top of a specific historical run.
+#
+# The pipeline's `from` field pins all upstream artifacts to one frozen
+# launch (identified by run_id). Stages with inputs of `type = "from"`
+# resolve those inputs from the pinned run's outputs, keyed by role.
+#
+# Pin resolution happens at submit time, not validate time — the run id
+# below is illustrative. Replace with a real run id (e.g. from
+# `labctl run-pipeline … && labctl list-runs`) before submitting.
+
+name = "from_pinned_example"
+from = "run_REPLACE_WITH_A_REAL_TRAIN_RUN_ID"
+
+[stages.eval]
+recipe = "../recipes/eval_from.toml"

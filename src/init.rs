@@ -5,7 +5,7 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::{
     config::{ClusterConfig, FilesystemConfig, SchedulerConfig, SlurmConfig},
@@ -88,6 +88,8 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
     {
         interactive_review(&mut cfg, &init_mode, &probe, pmode)?;
     }
+
+    reject_placeholders(&cfg)?;
 
     let dest = pick_destination(&opts, &cfg, pmode)?;
 
@@ -533,6 +535,38 @@ fn run_doctor_subprocess(cluster_path: &Path) -> Result<bool> {
         .status()
         .context("invoke labctl doctor")?;
     Ok(status.success())
+}
+
+// Skeleton paths start `/path/to/...`; surfaced foreign paths from
+// --migrate-from also start with whatever the foreign cluster uses
+// and have no reason to match this prefix. Catches both: --yes
+// greenfield without a --runs-base flag, and an interactive user
+// who Entered through every prompt without filling in the placeholders.
+fn reject_placeholders(cfg: &ClusterConfig) -> Result<()> {
+    let mut issues: Vec<String> = Vec::new();
+    let is_placeholder = |p: &Path| p.to_string_lossy().starts_with("/path/to/");
+    if is_placeholder(&cfg.filesystem.runs_base) {
+        issues.push(format!("runs_base = {}", cfg.filesystem.runs_base.display()));
+    }
+    for (kind, path) in &cfg.filesystem.artifact_roots {
+        if is_placeholder(path) {
+            issues.push(format!("artifact_root[{kind}] = {}", path.display()));
+        }
+    }
+    for (kind, path) in &cfg.filesystem.output_roots {
+        if is_placeholder(path) {
+            issues.push(format!("output_root[{kind}] = {}", path.display()));
+        }
+    }
+    if !issues.is_empty() {
+        bail!(
+            "init refusing to proceed — these paths are still placeholders:\n  - {}\n\n\
+             Either re-run interactively and fill them in, or pass them as flags:\n  \
+             --runs-base /your/path  --artifact-root <kind>=/your/path",
+            issues.join("\n  - "),
+        );
+    }
+    Ok(())
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {

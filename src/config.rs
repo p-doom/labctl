@@ -469,6 +469,12 @@ pub enum InputSpec {
     External { path: PathBuf },
     Checkpoint,
     Stage { stage: String, role: String },
+    /// Resolved against the pipeline's ``from`` historical pin. The role
+    /// names an output that the pinned run produced. Validation that the
+    /// role actually exists in the pinned run happens at submit time
+    /// (needs the registry); load-time validation only checks that the
+    /// containing pipeline declares a ``from`` field at all.
+    From { role: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -487,6 +493,12 @@ pub struct OutputSpec {
 pub struct Pipeline {
     pub name: String,
     pub stages: BTreeMap<String, PipelineStage>,
+    /// Historical pin. When set, stages may declare inputs of
+    /// ``type = "from"``; those resolve to the pinned run's outputs. The
+    /// pinned run's provenance is frozen and not re-validated at submit
+    /// time — pinning to a specific historical state is the whole point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -503,6 +515,9 @@ pub struct LoadedPipeline {
     pub name: String,
     pub stages: BTreeMap<String, LoadedStage>,
     pub topo_order: Vec<String>,
+    /// See ``Pipeline::from``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -546,26 +561,42 @@ impl Pipeline {
             );
         }
 
-        // Derive parent edges from inputs of type Stage.
+        // Derive parent edges from inputs of type Stage. Inputs of type
+        // From resolve against the pipeline's historical pin (not against
+        // an intra-pipeline parent), so they get skipped here — they only
+        // need the pin to be set, which we check below.
         for (stage_name, loaded) in stages.clone() {
             for (role, spec) in &loaded.recipe.inputs {
-                if let InputSpec::Stage { stage: parent, role: parent_role } = spec {
-                    if !stages.contains_key(parent) {
-                        bail!(
-                            "pipeline.stages.{stage_name}.inputs.{role} references unknown \
-                             stage {parent:?}"
-                        );
+                match spec {
+                    InputSpec::Stage { stage: parent, role: parent_role } => {
+                        if !stages.contains_key(parent) {
+                            bail!(
+                                "pipeline.stages.{stage_name}.inputs.{role} references \
+                                 unknown stage {parent:?}"
+                            );
+                        }
+                        let parent_stage = &stages[parent];
+                        if !parent_stage.recipe.outputs.contains_key(parent_role) {
+                            bail!(
+                                "pipeline.stages.{stage_name}.inputs.{role} references \
+                                 stage {parent:?} role {parent_role:?} which is not an \
+                                 output of recipe {}",
+                                parent_stage.recipe.name
+                            );
+                        }
+                        stages.get_mut(&stage_name).unwrap().parents.push(parent.clone());
                     }
-                    let parent_stage = &stages[parent];
-                    if !parent_stage.recipe.outputs.contains_key(parent_role) {
-                        bail!(
-                            "pipeline.stages.{stage_name}.inputs.{role} references stage \
-                             {parent:?} role {parent_role:?} which is not an output of \
-                             recipe {}",
-                            parent_stage.recipe.name
-                        );
+                    InputSpec::From { .. } => {
+                        if pipeline.from.is_none() {
+                            bail!(
+                                "pipeline.stages.{stage_name}.inputs.{role} is type=from \
+                                 but the pipeline has no top-level `from` field; set \
+                                 `from = \"<run_id>\"` on the pipeline or use a different \
+                                 input type"
+                            );
+                        }
                     }
-                    stages.get_mut(&stage_name).unwrap().parents.push(parent.clone());
+                    _ => {}
                 }
             }
         }
@@ -576,6 +607,7 @@ impl Pipeline {
             name: pipeline.name,
             stages,
             topo_order,
+            from: pipeline.from,
         })
     }
 }

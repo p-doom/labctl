@@ -55,6 +55,13 @@ struct AppState {
     /// completion so we walk once and reuse. Keyed by artifact id; entry is
     /// `None` if the artifact has no browseable per-segment layout.
     dataset_cache: Arc<Mutex<HashMap<String, Arc<Option<DatasetSummary>>>>>,
+    /// Per-segment frame-path resolution cache. Stage B outputs don't
+    /// copy frames — their chat_line.json embeds absolute paths back to
+    /// the producing Stage A artifact. This cache stores
+    /// frame_index → absolute_path so the frame endpoint can serve from
+    /// that path without re-parsing chat_line.json per request. Key
+    /// shape: "<artifact_id>::<split>::<seg>".
+    segment_frames_cache: Arc<Mutex<HashMap<String, Arc<HashMap<u32, PathBuf>>>>>,
 }
 
 /// Outbound SSE message. Kept tiny — just enough for the client cache to
@@ -82,6 +89,7 @@ pub fn serve(
         cluster: Arc::new(cluster),
         events_tx: events_tx.clone(),
         dataset_cache: Arc::new(Mutex::new(HashMap::new())),
+        segment_frames_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let api = Router::new()
@@ -219,7 +227,12 @@ async fn events_tailer(
 fn translate_event(ev: &crate::store::EventRow) -> Option<StreamEvent> {
     match ev.event_type.as_str() {
         "run_created" => ev.run_id.clone().map(|id| StreamEvent { kind: "run.created", id }),
-        "run_submitted" | "run_status" => {
+        "run_submitted"
+        | "run_status"
+        | "stage_cache_hit"
+        | "stage_coalesced"
+        | "stage_coalesce_resolved"
+        | "stage_coalesce_failed" => {
             ev.run_id.clone().map(|id| StreamEvent { kind: "run.updated", id })
         }
         "artifact_registered" => {
@@ -1883,73 +1896,127 @@ async fn get_artifact_dataset_segment(
     let meta: Value = serde_json::from_slice(&meta_bytes)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid meta.json: {e}")))?;
 
-    // Extract action strings from chat_line.json. Stage A writes:
-    //   {"messages": [
-    //      {"role": "user",      "content": [{"type":"image","image":"<path>"}]},
-    //      {"role": "assistant", "content": [{"type":"text","text":"<action>"}]},
-    //      ...repeats once per frame...
-    //   ]}
-    // The action string lives on the assistant turn; one assistant turn
-    // per frame, in source order.
-    let actions: Vec<String> = std::fs::read(&chat_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .map(|chat| {
-            chat.get("messages")
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-                        .map(|m| {
-                            let c = m.get("content");
-                            // content may be a string (post-flatten) or a
-                            // block list with one or more {"type":"text",
-                            // "text": "<action>"} entries.
-                            if let Some(s) = c.and_then(|x| x.as_str()) {
-                                return s.to_string();
-                            }
-                            if let Some(blocks) = c.and_then(|x| x.as_array()) {
-                                for b in blocks {
-                                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                        if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
-                                            return t.to_string();
-                                        }
-                                    }
-                                }
-                            }
-                            String::new()
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    // Walk chat_line.json. Stage A writes alternating user/assistant
+    // pairs; the user message carries a {"type":"image","image":"<...
+    // /frame_NNNNNN.jpg>"} block and the assistant message carries the
+    // action string. We extract BOTH: the action strings AND the
+    // on-disk frame index referenced by each user turn.
+    //
+    // Why both: stage-A-with-inline-filter (older datasets like
+    // `2026-04-29_360p_5fps_event_stream_ordered_from_2026-04-09`)
+    // writes all raw frames to disk but only the kept subset into
+    // chat_line.json. action[i] aligns with frame_<kept_indices[i]>,
+    // NOT with frame_<i> — so the UI must follow the chat_line ref to
+    // show the right frame.
+    let mut actions: Vec<String> = Vec::new();
+    let mut frame_indices: Vec<u32> = Vec::new();
+    if let Ok(bytes) = std::fs::read(&chat_path) {
+        if let Ok(chat) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(msgs) = chat.get("messages").and_then(|x| x.as_array()) {
+                // Walk in source order, pairing consecutive user→assistant
+                // pairs. The user turn precedes the assistant turn it
+                // describes; anything that isn't part of a pair (e.g. a
+                // leading system msg) is skipped.
+                let mut last_image_idx: Option<u32> = None;
+                for m in msgs {
+                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if role == "user" {
+                        last_image_idx = extract_frame_index_from_user_msg(m);
+                        continue;
+                    }
+                    if role != "assistant" {
+                        continue;
+                    }
+                    // Pull the action text out of the assistant content.
+                    let action = extract_text_from_msg(m);
+                    // If the preceding user turn referenced a frame, use
+                    // that. Otherwise fall back to positional index — for
+                    // pipelines that don't carry per-message image refs,
+                    // this preserves the old (already-correct-for-
+                    // unfiltered-datasets) behavior.
+                    let idx = last_image_idx.unwrap_or(actions.len() as u32);
+                    actions.push(action);
+                    frame_indices.push(idx);
+                    last_image_idx = None;
+                }
+            }
+        }
+    }
 
     Ok(axum::Json(json!({
         "split": split,
         "segment_id": seg,
         "meta": meta,
         "actions": actions,
+        "frame_indices": frame_indices,
     })))
+}
+
+/// Pull the `frame_NNNNNN.jpg` index out of a user message's image
+/// block. Recognises both `{"type":"image","image":"<path>"}` (Stage A
+/// schema) and `{"type":"image","url":"<path>"}` (image_url variant).
+/// Returns `None` if no recognisable frame ref is present.
+fn extract_frame_index_from_user_msg(m: &Value) -> Option<u32> {
+    let blocks = m.get("content").and_then(|c| c.as_array())?;
+    for b in blocks {
+        if b.get("type").and_then(|t| t.as_str()) != Some("image") {
+            continue;
+        }
+        let p = b
+            .get("image")
+            .and_then(|x| x.as_str())
+            .or_else(|| b.get("url").and_then(|x| x.as_str()))?;
+        let base = std::path::Path::new(p).file_name()?.to_str()?;
+        let stem = base.strip_prefix("frame_")?.strip_suffix(".jpg")?;
+        if let Ok(n) = stem.parse::<u32>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Pull the action text out of an assistant message. Content may be a
+/// bare string (post-flatten) or a block list with text entries.
+fn extract_text_from_msg(m: &Value) -> String {
+    let c = m.get("content");
+    if let Some(s) = c.and_then(|x| x.as_str()) {
+        return s.to_string();
+    }
+    if let Some(blocks) = c.and_then(|x| x.as_array()) {
+        for b in blocks {
+            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
+                    return t.to_string();
+                }
+            }
+        }
+    }
+    String::new()
 }
 
 async fn get_artifact_dataset_frame(
     State(state): State<AppState>,
     Path((id, split, seg, n)): Path<(String, String, String, u32)>,
 ) -> Result<Response, ApiError> {
-    // We resolve the artifact root via dataset_summary_for so the path
-    // goes through the same artifact-exists/kind check the other dataset
-    // endpoints use, and the cache walk fires once at first frame fetch
-    // even before the summary endpoint is hit.
     let (root, _) = dataset_summary_for(&state, &id)?
         .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
 
-    // Stage A writes frames as 6-digit-zero-padded JPEG filenames.
-    let frame_path = root
+    // Stage A writes a local `frames/` subdir; if it exists, use it
+    // directly. Stage B (and any other "chat_line-only" downstream
+    // artifact) skips copying frames, so the local file is absent and
+    // we fall back to the absolute path recorded in chat_line.json.
+    let local = root
         .join(&split)
         .join(&seg)
         .join("frames")
         .join(format!("frame_{n:06}.jpg"));
+    let frame_path = if local.is_file() {
+        local
+    } else {
+        resolve_frame_via_chat_line(&state, &id, &root, &split, &seg, n)
+            .ok_or_else(|| not_found(format!("frame {n} not resolvable for {seg}")))?
+    };
+
     let bytes = std::fs::read(&frame_path)
         .map_err(|_| not_found(format!("frame {n} not found at {}", frame_path.display())))?;
 
@@ -1958,6 +2025,74 @@ async fn get_artifact_dataset_frame(
         .header(header::CACHE_CONTROL, "public, max-age=3600")
         .body(axum::body::Body::from(bytes))
         .unwrap())
+}
+
+/// Build (or fetch from cache) the frame_index → absolute_path map for
+/// a single segment by parsing its chat_line.json. Used to serve frames
+/// for "chat_line-only" datasets (Stage B onwards) whose segment dir
+/// has no local `frames/` subdir.
+fn resolve_frame_via_chat_line(
+    state: &AppState,
+    artifact_id: &str,
+    root: &std::path::Path,
+    split: &str,
+    seg: &str,
+    n: u32,
+) -> Option<PathBuf> {
+    let key = format!("{artifact_id}::{split}::{seg}");
+    {
+        let cache = state.segment_frames_cache.lock().unwrap();
+        if let Some(map) = cache.get(&key) {
+            return map.get(&n).cloned();
+        }
+    }
+    // Build the cache outside the lock.
+    let chat_path = root.join(split).join(seg).join("chat_line.json");
+    let bytes = std::fs::read(&chat_path).ok()?;
+    let chat: Value = serde_json::from_slice(&bytes).ok()?;
+    let mut map: HashMap<u32, PathBuf> = HashMap::new();
+    if let Some(msgs) = chat.get("messages").and_then(|x| x.as_array()) {
+        for m in msgs {
+            if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+                continue;
+            }
+            let blocks = match m.get("content").and_then(|c| c.as_array()) {
+                Some(b) => b,
+                None => continue,
+            };
+            for b in blocks {
+                if b.get("type").and_then(|t| t.as_str()) != Some("image") {
+                    continue;
+                }
+                let p = b
+                    .get("image")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| b.get("url").and_then(|x| x.as_str()));
+                let p = match p {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let base = match std::path::Path::new(p).file_name().and_then(|s| s.to_str()) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let stem = match base.strip_prefix("frame_").and_then(|s| s.strip_suffix(".jpg")) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if let Ok(idx) = stem.parse::<u32>() {
+                    map.insert(idx, PathBuf::from(p));
+                }
+            }
+        }
+    }
+    let arc = Arc::new(map);
+    let resolved = arc.get(&n).cloned();
+    {
+        let mut cache = state.segment_frames_cache.lock().unwrap();
+        cache.insert(key, arc);
+    }
+    resolved
 }
 
 // ---------- static SPA ----------

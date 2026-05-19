@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     config::{ClusterConfig, InputSpec, LoadedPipeline, LoadedStage, Recipe, SchedulerKind},
     fs_layout, provenance,
-    store::{InputResolution, NewRun, Store, is_terminal},
+    store::{ArtifactRow, InputResolution, NewRun, Store, is_terminal},
     template::{RenderContext, render_value},
     util,
 };
@@ -88,6 +88,10 @@ pub struct StageContext<'a> {
     /// downstream stages can compute the path of an upstream stage's
     /// output: ``output_roots[upstream.kind] / rendered(upstream.alias)``.
     pub stages: &'a BTreeMap<String, LoadedStage>,
+    /// Outputs of the pipeline's ``from`` pin, keyed by role. Empty when
+    /// the pipeline has no ``from``. Used by ``InputSpec::From`` to
+    /// resolve inputs to the pinned run's artifacts.
+    pub pinned_outputs: &'a BTreeMap<String, ArtifactRow>,
 }
 
 /// Stage-level cache key: a stable digest of "the exact computation this
@@ -252,6 +256,270 @@ fn register_cache_hit(
     })
 }
 
+/// Resolve a pipeline's ``from`` historical pin to a role-keyed map of
+/// artifact rows. Fast path uses the registry; if the row is missing
+/// (cache wasn't rebuilt or run was registered by another user), falls
+/// back to scanning ``runs/<user>/<from_id>/.lab/context.json`` on disk.
+/// Rejects pinning to non-succeeded runs — pinning to in-flight or failed
+/// runs is almost always a mistake.
+fn resolve_from(
+    cluster: &ClusterConfig,
+    store: &Store,
+    from_id: &str,
+) -> Result<BTreeMap<String, ArtifactRow>> {
+    if let Ok(run) = store.get_run(from_id) {
+        match run.status.as_str() {
+            "succeeded" | "cache_hit" => {}
+            other => bail!(
+                "from = {from_id:?}: pinned run is {other:?}; pin only to runs that \
+                 succeeded or cache-hit a prior succeeded run"
+            ),
+        }
+        let outputs = store.run_outputs(from_id)?;
+        return key_outputs_by_role(from_id, outputs);
+    }
+
+    let runs_base = &cluster.filesystem.runs_base;
+    if let Some(ctx) = scan_context_json_for_run(runs_base, from_id)? {
+        return outputs_from_context(store, from_id, &ctx);
+    }
+
+    bail!(
+        "from = {from_id:?}: no registry row and no on-disk context.json found under {}",
+        runs_base.display()
+    )
+}
+
+fn key_outputs_by_role(
+    from_id: &str,
+    outputs: Vec<ArtifactRow>,
+) -> Result<BTreeMap<String, ArtifactRow>> {
+    let mut by_role = BTreeMap::new();
+    for art in outputs {
+        let role = art
+            .metadata_json
+            .get("role")
+            .and_then(|v| v.as_str())
+            .with_context(|| {
+                format!(
+                    "from = {from_id:?}: artifact {} has no `role` in metadata; \
+                     pinned run's outputs cannot be addressed by role",
+                    art.id
+                )
+            })?
+            .to_string();
+        by_role.insert(role, art);
+    }
+    Ok(by_role)
+}
+
+fn scan_context_json_for_run(runs_base: &Path, from_id: &str) -> Result<Option<Value>> {
+    let runs_root = fs_layout::runs_root(runs_base);
+    let entries = match fs::read_dir(&runs_root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("failed to read runs/ root"),
+    };
+    for user_entry in entries {
+        let user_entry = user_entry?;
+        if !user_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let candidate = user_entry
+            .path()
+            .join(from_id)
+            .join(fs_layout::LAB_DIRNAME)
+            .join(fs_layout::CONTEXT_JSON);
+        match fs::read_to_string(&candidate) {
+            Ok(text) => {
+                let value: Value = serde_json::from_str(&text).with_context(|| {
+                    format!("failed to parse {}", candidate.display())
+                })?;
+                return Ok(Some(value));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to read {}", candidate.display()))
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn outputs_from_context(
+    store: &Store,
+    from_id: &str,
+    ctx: &Value,
+) -> Result<BTreeMap<String, ArtifactRow>> {
+    let outputs_value = ctx.get("outputs").with_context(|| {
+        format!("from = {from_id:?}: recovered context.json has no `outputs` field")
+    })?;
+    let by_role: BTreeMap<String, OutputResolution> =
+        serde_json::from_value(outputs_value.clone()).with_context(|| {
+            format!("from = {from_id:?}: context.json `outputs` shape mismatch")
+        })?;
+    let mut artifacts = BTreeMap::new();
+    for (role, resolution) in by_role {
+        let marker_path = resolution.path.join(&resolution.marker);
+        if !marker_path.exists() {
+            bail!(
+                "from = {from_id:?}: output role {role:?} is missing its marker file {} \
+                 — pin target's outputs are not materialized on disk",
+                marker_path.display()
+            );
+        }
+        let art = store
+            .find_artifact_by_path(&resolution.kind, &resolution.path)?
+            .with_context(|| {
+                format!(
+                    "from = {from_id:?}: output role {role:?} (kind={:?}, path={}) is \
+                     not registered in the artifacts table — was the artifact moved or \
+                     scrubbed?",
+                    resolution.kind,
+                    resolution.path.display(),
+                )
+            })?;
+        artifacts.insert(role, art);
+    }
+    Ok(artifacts)
+}
+
+/// Claim the coalesce slot for this cache_key. Returns ``Ok(Some(follower))``
+/// if another producer already owns the slot and this submission becomes a
+/// follower; ``Ok(None)`` if this submission won the claim and should proceed
+/// as the producer. The slot's mkdir is the race-safe primitive.
+#[allow(clippy::too_many_arguments)]
+fn try_coalesce_as_follower(
+    cluster: &ClusterConfig,
+    store: &mut Store,
+    recipe: &Recipe,
+    run_id: &str,
+    run_dir: &Path,
+    lab_dir: &Path,
+    recipe_hash: &str,
+    cache_key: &str,
+    inputs: &[InputResolution],
+    outputs: &BTreeMap<String, OutputResolution>,
+    repo_provenance: &provenance::RepoProvenance,
+    stage_ctx: Option<&StageContext<'_>>,
+    parent_job_ids: &[String],
+    submitted_by: &str,
+) -> Result<Option<SubmittedRun>> {
+    match store.claim_coalesce_slot(cache_key, run_id)? {
+        fs_layout::ClaimOutcome::Claimed => Ok(None),
+        fs_layout::ClaimOutcome::AlreadyExists => {
+            if let Some(peer) = store.find_coalesce_peer(cache_key)? {
+                let peer_job_id = peer.job_id.as_deref().unwrap_or_default();
+                let follower = register_follower(
+                    cluster,
+                    store,
+                    recipe,
+                    run_id,
+                    run_dir,
+                    lab_dir,
+                    recipe_hash,
+                    cache_key,
+                    &peer.id,
+                    peer_job_id,
+                    inputs,
+                    outputs,
+                    repo_provenance,
+                    stage_ctx,
+                    parent_job_ids,
+                    submitted_by,
+                )?;
+                return Ok(Some(follower));
+            }
+            // Slot exists but no in-flight peer with a job_id yet. Either the
+            // claimer hasn't reached set_submitted (tight race window) or
+            // crashed mid-submit (stale claim). Release and reclaim once;
+            // bail if still contested — the user can retry.
+            store.release_coalesce_slot(cache_key)?;
+            match store.claim_coalesce_slot(cache_key, run_id)? {
+                fs_layout::ClaimOutcome::Claimed => Ok(None),
+                fs_layout::ClaimOutcome::AlreadyExists => bail!(
+                    "coalesce slot for cache_key {cache_key} is stuck (a concurrent \
+                     submitter is mid-flight). Retry shortly."
+                ),
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_follower(
+    cluster: &ClusterConfig,
+    store: &mut Store,
+    recipe: &Recipe,
+    run_id: &str,
+    run_dir: &Path,
+    lab_dir: &Path,
+    recipe_hash: &str,
+    cache_key: &str,
+    peer_run_id: &str,
+    peer_job_id: &str,
+    inputs: &[InputResolution],
+    outputs: &BTreeMap<String, OutputResolution>,
+    repo_provenance: &provenance::RepoProvenance,
+    stage_ctx: Option<&StageContext<'_>>,
+    parent_job_ids: &[String],
+    submitted_by: &str,
+) -> Result<SubmittedRun> {
+    let source_root = run_dir.join("source");
+    let source_path = source_root.join(&recipe.repo);
+    let ctx = json!({
+        "schema_version": 1,
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "recipe_name": recipe.name,
+        "recipe_hash": recipe_hash,
+        "repo": recipe.repo,
+        "source_path": source_path,
+        "source_hash": Value::Null,
+        "inputs": inputs,
+        "outputs": outputs,
+        "params": recipe.params,
+        "provenance": repo_provenance,
+        "stage_name": stage_ctx.map(|c| c.stage_name),
+        "parent_job_ids": parent_job_ids,
+        "coalesced_peer_run_id": peer_run_id,
+    });
+    util::atomic_write(
+        &lab_dir.join(fs_layout::CONTEXT_JSON),
+        &serde_json::to_vec_pretty(&ctx)?,
+    )?;
+
+    store.insert_run(
+        NewRun {
+            id: run_id,
+            recipe,
+            recipe_hash,
+            status: "created",
+            run_dir,
+            source_path: &source_path,
+            context_json: &ctx,
+            submitted_by: Some(submitted_by),
+            cache_key: Some(cache_key),
+        },
+        inputs,
+    )?;
+
+    let script = render_follower_script(cluster, recipe, run_dir, peer_job_id, parent_job_ids)?;
+    let script_path = lab_dir.join(fs_layout::SUBMIT_SH);
+    util::atomic_write(&script_path, script.as_bytes())?;
+
+    let job_id = submit_script(cluster, &script_path, run_id)?;
+    store.set_awaiting_peer(run_id, &job_id, peer_run_id, cache_key)?;
+
+    Ok(SubmittedRun {
+        run_id: run_id.to_string(),
+        job_id,
+        run_dir: run_dir.to_path_buf(),
+        cache_hit: false,
+    })
+}
+
 fn submit_recipe_inner(
     cluster: &ClusterConfig,
     store: &mut Store,
@@ -326,6 +594,30 @@ fn submit_recipe_inner(
                 submitted_by,
             );
         }
+    }
+
+    // Coalesce: another in-flight submission with the same cache_key is
+    // already running the work. Become a follower of that producer instead
+    // of duplicating the SLURM job. First writer wins via mkdir on the
+    // coalesce-claim namespace; subsequent writers `AlreadyExists` and
+    // resolve to the producer's run_id.
+    if let Some(follower) = try_coalesce_as_follower(
+        cluster,
+        store,
+        recipe,
+        &run_id,
+        &run_dir,
+        &lab_dir,
+        &recipe_hash,
+        &cache_key,
+        &inputs,
+        &outputs,
+        &repo_provenance,
+        stage_ctx,
+        parent_job_ids,
+        submitted_by,
+    )? {
+        return Ok(follower);
     }
 
     // Materialize each output's directory so the recipe's command can write
@@ -575,6 +867,14 @@ pub fn submit_pipeline(
     submitted_by: &str,
 ) -> Result<SubmittedPipeline> {
     fs_layout::validate_user(submitted_by)?;
+    // Resolve the `from` pin (if any) to a role-keyed map of artifact rows.
+    // Done once at the top so every stage shares the same view; cache-hit /
+    // coalesce decisions for downstream stages use these artifact_ids as
+    // canonical inputs in their cache_key.
+    let pinned_outputs: BTreeMap<String, ArtifactRow> = match pipeline.from.as_deref() {
+        Some(from_id) => resolve_from(cluster, store, from_id)?,
+        None => BTreeMap::new(),
+    };
     // Allocate run_ids for every stage up-front so downstream stages can render
     // input paths that point at upstream run_dirs that haven't been created yet.
     let stage_run_ids: BTreeMap<String, String> = pipeline
@@ -617,6 +917,7 @@ pub fn submit_pipeline(
             stage_name,
             stage_run_ids: &stage_run_ids,
             stages: &pipeline.stages,
+            pinned_outputs: &pinned_outputs,
         };
 
         let preallocated = &stage_run_ids[stage_name];
@@ -683,6 +984,13 @@ pub fn reconcile_one(
     store: &mut Store,
     run: &crate::store::RunRow,
 ) -> Result<ReconcileStep> {
+    // Followers waiting on a coalesce peer have a different lifecycle: the
+    // SLURM trampoline doesn't reflect the real producer's outcome, so
+    // scheduler_outcome would lie. Resolve them by inspecting the peer.
+    if run.status == "awaiting_peer" {
+        return reconcile_follower(store, run);
+    }
+
     let mut step = ReconcileStep {
         status_changed: false,
         artifacts_registered: 0,
@@ -699,6 +1007,79 @@ pub fn reconcile_one(
     step.artifacts_registered += register_outputs(store, &current)?;
     let _ = crate::tracking::try_populate_from_log(store, &current);
     Ok(step)
+}
+
+/// Drive a coalesce-follower through its terminal transition. Watches the
+/// peer's status: succeeded → flip to ``cache_hit`` and link the peer's
+/// outputs; failure → flip to ``failed`` with attribution. Still-running
+/// peers are a no-op (we'll be called again next reconcile pass).
+fn reconcile_follower(
+    store: &mut Store,
+    follower: &crate::store::RunRow,
+) -> Result<ReconcileStep> {
+    let mut step = ReconcileStep::default();
+    let peer_id = follower
+        .coalesced_peer_run_id
+        .as_deref()
+        .with_context(|| {
+            format!(
+                "run {} is awaiting_peer but has no coalesced_peer_run_id; \
+                 sidecar is corrupt",
+                follower.id
+            )
+        })?;
+    let peer = store.get_run(peer_id)?;
+    match peer.status.as_str() {
+        "succeeded" | "cache_hit" => {
+            let peer_outputs = store.run_outputs(&peer.id)?;
+            let follower_outputs = follower_output_map(follower)?;
+            if !cache_hit_outputs_valid(&peer_outputs, &follower_outputs) {
+                store.append_stage_coalesce_failed_event(
+                    &follower.id,
+                    &peer.id,
+                    "peer_outputs_invalid",
+                )?;
+                store.update_status(&follower.id, "failed", peer.finished_at)?;
+                step.status_changed = true;
+                return Ok(step);
+            }
+            store.copy_run_outputs(&peer.id, &follower.id)?;
+            store.append_stage_coalesce_resolved_event(&follower.id, &peer.id)?;
+            store.update_status(&follower.id, "cache_hit", peer.finished_at)?;
+            step.status_changed = true;
+        }
+        "failed" | "cancelled" | "timeout" | "oom" | "unknown_terminal" => {
+            store.append_stage_coalesce_failed_event(
+                &follower.id,
+                &peer.id,
+                &peer.status,
+            )?;
+            store.update_status(&follower.id, "failed", peer.finished_at)?;
+            step.status_changed = true;
+        }
+        _ => {
+            // Peer still in flight; check again next reconcile pass.
+        }
+    }
+    Ok(step)
+}
+
+fn follower_output_map(
+    follower: &crate::store::RunRow,
+) -> Result<BTreeMap<String, OutputResolution>> {
+    let outputs_value = follower
+        .context_json
+        .get("outputs")
+        .with_context(|| {
+            format!("follower {} context.json missing 'outputs' field", follower.id)
+        })?
+        .clone();
+    serde_json::from_value(outputs_value).with_context(|| {
+        format!(
+            "follower {} context.json 'outputs' shape mismatch",
+            follower.id
+        )
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -880,6 +1261,25 @@ fn resolve_inputs(
                     role: role.clone(),
                     artifact_id: Some(artifact.id),
                     resolved_path: artifact.path,
+                }
+            }
+            InputSpec::From { role: pinned_role } => {
+                let ctx = stage_ctx.with_context(|| {
+                    format!(
+                        "input {role:?} is type=from but recipe is being submitted \
+                         outside of a pipeline"
+                    )
+                })?;
+                let artifact = ctx.pinned_outputs.get(pinned_role).with_context(|| {
+                    format!(
+                        "input {role:?} is type=from role={pinned_role:?} but the \
+                         pipeline's `from` run produced no output named {pinned_role:?}"
+                    )
+                })?;
+                InputResolution {
+                    role: role.clone(),
+                    artifact_id: Some(artifact.id.clone()),
+                    resolved_path: artifact.path.clone(),
                 }
             }
             InputSpec::Stage {
@@ -1220,6 +1620,100 @@ else
   write_status failed "$rc"
 fi
 exit "$rc"
+"#,
+    );
+    Ok(script)
+}
+
+/// Minimal trampoline submitted for coalesce followers. SLURM holds the
+/// job via ``--dependency=afterok:<peer>`` until the producer succeeds;
+/// the resolver loop normally flips the follower to ``cache_hit`` before
+/// the trampoline ever runs. If it does run, it just writes a succeeded
+/// status sentinel and exits 0 so downstream ``afterok:`` stages
+/// proceed. Resources are tiny — this job does nothing.
+fn render_follower_script(
+    cluster: &ClusterConfig,
+    recipe: &Recipe,
+    run_dir: &Path,
+    peer_job_id: &str,
+    parent_job_ids: &[String],
+) -> Result<String> {
+    let status_path = run_dir
+        .join(fs_layout::LAB_DIRNAME)
+        .join(fs_layout::STATUS_JSON);
+    let mut script = String::new();
+    if cluster.scheduler.kind == SchedulerKind::Slurm {
+        script.push_str("#!/usr/bin/env bash\n");
+        script.push_str(&format!(
+            "#SBATCH --job-name={}-coalesce\n",
+            safe_job_name(&recipe.name)
+        ));
+        if let Some(account) = recipe
+            .resources
+            .account
+            .as_ref()
+            .or(cluster.slurm.account.as_ref())
+        {
+            script.push_str(&format!("#SBATCH --account={account}\n"));
+        }
+        if let Some(partition) = recipe
+            .resources
+            .partition
+            .as_ref()
+            .or(cluster.slurm.partition.as_ref())
+        {
+            script.push_str(&format!("#SBATCH --partition={partition}\n"));
+        }
+        if let Some(qos) = recipe.resources.qos.as_ref().or(cluster.slurm.qos.as_ref()) {
+            script.push_str(&format!("#SBATCH --qos={qos}\n"));
+        }
+        // afterok chain: peer + any intra-pipeline parents.
+        let mut deps: Vec<String> = vec![peer_job_id.to_string()];
+        deps.extend(parent_job_ids.iter().cloned());
+        script.push_str(&format!(
+            "#SBATCH --dependency=afterok:{}\n",
+            deps.join(":")
+        ));
+        script.push_str("#SBATCH --kill-on-invalid-dep=yes\n");
+        script.push_str("#SBATCH --cpus-per-task=1\n");
+        script.push_str("#SBATCH --mem=128M\n");
+        script.push_str("#SBATCH --time=00:05:00\n");
+        script.push_str(&format!(
+            "#SBATCH --output={}/.lab/%x_%j.log\n#SBATCH --error={}/.lab/%x_%j.log\n",
+            run_dir.display(),
+            run_dir.display()
+        ));
+    } else {
+        script.push_str("#!/usr/bin/env bash\n");
+    }
+    script.push_str(
+        r#"
+set -uo pipefail
+job_id="${SLURM_JOB_ID:-${LABCTL_JOB_ID:-local}}"
+write_status() {
+  state="$1"
+  rc="${2:-0}"
+  tmp=""#,
+    );
+    script.push_str(&util::shell_quote(&format!(
+        "{}.tmp",
+        status_path.display()
+    )));
+    script.push_str(
+        r#""
+  dst=""#,
+    );
+    script.push_str(&util::shell_quote(&status_path.display().to_string()));
+    script.push_str(
+        r#""
+  printf '{"status":"%s","job_id":"%s","rc":%s,"updated_at":%s}\n' "$state" "$job_id" "$rc" "$(date +%s)" > "$tmp"
+  mv "$tmp" "$dst"
+}
+# Coalesce trampoline: the resolver loop normally flips this follower to
+# cache_hit before SLURM ever runs this script. If it didn't (fast queue,
+# slow reconcile), exit 0 so downstream afterok: stages proceed.
+write_status succeeded 0
+exit 0
 "#,
     );
     Ok(script)

@@ -478,7 +478,17 @@ need the foreign run details, open the foreign cluster's UI directly.
 ## What's next
 
 - **Recipes**: see `docs/RECIPE_CONTRACT.md` for the full contract.
-- **Pipelines**: TOML stages with explicit inter-stage `[stages.X.depends_on]`.
+- **Pipelines**: a TOML file listing stages, each pointing at a recipe.
+  Inputs of `type = "stage"` chain stages into a DAG that labctl
+  submits with `--dependency=afterok:` between SLURM jobs. The pipeline
+  can also pin its upstream to a specific historical run with
+  `from = "<run_id>"`; stages whose inputs are `type = "from"` resolve
+  to that pinned run's outputs (frozen provenance, no re-validation).
+  Submit the same pipeline twice and the second submission cache-hits
+  the first; submit six in parallel and they coalesce onto one SLURM
+  job. Result: fan out experiments cheaply without duplicating work,
+  and pin them to frozen upstream state without freezing the registry.
+  See `examples/pipelines/from-pinned.toml`.
 - **Eval policies**: declarative auto-dispatch — see `examples/policies/`.
 - **CLI surface**: `labctl --help` lists everything, including
   `validate`, `show <run>`, `recover-outputs`, and

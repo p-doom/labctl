@@ -1,0 +1,28 @@
+# Extends a historical training run: consume its checkpoint output as
+# input via the pipeline's `from` pin. Pair with
+# examples/pipelines/from-pinned.toml.
+
+name    = "eval_from_example"
+repo    = "myrepo"
+command = [
+  "python", "scripts/eval.py",
+  "--checkpoint", "{inputs.checkpoint.path}",
+  "--out", "{outputs.result.dir}",
+]
+
+[resources]
+gpus = 1
+cpus = 4
+mem  = "16GB"
+time = "00:30:00"
+
+# `type = "from"` resolves the input from the pipeline's pinned run.
+# `role` names the output role on the pinned run that we want here.
+[inputs.checkpoint]
+type = "from"
+role = "checkpoint"
+
+[outputs.result]
+type   = "eval_result"
+marker = "metrics.json"
+alias  = "eval_from_{run.id}"

@@ -22,6 +22,19 @@ throttle as a systemd unit. `labctl serve` is a read-only HTTP server
 that anyone can run; it builds an in-memory SQLite cache from the tree
 on startup.
 
+## Workflow philosophy
+
+**Stable artifacts, composable pipelines, ephemeral runs.** Data
+preparation lives in long-running pipelines that produce named
+artifacts; experiments are small pipeline files that extend a specific
+historical run via `from = "<run_id>"`. Stage-level cache-hit
+short-circuits any stage whose key already has a succeeded run on disk;
+in-flight coalescing routes parallel submissions that share an upstream
+key onto a single SLURM job instead of duplicating it. The net effect:
+fan out experiments without duplicating work, and pin them to frozen
+upstream state without freezing the registry. See
+`examples/pipelines/from-pinned.toml`.
+
 ## Install
 
 ```bash

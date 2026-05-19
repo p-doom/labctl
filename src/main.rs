@@ -1024,11 +1024,16 @@ fn validate_path(path: &PathBuf) -> Result<()> {
         );
     } else if raw.contains_key("stages") {
         let loaded = config::Pipeline::load(path)?;
+        let from_suffix = match &loaded.from {
+            Some(id) => format!(", from={id:?}"),
+            None => String::new(),
+        };
         println!(
-            "pipeline {:?} OK ({} stages, topo={:?})",
+            "pipeline {:?} OK ({} stages, topo={:?}{})",
             loaded.name,
             loaded.stages.len(),
             loaded.topo_order,
+            from_suffix,
         );
     } else if raw.contains_key("applies_to") {
         let policy = config::EvalPolicy::load(path)?;

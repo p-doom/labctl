@@ -82,4 +82,27 @@ export const router = {
     if (qs) hash += `?${qs}`;
     if (window.location.hash !== hash) window.location.hash = hash;
   },
+  /**
+   * Like `setQuery`, but swaps the current history entry instead of
+   * pushing a new one. Use for state changes that should be URL-visible
+   * (deep-linkable / refresh-safe) but not history-worthy — tab swaps
+   * inside a view, scrubber positions, filter typing, etc. The back
+   * button still works because the prior real entry is preserved.
+   */
+  setQueryReplace(updates: Record<string, string | null>) {
+    const q = new URLSearchParams(route.query);
+    for (const [k, v] of Object.entries(updates)) {
+      if (v == null || v === "") q.delete(k);
+      else q.set(k, v);
+    }
+    let hash = `#/${route.view}`;
+    if (route.selected) hash += `/${route.selected}`;
+    const qs = q.toString();
+    if (qs) hash += `?${qs}`;
+    if (window.location.hash === hash) return;
+    history.replaceState(history.state, "", hash);
+    // hashchange doesn't fire for replaceState; re-parse manually so
+    // every consumer of `router.query` sees the new state.
+    route = parse(hash);
+  },
 };

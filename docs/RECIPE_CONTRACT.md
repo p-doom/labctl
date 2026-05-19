@@ -55,6 +55,24 @@ labctl wraps your command with a `write_status` helper that emits
 wrapper writes `running` before your command and `succeeded` / `failed`
 based on its exit code.
 
+### Input types
+
+The `type` field on each `[inputs.<role>]` chooses how labctl resolves
+the artifact at submit time:
+
+| type         | resolves via                                                          |
+|--------------|-----------------------------------------------------------------------|
+| `artifact`   | named registry alias (`artifact = "alias_name"`)                      |
+| `external`   | absolute filesystem path (`path = "/abs/..."`)                        |
+| `stage`      | another stage in the same pipeline (`stage = "X", role = "..."`)      |
+| `from`       | the pipeline's `from`-pinned run (`role = "..."`)                     |
+| `checkpoint` | injected by an eval policy at dispatch (per-checkpoint eval recipes)  |
+
+`stage` and `from` are pipeline-scoped: `stage` pulls from an
+intra-pipeline parent, `from` pulls from the pipeline's historical
+`from = "<run_id>"` pin. Submitting a recipe outside a pipeline that
+declares either is a hard error.
+
 ## What labctl demands from your recipe
 
 ### One marker file per output
@@ -97,8 +115,8 @@ mem  = "256GB"
 time = "08:00:00"
 
 [inputs.dataset]
-type = "dataset"
-alias = "ifeval_replay_v1"
+type     = "artifact"
+artifact = "ifeval_replay_v1"
 
 [outputs.checkpoint]
 type   = "checkpoint_stream"
