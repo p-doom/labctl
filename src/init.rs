@@ -56,7 +56,10 @@ pub enum InitMode {
 }
 
 pub struct InitOptions {
-    pub mode: InitMode,
+    /// `None` means no mode flag was passed — init will prompt for
+    /// the mode interactively, or default to Greenfield in auto mode.
+    /// `Some(x)` is the explicit flag-supplied mode.
+    pub mode: Option<InitMode>,
     pub yes: bool,
     pub name: Option<String>,
     pub runs_base: Option<PathBuf>,
@@ -79,12 +82,24 @@ struct SlurmProbe {
     notes: Vec<String>,
 }
 
-pub fn run(opts: InitOptions) -> Result<()> {
-    let mode = prompt::Mode::resolve(opts.yes);
-    print_header(&opts.mode);
+pub fn run(mut opts: InitOptions) -> Result<()> {
+    let pmode = prompt::Mode::resolve(opts.yes);
+    println!("labctl init — bootstrap a cluster config and per-user agent.\n");
+
+    // Resolve mode: explicit flag wins; otherwise prompt
+    // interactively (so a fresh `labctl init` walks the user
+    // through "what are you doing?" instead of silently defaulting
+    // to greenfield). In auto mode with no flag, fall back to
+    // greenfield — the existing scripted behavior. `take()` to
+    // move out without invalidating `opts` for later access.
+    let init_mode = match opts.mode.take() {
+        Some(m) => m,
+        None => prompt_for_mode(pmode)?,
+    };
+    print_mode_line(&init_mode);
 
     // ── 1. Acquire base config ───────────────────────────────────
-    let mut cfg = match &opts.mode {
+    let mut cfg = match &init_mode {
         InitMode::Greenfield => skeleton_config(opts.name.as_deref()),
         InitMode::Use(p) | InitMode::MigrateFrom(p) | InitMode::Join(p) => load_lax(p)
             .with_context(|| format!("failed to load source config {}", p.display()))?,
@@ -95,7 +110,7 @@ pub fn run(opts: InitOptions) -> Result<()> {
     // with a local probe. Greenfield/MigrateFrom probe because the
     // user is targeting this cluster and the source (if any) is
     // from elsewhere.
-    let probe = match (&opts.mode, opts.no_detect) {
+    let probe = match (&init_mode, opts.no_detect) {
         (_, true) => SlurmProbe::default(),
         (InitMode::Use(_) | InitMode::Join(_), _) => SlurmProbe::default(),
         _ => slurm_probe(),
@@ -116,9 +131,9 @@ pub fn run(opts: InitOptions) -> Result<()> {
     }
     apply_probe(&mut cfg, &probe);
 
-    match (&opts.mode, mode) {
+    match (&init_mode, pmode) {
         (InitMode::Greenfield | InitMode::MigrateFrom(_), prompt::Mode::Interactive) => {
-            interactive_review(&mut cfg, &opts.mode, &probe, mode)?;
+            interactive_review(&mut cfg, &init_mode, &probe, pmode)?;
         }
         _ => {
             // In auto mode: flag overrides + probe + skeleton/foreign
@@ -128,17 +143,17 @@ pub fn run(opts: InitOptions) -> Result<()> {
     }
 
     // ── 4. Decide output / link target ───────────────────────────
-    let dest = pick_destination(&opts, &cfg, mode)?;
+    let dest = pick_destination(&opts, &cfg, pmode)?;
 
     // ── 5. Existing-file disposition ─────────────────────────────
     if dest.exists() && !opts.force {
-        let same_target = matches!(&opts.mode, InitMode::Use(p) | InitMode::Join(p) if same_file(p, &dest));
+        let same_target = matches!(&init_mode, InitMode::Use(p) | InitMode::Join(p) if same_file(p, &dest));
         if !same_target {
-            match handle_existing(&dest, mode)? {
+            match handle_existing(&dest, pmode)? {
                 ExistingAction::Keep => {
                     println!("→ keeping existing {}", dest.display());
                 }
-                ExistingAction::Replace => write_or_link(&cfg, &dest, &opts)?,
+                ExistingAction::Replace => write_or_link(&cfg, &dest, &init_mode, &opts)?,
                 ExistingAction::Abort => {
                     println!("aborted by user");
                     return Ok(());
@@ -148,7 +163,7 @@ pub fn run(opts: InitOptions) -> Result<()> {
             println!("→ {} already points at the source; skipping write.", dest.display());
         }
     } else {
-        write_or_link(&cfg, &dest, &opts)?;
+        write_or_link(&cfg, &dest, &init_mode, &opts)?;
     }
 
     // ── 6. Pre-create per-user subdirs ───────────────────────────
@@ -158,7 +173,7 @@ pub fn run(opts: InitOptions) -> Result<()> {
         let do_create = prompt::confirm(
             "Pre-create per-user subdirectories under runs_base + artifact_roots?",
             true,
-            mode,
+            pmode,
         )?;
         if do_create {
             create_user_dirs(&cfg)?;
@@ -171,7 +186,7 @@ pub fn run(opts: InitOptions) -> Result<()> {
             let do_install = prompt::confirm(
                 "Install per-user agent (systemd user unit)?",
                 true,
-                mode,
+                pmode,
             )?;
             if do_install {
                 install_agent_unit(&dest, opts.force)?;
@@ -211,8 +226,7 @@ pub fn run(opts: InitOptions) -> Result<()> {
     Ok(())
 }
 
-fn print_header(mode: &InitMode) {
-    println!("labctl init — bootstrap a cluster config and per-user agent.");
+fn print_mode_line(mode: &InitMode) {
     match mode {
         InitMode::Greenfield => println!("mode: greenfield (writing a fresh config)\n"),
         InitMode::Use(p) => println!("mode: use {} (adopting an existing config)\n", p.display()),
@@ -224,6 +238,46 @@ fn print_header(mode: &InitMode) {
             p.display()
         ),
     }
+}
+
+/// Pick a mode interactively. Auto-resolves to Greenfield in non-
+/// interactive mode (preserving the old scripted behavior — set the
+/// mode via flag, or accept the greenfield default with `--yes`).
+fn prompt_for_mode(pmode: prompt::Mode) -> Result<InitMode> {
+    if pmode == prompt::Mode::Auto {
+        return Ok(InitMode::Greenfield);
+    }
+    let options = [
+        "greenfield — brand-new cluster, no template",
+        "use existing — I already wrote a cluster.toml; adopt it",
+        "migrate from — adapt another cluster's cluster.toml to this site",
+        "join shared — a colleague already runs labctl on this cluster",
+    ];
+    let idx = prompt::choice("What are you doing?", &options, 0, pmode)?;
+    Ok(match idx {
+        0 => InitMode::Greenfield,
+        1 => {
+            let p = prompt::path("path to your cluster.toml", None, pmode)?;
+            InitMode::Use(p)
+        }
+        2 => {
+            let p = prompt::path(
+                "path to the source cluster.toml (foreign cluster)",
+                None,
+                pmode,
+            )?;
+            InitMode::MigrateFrom(p)
+        }
+        3 => {
+            let p = prompt::path(
+                "path to the shared cluster.toml (your colleague's)",
+                None,
+                pmode,
+            )?;
+            InitMode::Join(p)
+        }
+        _ => unreachable!(),
+    })
 }
 
 /// Probe local SLURM for partition / QoS / GresTypes. Each step is
@@ -474,13 +528,18 @@ fn handle_existing(dest: &Path, mode: prompt::Mode) -> Result<ExistingAction> {
 /// source file into the destination (Use/Join). Greenfield-style
 /// header carries an explanatory comment so the user knows where
 /// the file came from when they grep for it later.
-fn write_or_link(cfg: &ClusterConfig, dest: &Path, opts: &InitOptions) -> Result<()> {
+fn write_or_link(
+    cfg: &ClusterConfig,
+    dest: &Path,
+    mode: &InitMode,
+    opts: &InitOptions,
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create parent dir {}", parent.display()))?;
     }
 
-    match &opts.mode {
+    match mode {
         InitMode::Use(src) | InitMode::Join(src) => {
             // For these modes the source IS the truth. The
             // destination is just a pointer so plain `labctl <cmd>`
@@ -507,7 +566,7 @@ fn write_or_link(cfg: &ClusterConfig, dest: &Path, opts: &InitOptions) -> Result
             }
         }
         InitMode::Greenfield | InitMode::MigrateFrom(_) => {
-            let copied_from = match &opts.mode {
+            let copied_from = match mode {
                 InitMode::MigrateFrom(p) => Some(p.as_path()),
                 _ => None,
             };

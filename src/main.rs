@@ -360,11 +360,14 @@ fn main() -> Result<()> {
         copy_config,
     } = cli.command
     {
+        // Only set Some(...) when the user passed an explicit mode
+        // flag. `None` lets init prompt for the mode interactively
+        // (or default to Greenfield in auto mode).
         let mode = match (r#use, migrate_from, join) {
-            (Some(p), None, None) => init::InitMode::Use(p),
-            (None, Some(p), None) => init::InitMode::MigrateFrom(p),
-            (None, None, Some(p)) => init::InitMode::Join(p),
-            (None, None, None) => init::InitMode::Greenfield,
+            (Some(p), None, None) => Some(init::InitMode::Use(p)),
+            (None, Some(p), None) => Some(init::InitMode::MigrateFrom(p)),
+            (None, None, Some(p)) => Some(init::InitMode::Join(p)),
+            (None, None, None) => None,
             _ => unreachable!("clap's mutual-exclusion group prevents this"),
         };
         return init::run(init::InitOptions {
