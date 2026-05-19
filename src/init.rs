@@ -112,14 +112,8 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
     }
 
     if !opts.no_create_dirs {
-        let do_create = prompt::confirm(
-            "Pre-create per-user subdirectories under runs_base + artifact_roots?",
-            true,
-            pmode,
-        )?;
-        if do_create {
-            create_user_dirs(&cfg)?;
-        }
+        println!("Creating per-user subdirectories under runs_base + artifact_roots...");
+        create_user_dirs(&cfg)?;
     }
 
     if !opts.no_agent {
