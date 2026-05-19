@@ -442,13 +442,18 @@ fn main() -> Result<()> {
                 }
             }
             ServiceCommand::Restart { agent, ui } => {
+                // A unit is restart-able if either its file is on disk
+                // or systemd has it loaded in memory — the latter covers
+                // the case where the file was removed/renamed but the
+                // unit is still running until `daemon-reload`.
+                let known = |n: &&str| service::is_installed(n) || service::is_loaded(n);
                 let targets: Vec<&str> = match (agent, ui) {
                     (true, false) => vec![service::AGENT_UNIT_NAME],
                     (false, true) => vec![service::UI_UNIT_NAME],
                     (true, true) => unreachable!("clap ArgGroup prevents both"),
                     (false, false) => [service::AGENT_UNIT_NAME, service::UI_UNIT_NAME]
                         .into_iter()
-                        .filter(|n| service::is_installed(n))
+                        .filter(known)
                         .collect(),
                 };
                 if targets.is_empty() {

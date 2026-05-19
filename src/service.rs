@@ -262,10 +262,26 @@ fn linger_enabled() -> bool {
     }
 }
 
-/// Returns true when a service unit is installed at the expected path.
-/// Used by the first-run hint in `labctl run`.
+/// Returns true when a service unit file exists at the expected path.
+/// Used by the first-run hint in `labctl run` and by the doctor output,
+/// where on-disk semantics are what the user wants.
 pub fn is_installed(unit_name: &str) -> bool {
     unit_path(unit_name).map(|p| p.exists()).unwrap_or(false)
+}
+
+/// Returns true when systemd has the unit loaded in memory. systemd
+/// keeps a unit loaded across removal of its on-disk file until the
+/// next `daemon-reload`, so `is_installed` and `is_loaded` can disagree
+/// — `labctl service restart` accepts either.
+pub fn is_loaded(unit_name: &str) -> bool {
+    let unit = format!("{unit_name}.service");
+    let Ok(out) = Command::new("systemctl")
+        .args(["--user", "show", "-p", "LoadState", "--value", &unit])
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "loaded"
 }
 
 /// Returns true when systemd-user looks usable on this host. Mirrors the
