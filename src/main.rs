@@ -35,10 +35,8 @@ const BUILD_VERSION: &str = concat!(
 #[command(version = BUILD_VERSION)]
 #[command(about = "Reproducible lab run envelope and artifact lineage control plane")]
 struct Cli {
-    /// Path to cluster.toml. Defaults to $XDG_CONFIG_HOME/labctl/cluster.toml
-    /// (or ~/.config/labctl/cluster.toml). Override per invocation or set
-    /// $LABCTL_CLUSTER. `labctl init` writes the default location so plain
-    /// `labctl <cmd>` Just Works after setup.
+    /// Path to cluster.toml. Default: $LABCTL_CLUSTER, then
+    /// $XDG_CONFIG_HOME/labctl/cluster.toml, then ~/.config/labctl/cluster.toml.
     #[arg(long, global = true)]
     cluster: Option<PathBuf>,
 
@@ -46,9 +44,6 @@ struct Cli {
     command: Command,
 }
 
-/// Resolve the cluster path: explicit `--cluster` > $LABCTL_CLUSTER > XDG default.
-/// XDG honors $XDG_CONFIG_HOME if set, else $HOME/.config/labctl/cluster.toml.
-/// Falls back to `./labctl.toml` if HOME isn't set (CI / system contexts).
 fn resolve_cluster_path(arg: Option<PathBuf>) -> PathBuf {
     if let Some(p) = arg {
         return p;
@@ -339,9 +334,6 @@ fn main() -> Result<()> {
     if let Command::Validate { path } = &cli.command {
         return validate_path(path);
     }
-    // Init is the full bootstrap (cluster.toml + dirs + agent +
-    // doctor). It chooses its OWN destination — the global --cluster
-    // arg is not read here.
     if let Command::Init {
         r#use,
         migrate_from,
@@ -360,9 +352,6 @@ fn main() -> Result<()> {
         copy_config,
     } = cli.command
     {
-        // Only set Some(...) when the user passed an explicit mode
-        // flag. `None` lets init prompt for the mode interactively
-        // (or default to Greenfield in auto mode).
         let mode = match (r#use, migrate_from, join) {
             (Some(p), None, None) => Some(init::InitMode::Use(p)),
             (None, Some(p), None) => Some(init::InitMode::MigrateFrom(p)),
@@ -790,11 +779,6 @@ fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_else(|| "unknown".into());
                 emit(&format!("{unit} unit"), true, &format!("installed ({active})"));
-                // When a unit is failed or inactive, tail journalctl so
-                // doctor reports the *why* in-line rather than forcing a
-                // round-trip through `systemctl --user status`. Best-
-                // effort: missing journalctl, no permission, or no log
-                // yet all just elide the tail without failing the check.
                 if active == "failed" || active == "inactive" {
                     if let Ok(out) = Cmd::new("journalctl")
                         .args(["--user", "-u", unit, "-n", "20", "--no-pager"])

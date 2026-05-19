@@ -116,10 +116,9 @@ Each step has an off switch for scripted / cautious runs:
 
 If you want full control, write a `cluster.toml` directly (minimal
 shape below), then run `labctl init --use <that-file>` to bootstrap
-dirs + agent + doctor around it. The committed
-`cluster.berlin.toml` at the repo root is a real populated example;
-`examples/clusters/` has `single-user.toml`, `multi-tenant.toml`,
-and `with-remote.toml` templates.
+dirs + agent + doctor around it. `examples/clusters/` has
+`single-user.toml`, `multi-tenant.toml`, and `with-remote.toml`
+templates to crib from.
 
 ```toml
 name = "berlin"

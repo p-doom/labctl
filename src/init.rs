@@ -1,36 +1,3 @@
-//! `labctl init` — full bootstrap for a new-cluster setup.
-//!
-//! Not a config-writer. End-to-end: resolve a cluster config (write
-//! one, adopt an existing one, adapt a foreign one, or symlink the
-//! team's), pre-create per-user subdirs, install the systemd agent
-//! unit, run doctor. Leave the user with `labctl run` working.
-//!
-//! Four modes — pick by flag, otherwise asked interactively:
-//!
-//!   - `Greenfield` — write a fresh cluster.toml. SLURM probes fill
-//!     partition/QoS/gres; prompts fill paths. Default for new sites
-//!     with no template to crib from.
-//!   - `Use(path)` — adopt an existing cluster.toml the user wrote.
-//!     Don't touch the source file; symlink it into the default
-//!     config location so plain `labctl <cmd>` works, then bootstrap
-//!     dirs + agent + doctor around it.
-//!   - `MigrateFrom(path)` — copy schema from a foreign cluster's
-//!     identity card, but adapt site-local paths interactively. The
-//!     output is a *new* cluster.toml at the local destination. Use
-//!     this when standing labctl up at site B from site A's config.
-//!   - `Join(path)` — join a colleague's shared registry on the same
-//!     cluster. Keep paths verbatim (the registry IS shared);
-//!     symlink the colleague's cluster.toml into the user's default
-//!     location; install per-user agent; create the per-user
-//!     subdirs the colleague's registry already expects. Different
-//!     from Use only in messaging.
-//!
-//! Interactive by default. `--yes` (or non-TTY stdin) collapses to
-//! "accept all defaults" — same code path, suppressed prompts. Flag
-//! overrides win over interactive defaults so a partially-scripted
-//! invocation works: `labctl init --yes --runs-base /scratch/foo` is
-//! valid.
-
 use std::{
     collections::BTreeMap,
     env,
@@ -46,7 +13,6 @@ use crate::{
     service,
 };
 
-/// Which of the four bootstrap stories the user is running.
 #[derive(Debug, Clone)]
 pub enum InitMode {
     Greenfield,
@@ -56,9 +22,7 @@ pub enum InitMode {
 }
 
 pub struct InitOptions {
-    /// `None` means no mode flag was passed — init will prompt for
-    /// the mode interactively, or default to Greenfield in auto mode.
-    /// `Some(x)` is the explicit flag-supplied mode.
+    /// None = prompt for the mode (or default Greenfield in auto).
     pub mode: Option<InitMode>,
     pub yes: bool,
     pub name: Option<String>,
@@ -86,37 +50,25 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
     let pmode = prompt::Mode::resolve(opts.yes);
     println!("labctl init — bootstrap a cluster config and per-user agent.\n");
 
-    // Resolve mode: explicit flag wins; otherwise prompt
-    // interactively (so a fresh `labctl init` walks the user
-    // through "what are you doing?" instead of silently defaulting
-    // to greenfield). In auto mode with no flag, fall back to
-    // greenfield — the existing scripted behavior. `take()` to
-    // move out without invalidating `opts` for later access.
     let init_mode = match opts.mode.take() {
         Some(m) => m,
         None => prompt_for_mode(pmode)?,
     };
     print_mode_line(&init_mode);
 
-    // ── 1. Acquire base config ───────────────────────────────────
     let mut cfg = match &init_mode {
         InitMode::Greenfield => skeleton_config(opts.name.as_deref()),
         InitMode::Use(p) | InitMode::MigrateFrom(p) | InitMode::Join(p) => load_lax(p)
             .with_context(|| format!("failed to load source config {}", p.display()))?,
     };
 
-    // ── 2. SLURM probe ───────────────────────────────────────────
-    // Use/Join trust the source's SLURM block — don't overwrite it
-    // with a local probe. Greenfield/MigrateFrom probe because the
-    // user is targeting this cluster and the source (if any) is
-    // from elsewhere.
+    // Use/Join trust the source's SLURM block; don't clobber it with a local probe.
     let probe = match (&init_mode, opts.no_detect) {
         (_, true) => SlurmProbe::default(),
         (InitMode::Use(_) | InitMode::Join(_), _) => SlurmProbe::default(),
         _ => slurm_probe(),
     };
 
-    // ── 3. Apply flag overrides + interactive review ─────────────
     if let Some(name) = &opts.name {
         cfg.name = name.clone();
     }
@@ -131,21 +83,14 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
     }
     apply_probe(&mut cfg, &probe);
 
-    match (&init_mode, pmode) {
-        (InitMode::Greenfield | InitMode::MigrateFrom(_), prompt::Mode::Interactive) => {
-            interactive_review(&mut cfg, &init_mode, &probe, pmode)?;
-        }
-        _ => {
-            // In auto mode: flag overrides + probe + skeleton/foreign
-            // defaults are already applied above. In Use/Join modes:
-            // the source IS the truth, nothing to review.
-        }
+    if let (InitMode::Greenfield | InitMode::MigrateFrom(_), prompt::Mode::Interactive) =
+        (&init_mode, pmode)
+    {
+        interactive_review(&mut cfg, &init_mode, &probe, pmode)?;
     }
 
-    // ── 4. Decide output / link target ───────────────────────────
     let dest = pick_destination(&opts, &cfg, pmode)?;
 
-    // ── 5. Existing-file disposition ─────────────────────────────
     if dest.exists() && !opts.force {
         let same_target = matches!(&init_mode, InitMode::Use(p) | InitMode::Join(p) if same_file(p, &dest));
         if !same_target {
@@ -166,9 +111,6 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
         write_or_link(&cfg, &dest, &init_mode, &opts)?;
     }
 
-    // ── 6. Pre-create per-user subdirs ───────────────────────────
-    // Always safe (the user owns their own subdir). Surfaces are
-    // logged so a follow-up doctor explains any failures.
     if !opts.no_create_dirs {
         let do_create = prompt::confirm(
             "Pre-create per-user subdirectories under runs_base + artifact_roots?",
@@ -180,7 +122,6 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
         }
     }
 
-    // ── 7. Install systemd agent unit ────────────────────────────
     if !opts.no_agent {
         if service::systemd_available() {
             let do_install = prompt::confirm(
@@ -199,10 +140,6 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
         }
     }
 
-    // ── 8. Run doctor ────────────────────────────────────────────
-    // Invoked as a subprocess so its non-zero exit code can't kill
-    // the success summary below. We still surface the exit status so
-    // the user sees pass/fail.
     if !opts.no_doctor {
         println!();
         println!("Running doctor against {}...", dest.display());
@@ -240,9 +177,6 @@ fn print_mode_line(mode: &InitMode) {
     }
 }
 
-/// Pick a mode interactively. Auto-resolves to Greenfield in non-
-/// interactive mode (preserving the old scripted behavior — set the
-/// mode via flag, or accept the greenfield default with `--yes`).
 fn prompt_for_mode(pmode: prompt::Mode) -> Result<InitMode> {
     if pmode == prompt::Mode::Auto {
         return Ok(InitMode::Greenfield);
@@ -280,9 +214,6 @@ fn prompt_for_mode(pmode: prompt::Mode) -> Result<InitMode> {
     })
 }
 
-/// Probe local SLURM for partition / QoS / GresTypes. Each step is
-/// best-effort: missing binary, non-SLURM cluster, or permission
-/// denied each degrade to a note rather than an error.
 fn slurm_probe() -> SlurmProbe {
     let mut probe = SlurmProbe::default();
 
@@ -348,8 +279,7 @@ fn slurm_probe() -> SlurmProbe {
 }
 
 fn apply_probe(cfg: &mut ClusterConfig, probe: &SlurmProbe) {
-    // Only fill what's empty — the foreign --from config's explicit
-    // values win.
+    // Only fill empty fields so --from values win over the local probe.
     if cfg.slurm.partition.is_none() {
         cfg.slurm.partition = probe.partition.clone();
     }
@@ -361,10 +291,6 @@ fn apply_probe(cfg: &mut ClusterConfig, probe: &SlurmProbe) {
     }
 }
 
-/// Walk through the user-editable fields, prompting with the
-/// current value as default. Greenfield and Migrate-from both flow
-/// through this — the differences are in what the defaults look
-/// like (skeleton placeholders vs. foreign config values).
 fn interactive_review(
     cfg: &mut ClusterConfig,
     mode: &InitMode,
@@ -433,13 +359,8 @@ fn interactive_review(
     Ok(())
 }
 
-/// Prompt for an Option<String> field. Differs from prompt::string
-/// in its empty-input semantics: empty = "accept current value"
-/// (which may itself be None). To clear a field that has a current
-/// value, the user types `-`. Avoids the "required" re-prompt loop
-/// that prompt::string falls into for None-default fields, which
-/// would otherwise trap a user past the SLURM section if no probe
-/// values were found and they don't want to fill it in.
+// Empty Enter accepts the current value (may be None); `-` clears.
+// prompt::string can't express "None is OK", so this is a separate primitive.
 fn optional_string(
     label: &str,
     current: &Option<String>,
@@ -467,8 +388,6 @@ fn optional_string(
     }
 }
 
-/// Where to put the cluster.toml. In Greenfield/Migrate we WRITE
-/// here; in Use/Join we SYMLINK here pointing at the source.
 fn pick_destination(
     opts: &InitOptions,
     cfg: &ClusterConfig,
@@ -524,10 +443,6 @@ fn handle_existing(dest: &Path, mode: prompt::Mode) -> Result<ExistingAction> {
     })
 }
 
-/// Write a fresh TOML (Greenfield/MigrateFrom) OR symlink/copy the
-/// source file into the destination (Use/Join). Greenfield-style
-/// header carries an explanatory comment so the user knows where
-/// the file came from when they grep for it later.
 fn write_or_link(
     cfg: &ClusterConfig,
     dest: &Path,
@@ -541,9 +456,6 @@ fn write_or_link(
 
     match mode {
         InitMode::Use(src) | InitMode::Join(src) => {
-            // For these modes the source IS the truth. The
-            // destination is just a pointer so plain `labctl <cmd>`
-            // (without `--cluster`) finds the right file.
             let src_abs = std::fs::canonicalize(src)
                 .with_context(|| format!("canonicalize {}", src.display()))?;
             if dest.exists() || dest.is_symlink() {
@@ -629,9 +541,6 @@ fn run_doctor_subprocess(cluster_path: &Path) -> Result<bool> {
     Ok(status.success())
 }
 
-/// Best-effort same-file check: canonicalize both sides and compare.
-/// Used to detect when --use/--join's source already IS the
-/// destination (idempotent re-run).
 fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(ca), Ok(cb)) => ca == cb,
@@ -648,6 +557,8 @@ fn load_lax(path: &Path) -> Result<ClusterConfig> {
 }
 
 fn skeleton_config(name: Option<&str>) -> ClusterConfig {
+    // Pre-seed canonical artifact kinds so the file round-trips through
+    // ClusterConfig::load (which bails on empty artifact_roots).
     let mut artifact_roots = BTreeMap::new();
     artifact_roots.insert("dataset".to_string(), PathBuf::from("/path/to/datasets"));
     artifact_roots.insert("checkpoint".to_string(), PathBuf::from("/path/to/checkpoints"));
@@ -671,14 +582,8 @@ fn skeleton_config(name: Option<&str>) -> ClusterConfig {
 
 fn serialize_config(cfg: &ClusterConfig, copied_from: Option<&Path>) -> Result<String> {
     let header = match copied_from {
-        Some(p) => format!(
-            "# Adapted by `labctl init --migrate-from {}` — edit paths as needed.\n\
-             # `labctl doctor` to verify writability, scheduler reachability, agent status.\n\n",
-            p.display(),
-        ),
-        None => "# Generated by `labctl init`. Edit paths as needed.\n\
-                 # `labctl doctor` to verify writability, scheduler reachability, agent status.\n\n"
-            .to_string(),
+        Some(p) => format!("# Adapted by `labctl init --migrate-from {}`.\n\n", p.display()),
+        None => "# Generated by `labctl init`.\n\n".to_string(),
     };
     let body = toml::to_string_pretty(cfg).context("serialize cluster config")?;
     Ok(format!("{header}{body}"))

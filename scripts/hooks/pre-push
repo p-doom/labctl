@@ -1,18 +1,11 @@
 #!/usr/bin/env bash
-# Run the test suite before allowing a push. Bypass for a hot WIP
-# branch with `git push --no-verify`.
-#
-# Activated for everyone in the repo via `git config core.hooksPath
-# scripts/hooks` (set by scripts/install.sh).
+# Bypass with `git push --no-verify`.
 set -e
 
 cd "$(git rev-parse --show-toplevel)"
 
-# `cargo test --all-features` turns on the `ui` feature, which uses
-# rust-embed against ui/dist/. If the frontend hasn't been built yet
-# (fresh clone, deleted dist/), embed-compile fails opaquely — do a
-# one-shot build so the failure mode is "your tests broke" rather
-# than "your frontend isn't built".
+# --all-features turns on `ui`, which rust-embeds ui/dist/. Build it
+# if missing so the failure mode is a test, not an opaque embed error.
 if [ ! -d ui/dist ]; then
   echo "→ ui/dist/ missing — running npm run build..."
   (cd ui && npm run build)
