@@ -202,7 +202,7 @@
   </div>
 </div>
 
-{#if router.selected}
+{#if router.view === "artifacts" && router.selected}
   <ArtifactPanel artifactId={router.selected} />
 {/if}
 

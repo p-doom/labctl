@@ -22,10 +22,11 @@
     const t = e.target as HTMLElement | null;
     if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
     e.preventDefault();
-    // Esc always closes. Back-through-history is reserved for the
-    // explicit back button (and Cmd+[) — using Esc for it surprised
-    // people whose stack contained a stale entry from a prior session.
-    onClose();
+    // Walk back through panel history when available; close once the
+    // stack is exhausted. The stack is scoped to a single panel-open
+    // session (see panel.svelte.ts), so there are no stale entries.
+    if (canBack && onBack) onBack();
+    else onClose();
   }
 
   onMount(() => {

@@ -172,7 +172,7 @@
   </div>
 </div>
 
-{#if router.selected && detail}
+{#if router.view === "pipelines" && router.selected && detail}
   <PipelineDetail detail={detail} />
 {/if}
 
