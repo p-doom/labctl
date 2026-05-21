@@ -623,6 +623,7 @@ dependencies = [
  "clap",
  "futures-util",
  "hex",
+ "libc",
  "mime_guess",
  "rusqlite",
  "rust-embed",

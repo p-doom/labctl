@@ -251,6 +251,15 @@ enum Command {
         /// is usually what you want for a team-rotated config.
         #[arg(long)]
         copy_config: bool,
+        /// Unix group for shared multi-user access. When set, writes
+        /// `[filesystem].shared_group = "<group>"` and creates
+        /// `runs_base` + each `artifact_roots[...]` with mode `2770` +
+        /// setgid + chgrp. Required for cross-user cache hits to read
+        /// each other's artifacts portably (without it, cross-user
+        /// reads only work if someone manually set up perms out-of-
+        /// band).
+        #[arg(long)]
+        shared_group: Option<String>,
     },
 }
 
@@ -360,6 +369,22 @@ fn main() -> Result<()> {
     if let Command::Validate { path } = &cli.command {
         return validate_path(path);
     }
+
+    // If the cluster.toml exists and configures a shared_group, drop our
+    // umask to 002 so dirs / sidecars we create inherit group-rwx and
+    // peers can write. Setgid on the artifact-root + runs_base ancestors
+    // handles group inheritance separately. The Init command runs before
+    // any cluster.toml necessarily exists, so we skip it here and apply
+    // perms explicitly in init::create_user_dirs. Validate also bypasses
+    // (handled above).
+    if !matches!(cli.command, Command::Init { .. }) {
+        if let Ok(cfg) = config::ClusterConfig::load(&cluster_path) {
+            if cfg.filesystem.shared_group.is_some() {
+                set_shared_umask();
+            }
+        }
+    }
+
     if let Command::Init {
         r#use,
         migrate_from,
@@ -376,6 +401,7 @@ fn main() -> Result<()> {
         no_agent,
         no_doctor,
         copy_config,
+        shared_group,
     } = cli.command
     {
         let mode = match (r#use, migrate_from, join) {
@@ -399,6 +425,7 @@ fn main() -> Result<()> {
             no_agent,
             no_doctor,
             copy_config,
+            shared_group,
         });
     }
     // Service install/uninstall/status only needs the cluster path
@@ -1036,6 +1063,23 @@ fn run_pipeline_command(cluster_path: &PathBuf, pipeline_path: &PathBuf) -> Resu
     println!("{}", serde_json::to_string_pretty(&submitted)?);
     Ok(())
 }
+
+/// Drop the process umask to `002` so newly-created files / dirs are
+/// group-readable+writable. Paired with `chmod 2770` + setgid on the
+/// shared roots (applied by `labctl init`): the setgid bit propagates
+/// the shared group to descendants, and umask=002 grants group rwx by
+/// default. No-op on non-Unix.
+#[cfg(unix)]
+fn set_shared_umask() {
+    // SAFETY: umask is async-signal-safe; the return value (prior
+    // umask) is discarded — we want the override unconditional.
+    unsafe {
+        libc::umask(0o002);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_shared_umask() {}
 
 /// Resolve `$USER` once. Required everywhere the CLI writes — the path-
 /// canonical layout records the invoker as a load-bearing path segment.
