@@ -75,6 +75,22 @@ declares either is a hard error.
 
 ## What labctl demands from your recipe
 
+### Inputs are read-only
+`{inputs.<role>.path}` points at the artifact's actual on-disk directory —
+which on a cross-user cache hit will live under the *producer's* user
+prefix, not yours (e.g. you submitted as `bob`, the cache hit reused
+`alice`'s prior run, so `{inputs.X.path}` resolves to
+`<artifact_root>/alice/<alias>`). With shared-group + setgid on the
+artifact roots (the standard multi-user setup), your job has read +
+write access to that directory.
+
+Do not write into it. Treat `{inputs.<role>.path}` as strictly
+read-only. A stray write — a tempfile, a `.lock`, an in-place edit —
+lands inside another user's registered artifact and silently corrupts
+shared state with no error from labctl or your filesystem.
+
+Recipes should write only under `{outputs.<role>.path}` and `{run.dir}`.
+
 ### One marker file per output
 Each `[outputs.<role>]` declares a `marker` filename. Your job must write a
 file with that name into the resolved output path. Without the marker,

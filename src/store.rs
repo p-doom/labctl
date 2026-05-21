@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    config::{ClusterConfig, Recipe},
+    config::{ClusterConfig, InputSpec, Recipe},
     fs_layout::{
         self, AliasTargetSidecar, ArtifactSidecar, ClaimOutcome, EvalRequestSidecar, EventLine,
         InputSidecar, OutputLink, PipelineSidecar, RunSidecar, TrackingSidecar,
@@ -93,6 +93,22 @@ CREATE TABLE artifact_aliases (
     alias TEXT PRIMARY KEY,
     artifact_id TEXT NOT NULL,
     created_at INTEGER NOT NULL
+);
+
+-- Per-user alias overlay onto content-addressed artifacts. An artifact
+-- (one content_hash, one id) can be referenced by multiple (user, alias,
+-- kind) tuples — e.g. Alice produces ds, Bob produces byte-identical ds
+-- with the same alias name; both get rows here pointing at the same
+-- artifact_id. Disk truth lives at
+-- `<artifact_roots[kind]>/aliases/<user>/<alias>` as a symlink to the
+-- artifact's `_objects/<prefix>/<hash>/` dir.
+CREATE TABLE artifact_user_aliases (
+    user TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (user, alias, kind)
 );
 
 CREATE TABLE run_inputs (
@@ -160,6 +176,8 @@ CREATE INDEX idx_run_inputs_path ON run_inputs(resolved_path);
 CREATE INDEX idx_run_inputs_artifact ON run_inputs(artifact_id);
 CREATE INDEX idx_run_outputs_run ON run_outputs(run_id);
 CREATE INDEX idx_aliases_artifact ON artifact_aliases(artifact_id);
+CREATE INDEX idx_user_aliases_artifact ON artifact_user_aliases(artifact_id);
+CREATE INDEX idx_user_aliases_kind ON artifact_user_aliases(kind, user);
 CREATE INDEX idx_runs_cache_key ON runs(cache_key);
 "#;
 
@@ -669,30 +687,92 @@ impl Store {
 
     // ---------- artifacts ----------
 
+    /// Register an artifact under content-addressed storage.
+    ///
+    /// `staging_path` is where the run wrote its bytes — `<artifact_root>/
+    /// <user>/<alias>/` (the legacy convention). The function:
+    ///   1. dedups by `(kind, content_hash)` — if a prior artifact has the
+    ///      same content, the staging bytes are discarded (atomic rmdir-
+    ///      if-empty / remove_dir_all on a duplicate) and a new per-user
+    ///      alias overlay is added pointing at the existing artifact.
+    ///   2. otherwise atomically `rename(2)`s the staging dir into
+    ///      `<artifact_root>/_objects/<prefix>/<content_hash>/`,
+    ///      writes the sidecar inside it, inserts the artifact row,
+    ///      and creates the per-user alias symlink + overlay row.
+    ///
+    /// Same-filesystem rename is atomic on Linux; if the staging path
+    /// and the by-hash path live on different mounts the rename returns
+    /// EXDEV and the caller gets a clear error. `labctl init`'s
+    /// shared-perms setup keeps both under the same `artifact_root`.
     pub fn insert_artifact(
         &mut self,
         kind: &str,
-        path: &Path,
+        staging_path: &Path,
         content_hash: &str,
         producer_run_id: Option<&str>,
         metadata: &Value,
     ) -> Result<ArtifactRow> {
+        let root = self
+            .artifact_roots
+            .get(kind)
+            .with_context(|| format!("kind {kind:?} not in cluster.filesystem.artifact_roots"))?
+            .clone();
+        // The staging path is <root>/<user>/<alias>/. The (user, alias)
+        // tuple becomes the first per-user overlay onto the artifact.
+        // Tolerate paths already inside _objects/ (re-registration after
+        // crash recovery): treat the by-hash dir itself as the source.
+        let user_alias = decompose_artifact_path(staging_path, &root).ok();
+
         if let Some(existing) = self.find_artifact_by_hash(kind, content_hash)? {
-            self.backfill_chain_inputs(&existing.path, &existing.id)?;
+            // Dedup: bytes already canonical. Discard the staging copy
+            // if it differs from the canonical location.
+            if staging_path != existing.path && staging_path.exists() {
+                fs::remove_dir_all(staging_path).with_context(|| {
+                    format!(
+                        "failed to remove redundant staging dir {} after \
+                         content-hash dedup matched existing {}",
+                        staging_path.display(),
+                        existing.path.display()
+                    )
+                })?;
+            }
+            // Even on dedup we may need to record a new per-user alias
+            // overlay (Bob just registered byte-identical content that
+            // Alice produced earlier).
+            if let Some((user, alias)) = user_alias.as_ref() {
+                self.add_user_alias(kind, user, alias, &existing.id, &existing.path)?;
+            }
+            self.rehydrate_inputs_by_path(&existing.path, &existing.id)?;
             return Ok(existing);
         }
-        let root = self.artifact_roots.get(kind).with_context(|| {
-            format!("kind {kind:?} not in cluster.filesystem.artifact_roots")
-        })?;
-        let (user, alias_segment) = decompose_artifact_path(path, root).with_context(|| {
-            format!(
-                "artifact path {} is not under artifact_roots[{kind}]={} as <user>/<alias>",
-                path.display(),
-                root.display()
-            )
-        })?;
+
+        // Fresh artifact. Move bytes to the by-hash slot.
+        let canonical = fs_layout::content_addressed_dir(&root, content_hash);
+        if !canonical.exists() {
+            if let Some(parent) = canonical.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create {}", parent.display())
+                })?;
+            }
+            fs::rename(staging_path, &canonical).with_context(|| {
+                format!(
+                    "failed to move staging dir {} -> {} (must be same filesystem)",
+                    staging_path.display(),
+                    canonical.display(),
+                )
+            })?;
+        } else if staging_path != canonical && staging_path.exists() {
+            // Race: another process moved bytes here first. Drop ours.
+            fs::remove_dir_all(staging_path).ok();
+        }
+
         let id = format!("artifact_{}", &content_hash[..16.min(content_hash.len())]);
         let now = util::now_ts();
+        // For artifacts produced without a (user, alias) overlay
+        // (e.g. ad-hoc rebuild flows), fall back to placeholder values
+        // in the sidecar — the row's authoritative user/alias_segment
+        // come from the artifact_user_aliases overlay rows.
+        let (user, alias_segment) = user_alias.unwrap_or_else(|| ("unknown".into(), id.clone()));
         let sidecar = ArtifactSidecar {
             id: id.clone(),
             kind: kind.to_string(),
@@ -703,8 +783,7 @@ impl Store {
             metadata: metadata.clone(),
             created_at: now,
         };
-        let meta_path = fs_layout::artifact_meta_path(root, &user, &alias_segment);
-        fs_layout::atomic_write_json(&meta_path, &sidecar)?;
+        fs_layout::atomic_write_json(&canonical.join(fs_layout::ARTIFACT_META), &sidecar)?;
 
         self.cache.execute(
             "INSERT INTO artifacts
@@ -714,7 +793,7 @@ impl Store {
             params![
                 id,
                 kind,
-                path.display().to_string(),
+                canonical.display().to_string(),
                 content_hash,
                 producer_run_id,
                 serde_json::to_string(metadata)?,
@@ -723,25 +802,59 @@ impl Store {
                 alias_segment,
             ],
         )?;
-        self.backfill_chain_inputs(path, &id)?;
+        self.add_user_alias(kind, &user, &alias_segment, &id, &canonical)?;
+        self.rehydrate_inputs_by_path(&canonical, &id)?;
         if let Some(run_id) = producer_run_id {
             self.append_event(EventLine {
                 run_id: Some(run_id.to_string()),
                 event_type: "artifact_registered".to_string(),
-                payload: json!({ "artifact_id": id, "kind": kind, "path": path }),
+                payload: json!({ "artifact_id": id, "kind": kind, "path": canonical }),
                 created_at: now,
             })?;
         }
         self.get_artifact(&id)
     }
 
-    /// Update any run_inputs rows whose `resolved_path` matches this
-    /// artifact's path but whose `artifact_id` is NULL. This is the
-    /// pipeline-stage chain edge: stage 2's input was pre-recorded
-    /// referencing stage 1's not-yet-existent output. As soon as stage 1
-    /// produces its artifact, those NULL rows get backfilled. We update
-    /// both the cache and the corresponding `inputs.json` sidecars.
-    fn backfill_chain_inputs(&self, artifact_path: &Path, artifact_id: &str) -> Result<()> {
+    /// Write a per-user alias overlay: a symlink at
+    /// `<artifact_root>/aliases/<user>/<alias>` pointing at the
+    /// artifact's canonical `_objects/<prefix>/<hash>/` dir, plus an
+    /// `artifact_user_aliases` row. Idempotent — re-adding the same
+    /// (user, alias, kind) is a no-op.
+    fn add_user_alias(
+        &self,
+        kind: &str,
+        user: &str,
+        alias: &str,
+        artifact_id: &str,
+        target: &Path,
+    ) -> Result<()> {
+        let root = self.artifact_roots.get(kind).with_context(|| {
+            format!("kind {kind:?} not in cluster.filesystem.artifact_roots")
+        })?;
+        let link = fs_layout::alias_symlink_path(root, user, alias);
+        fs_layout::create_alias_symlink(&link, target)?;
+        self.cache.execute(
+            "INSERT OR IGNORE INTO artifact_user_aliases
+             (user, alias, kind, artifact_id, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+            params![user, alias, kind, artifact_id, util::now_ts()],
+        )?;
+        Ok(())
+    }
+
+    /// Path-based rehydration: update any run_inputs rows whose
+    /// `resolved_path` matches this artifact's path but whose `artifact_id`
+    /// is NULL. Writes through cache + `inputs.json` sidecars.
+    ///
+    /// **Not the primary chain-input mechanism.** Pipeline-stage chain
+    /// wiring is done structurally via `backfill_stage_consumers` (called
+    /// from `register_outputs`, `copy_run_outputs`, and at submit time in
+    /// `runner::resolve_inputs`). This function is the narrower fallback
+    /// for *out-of-band* artifact materializations: a `register-external`
+    /// invocation, or an artifact arriving at a path some run had pre-
+    /// recorded as its `External` / non-pipeline input. Keep it for that
+    /// case; do not rely on it for pipeline correctness.
+    fn rehydrate_inputs_by_path(&self, artifact_path: &Path, artifact_id: &str) -> Result<()> {
         let path_str = artifact_path.display().to_string();
         // Find the runs whose inputs reference this path with NULL artifact_id.
         let runs: Vec<String> = {
@@ -1174,21 +1287,160 @@ impl Store {
     /// preserving role and artifact_id. Used by cache-hit submission to
     /// link existing artifacts as the new run's outputs without touching
     /// the artifacts table (so producer_run_id stays pointing at the
-    /// original producer).
+    /// original producer). After linking, walks downstream pipeline
+    /// stages and backfills any `type=stage` inputs that point at
+    /// `dest_run_id` — see `backfill_stage_consumers`.
     pub fn copy_run_outputs(&mut self, source_run_id: &str, dest_run_id: &str) -> Result<()> {
-        let rows: Vec<(String, String)> = {
-            let mut stmt = self.cache.prepare(
-                "SELECT role, artifact_id FROM run_outputs WHERE run_id = ?",
-            )?;
-            stmt.query_map(params![source_run_id], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (role, artifact_id) in rows {
-            self.link_run_output(dest_run_id, &role, &artifact_id)?;
+        let rows = self.run_output_links(source_run_id)?;
+        for (role, artifact_id) in &rows {
+            self.link_run_output(dest_run_id, role, artifact_id)?;
         }
+        self.backfill_stage_consumers(dest_run_id, &rows)?;
         Ok(())
+    }
+
+    /// `(role, artifact_id)` tuples for every output linked to `run_id`.
+    /// Sister of `run_outputs`, which returns the joined artifact rows.
+    pub fn run_output_links(&self, run_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .cache
+            .prepare("SELECT role, artifact_id FROM run_outputs WHERE run_id = ?")?;
+        Ok(stmt
+            .query_map(params![run_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Look up the artifact_id linked as `run_id`'s output for `role`.
+    /// `None` if the role is unfilled (run hasn't produced this output yet).
+    pub fn run_output_artifact_id(
+        &self,
+        run_id: &str,
+        role: &str,
+    ) -> Result<Option<String>> {
+        self.cache
+            .query_row(
+                "SELECT artifact_id FROM run_outputs WHERE run_id=? AND role=?",
+                params![run_id, role],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Set `run_inputs[(run_id, role)].artifact_id` and `resolved_path`
+    /// if and only if `artifact_id` is currently NULL. Sources
+    /// `resolved_path` from the linked artifact's actual on-disk path —
+    /// not from the consumer's `<root>/<submitter>/<alias>` prediction —
+    /// so recipe args (`{inputs.X.path}/...`) resolve at the producer's
+    /// directory. That makes cross-user cache hits work: Bob's downstream
+    /// reads from `<root>/alice/<alias>` (where the bytes live), instead
+    /// of from a path under `<root>/bob/<alias>` that was never created.
+    /// Co-requisite: artifact roots must be cross-user readable (setgid +
+    /// shared group, or equivalent).
+    ///
+    /// Writes through both the cache and the on-disk `inputs.json`
+    /// sidecar. Returns `true` if a row was actually patched. Idempotent.
+    pub fn set_run_input_artifact(
+        &self,
+        run_id: &str,
+        role: &str,
+        artifact_id: &str,
+    ) -> Result<bool> {
+        let artifact = self.get_artifact(artifact_id)?;
+        let path_str = artifact.path.display().to_string();
+        let updated = self.cache.execute(
+            "UPDATE run_inputs SET artifact_id=?, resolved_path=?
+             WHERE run_id=? AND role=? AND artifact_id IS NULL",
+            params![artifact_id, &path_str, run_id, role],
+        )?;
+        if updated == 0 {
+            return Ok(false);
+        }
+        // Mirror into inputs.json. If the sidecar isn't there yet
+        // (degenerate state mid-creation), the cache patch still stands;
+        // the next refresh from disk would clobber it, but in practice
+        // insert_run writes the sidecar before any caller can race here.
+        let user = match self.user_for_run(run_id) {
+            Ok(u) => u,
+            Err(_) => return Ok(true),
+        };
+        let inputs_path =
+            fs_layout::run_lab_dir(&self.runs_base, &user, run_id).join(fs_layout::INPUTS_JSON);
+        let mut inputs: Vec<InputSidecar> = match fs_layout::read_json_optional(&inputs_path)? {
+            Some(v) => v,
+            None => return Ok(true),
+        };
+        let mut changed = false;
+        for input in &mut inputs {
+            if input.role == role && input.artifact_id.is_none() {
+                input.artifact_id = Some(artifact_id.to_string());
+                input.resolved_path = artifact.path.clone();
+                changed = true;
+            }
+        }
+        if changed {
+            fs_layout::atomic_write_json(&inputs_path, &inputs)?;
+        }
+        Ok(true)
+    }
+
+    /// Structural pipeline-graph backfill: given a producer run that has
+    /// just had `outputs` linked (role → artifact_id), find every other
+    /// run in the same pipeline whose recipe declares
+    /// `inputs.X = {type=stage, stage=<producer.stage_name>, role=<R>}`
+    /// and set that downstream input row's artifact_id to the matching
+    /// output's artifact_id.
+    ///
+    /// This is the "downstream-already-submitted" half of the chain-input
+    /// wiring (the cache-hit / coalesced-follower path that doesn't go
+    /// through `insert_artifact`). For the "downstream-not-yet-submitted"
+    /// half, see the InputSpec::Stage branch of `runner::resolve_inputs`,
+    /// which pre-fills artifact_id at submit time when the upstream is
+    /// already satisfied.
+    ///
+    /// Only NULL run_inputs rows are touched; existing non-NULL wiring is
+    /// never overwritten. Producers outside a pipeline (no pipeline_id /
+    /// stage_name) are a no-op.
+    pub fn backfill_stage_consumers(
+        &self,
+        producer_run_id: &str,
+        outputs: &[(String, String)],
+    ) -> Result<usize> {
+        let producer = self.get_run(producer_run_id)?;
+        let (pipeline_id, stage_name) =
+            match (producer.pipeline_id.as_deref(), producer.stage_name.as_deref()) {
+                (Some(p), Some(s)) => (p.to_string(), s.to_string()),
+                _ => return Ok(0),
+            };
+        let outputs_by_role: BTreeMap<&str, &str> = outputs
+            .iter()
+            .map(|(r, a)| (r.as_str(), a.as_str()))
+            .collect();
+        let mut patched = 0;
+        for sibling in self.list_pipeline_runs(&pipeline_id)? {
+            if sibling.id == producer_run_id {
+                continue;
+            }
+            let recipe: Recipe = match serde_json::from_value(sibling.recipe_json.clone()) {
+                Ok(r) => r,
+                Err(_) => continue, // tolerate corrupt rows; cache will be rebuilt
+            };
+            for (input_role, spec) in &recipe.inputs {
+                let InputSpec::Stage { stage, role: parent_role } = spec else {
+                    continue;
+                };
+                if stage != &stage_name {
+                    continue;
+                }
+                let Some(artifact_id) = outputs_by_role.get(parent_role.as_str()) else {
+                    continue;
+                };
+                if self.set_run_input_artifact(&sibling.id, input_role, artifact_id)? {
+                    patched += 1;
+                }
+            }
+        }
+        Ok(patched)
     }
 
     fn aliases_for_run_outputs(&self, run_id: &str) -> Result<Vec<(String, String)>> {
@@ -1814,6 +2066,16 @@ fn build_in_memory_cache(
     for (root, kinds) in &roots_to_kinds {
         index_artifacts_under(root, kinds, &conn)?;
     }
+    // Walk the per-user alias overlay symlinks at
+    // `<root>/aliases/<user>/<alias>` and populate the
+    // artifact_user_aliases table. Pre-(D) artifacts (no symlinks) are
+    // surfaced by `index_artifacts_under` using their `<user>/<alias>`
+    // path; their per-user alias is implicit in the sidecar's
+    // `(user, alias)` fields and we'd want a one-shot to materialize
+    // those rows during M2 migration.
+    for (root, kinds) in &roots_to_kinds {
+        index_artifact_user_aliases_under(root, kinds, &conn)?;
+    }
     index_aliases(runs_base, &conn)?;
     index_runs(runs_base, &conn)?;
     index_eval_requests(runs_base, &conn)?;
@@ -1898,42 +2160,110 @@ fn index_artifacts_under(
     allowed_kinds: &BTreeSet<String>,
     conn: &Connection,
 ) -> Result<()> {
-    // Layout: <root>/<user>/<alias>/.meta.json for directly-produced
-    // artifacts, and <root>/<user>/<alias>/<step>/.meta.json for
-    // per-step artifacts in a checkpoint stream. We descend up to two
-    // levels under <user>/. A single root may host several artifact
-    // kinds (e.g. the checkpoints tree hosts both `checkpoint` per-step
-    // artifacts and the resolution-kind `checkpoint_stream` recipe
-    // output root); we walk the tree once and let each sidecar's
-    // declared kind decide which it is.
-    let user_dirs = match fs::read_dir(root) {
+    // Content-addressed layout: artifact bytes + sidecar live at
+    // `<root>/_objects/<prefix>/<hash>/.meta.json`. Per-user aliases
+    // are symlinks at `<root>/aliases/<user>/<alias>` and indexed
+    // separately by `index_artifact_user_aliases_under`. A single root
+    // may host several artifact kinds (checkpoints' root hosts both
+    // `checkpoint` and the `checkpoint_stream` resolution-kind output
+    // tree); each sidecar's declared kind decides which it is.
+    let objects_root = root.join(fs_layout::OBJECTS_DIR);
+    walk_objects_dir(&objects_root, allowed_kinds, conn)
+}
+
+/// Walk `<root>/_objects/<prefix>/<hash>/.meta.json` and ingest each
+/// content-addressed artifact. The prefix dir is a 2-char shard
+/// (`ab/`, `cd/`, ...) bounding directory size; we don't validate the
+/// prefix matches `hash[:2]` here — the sidecar is authoritative and
+/// any mismatch would surface as an artifact at an odd path, which is
+/// surprising but not broken.
+fn walk_objects_dir(
+    objects_root: &Path,
+    allowed_kinds: &BTreeSet<String>,
+    conn: &Connection,
+) -> Result<()> {
+    let prefix_dirs = match fs::read_dir(objects_root) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).context(format!("reading {}", root.display())),
+        Err(e) => return Err(e).context(format!("reading {}", objects_root.display())),
+    };
+    for prefix_entry in prefix_dirs {
+        let prefix_entry = prefix_entry?;
+        if !prefix_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for hash_entry in fs::read_dir(prefix_entry.path())? {
+            let hash_entry = hash_entry?;
+            if !hash_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let hash_dir = hash_entry.path();
+            if hash_dir.join(fs_layout::ARTIFACT_META).is_file() {
+                ingest_artifact_meta(&hash_dir, allowed_kinds, conn)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk `<root>/aliases/<user>/<alias>` symlinks and populate the
+/// `artifact_user_aliases` table by resolving each symlink back to a
+/// `_objects/<prefix>/<hash>/` dir, reading its sidecar to recover the
+/// artifact_id + kind, and writing the (user, alias, kind, artifact_id)
+/// row. Tolerant of dangling symlinks (skip) and wrong-kind sidecars
+/// (skip).
+fn index_artifact_user_aliases_under(
+    root: &Path,
+    allowed_kinds: &BTreeSet<String>,
+    conn: &Connection,
+) -> Result<()> {
+    let aliases_root = root.join(fs_layout::ALIASES_USER_DIR);
+    let user_dirs = match fs::read_dir(&aliases_root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context(format!("reading {}", aliases_root.display())),
     };
     for user_entry in user_dirs {
         let user_entry = user_entry?;
         if !user_entry.file_type()?.is_dir() {
             continue;
         }
+        let user = match user_entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
         for alias_entry in fs::read_dir(user_entry.path())? {
             let alias_entry = alias_entry?;
-            if !alias_entry.file_type()?.is_dir() {
+            // Per-user aliases are symlinks (created by add_user_alias).
+            // Skip anything else.
+            if !alias_entry.file_type()?.is_symlink() {
                 continue;
             }
-            let alias_path = alias_entry.path();
-            if alias_path.join(fs_layout::ARTIFACT_META).is_file() {
-                ingest_artifact_meta(&alias_path, allowed_kinds, conn)?;
+            let alias = match alias_entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Resolve the symlink to the canonical _objects dir, then
+            // read its sidecar to recover artifact_id + kind.
+            let target = match alias_entry.path().canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue, // dangling symlink
+            };
+            let sidecar_path = target.join(fs_layout::ARTIFACT_META);
+            let Some(sidecar) =
+                fs_layout::read_json_optional::<ArtifactSidecar>(&sidecar_path)?
+            else {
+                continue;
+            };
+            if !allowed_kinds.contains(&sidecar.kind) {
+                continue;
             }
-            for step_entry in fs::read_dir(&alias_path)? {
-                let step_entry = step_entry?;
-                if !step_entry.file_type()?.is_dir() {
-                    continue;
-                }
-                if step_entry.path().join(fs_layout::ARTIFACT_META).is_file() {
-                    ingest_artifact_meta(&step_entry.path(), allowed_kinds, conn)?;
-                }
-            }
+            conn.execute(
+                "INSERT OR IGNORE INTO artifact_user_aliases
+                 (user, alias, kind, artifact_id, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+                params![user, alias, sidecar.kind, sidecar.id, sidecar.created_at],
+            )?;
         }
     }
     Ok(())
@@ -2318,6 +2648,7 @@ mod tests {
                 runs_base: runs_base.to_path_buf(),
                 artifact_roots,
                 output_roots: BTreeMap::new(),
+                shared_group: None,
             },
             repos: BTreeMap::new(),
             env: BTreeMap::new(),
@@ -2488,6 +2819,586 @@ mod tests {
         // Still only A matches.
         let peer = store.find_coalesce_peer(&cache_key).unwrap().unwrap();
         assert_eq!(peer.id, "run_a");
+    }
+
+    #[test]
+    fn copy_run_outputs_backfills_downstream_stage_inputs() {
+        // Two-stage pipeline. The upstream stage's output is registered
+        // as an artifact, but the upstream run never went through
+        // insert_artifact for the new run (cache-hit path: copy_run_outputs
+        // links a pre-existing artifact). The downstream stage was
+        // submitted with a NULL run_inputs row pointing at upstream by
+        // stage+role. copy_run_outputs should backfill the NULL row.
+        let dir = tempdir().unwrap();
+        let mut roots = BTreeMap::new();
+        roots.insert("dataset".to_string(), dir.path().join("datasets"));
+        let cluster = test_cluster(dir.path(), roots.clone());
+        let mut store = Store::open(&cluster).unwrap();
+
+        // Plant the upstream's output artifact.
+        let artifact_dir = roots["dataset"].join("alice/upstream_out");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let artifact = store
+            .insert_artifact(
+                "dataset",
+                &artifact_dir,
+                &"a".repeat(64),
+                None,
+                &json!({}),
+            )
+            .unwrap();
+
+        // Upstream run (the cache-hit destination — owns the link to the
+        // pre-existing artifact via copy_run_outputs, not insert_artifact).
+        let upstream_recipe = Recipe {
+            name: "ingest".into(),
+            repo: "foo".into(),
+            command: vec!["true".into()],
+            resources: Default::default(),
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            params: BTreeMap::new(),
+            args: BTreeMap::new(),
+            env: BTreeMap::new(),
+            tracking: Default::default(),
+            sweep: None,
+        };
+        let upstream_dir = dir.path().join("runs/alice/run_upstream");
+        store
+            .insert_run(
+                NewRun {
+                    id: "run_upstream",
+                    recipe: &upstream_recipe,
+                    recipe_hash: "u",
+                    status: "created",
+                    run_dir: &upstream_dir,
+                    source_path: &upstream_dir.join("source/foo"),
+                    context_json: &json!({}),
+                    submitted_by: Some("alice"),
+                    cache_key: None,
+                },
+                &[],
+            )
+            .unwrap();
+
+        // Downstream recipe declares a type=stage input pointing at the upstream's
+        // "ds" output role.
+        let mut downstream_inputs = BTreeMap::new();
+        downstream_inputs.insert(
+            "data".to_string(),
+            InputSpec::Stage {
+                stage: "ingest".into(),
+                role: "ds".into(),
+            },
+        );
+        let downstream_recipe = Recipe {
+            name: "train".into(),
+            repo: "foo".into(),
+            command: vec!["true".into()],
+            resources: Default::default(),
+            inputs: downstream_inputs,
+            outputs: BTreeMap::new(),
+            params: BTreeMap::new(),
+            args: BTreeMap::new(),
+            env: BTreeMap::new(),
+            tracking: Default::default(),
+            sweep: None,
+        };
+        let downstream_dir = dir.path().join("runs/alice/run_downstream");
+        store
+            .insert_run(
+                NewRun {
+                    id: "run_downstream",
+                    recipe: &downstream_recipe,
+                    recipe_hash: "d",
+                    status: "created",
+                    run_dir: &downstream_dir,
+                    source_path: &downstream_dir.join("source/foo"),
+                    context_json: &json!({}),
+                    submitted_by: Some("alice"),
+                    cache_key: None,
+                },
+                &[InputResolution {
+                    role: "data".into(),
+                    artifact_id: None,
+                    resolved_path: artifact_dir.clone(),
+                }],
+            )
+            .unwrap();
+
+        // Join the two runs under one pipeline and tag the upstream's stage.
+        store.insert_pipeline("pipe_1", "demo", None).unwrap();
+        store
+            .set_pipeline_membership("run_upstream", "pipe_1", "ingest", &json!({"afterok": []}))
+            .unwrap();
+        store
+            .set_pipeline_membership(
+                "run_downstream",
+                "pipe_1",
+                "train",
+                &json!({"afterok": []}),
+            )
+            .unwrap();
+
+        // Sanity: downstream's input is currently NULL.
+        let inputs_before = store.run_inputs("run_downstream").unwrap();
+        assert_eq!(inputs_before.len(), 1);
+        assert!(inputs_before[0].artifact_id.is_none());
+
+        // The cache-hit linkage: copy_run_outputs from a synthetic
+        // prior-run row that owned the artifact, into run_upstream.
+        // For this test we shortcut by directly linking the output and
+        // then calling backfill_stage_consumers; copy_run_outputs is
+        // exercised end-to-end in the second test below.
+        store
+            .link_run_output("run_upstream", "ds", &artifact.id)
+            .unwrap();
+        store
+            .backfill_stage_consumers(
+                "run_upstream",
+                &[("ds".to_string(), artifact.id.clone())],
+            )
+            .unwrap();
+
+        let inputs_after = store.run_inputs("run_downstream").unwrap();
+        assert_eq!(
+            inputs_after[0].artifact_id.as_deref(),
+            Some(artifact.id.as_str()),
+            "downstream stage input should have been backfilled"
+        );
+
+        // Idempotent: second call doesn't churn or err.
+        store
+            .backfill_stage_consumers(
+                "run_upstream",
+                &[("ds".to_string(), artifact.id.clone())],
+            )
+            .unwrap();
+        let inputs_again = store.run_inputs("run_downstream").unwrap();
+        assert_eq!(inputs_again[0].artifact_id.as_deref(), Some(artifact.id.as_str()));
+
+        // Sidecar on disk reflects the patched id.
+        let sidecar_path = dir
+            .path()
+            .join("runs/alice/run_downstream/.lab/inputs.json");
+        let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
+        let sidecar_text = String::from_utf8_lossy(&sidecar_bytes).to_string();
+        assert!(
+            sidecar_text.contains(artifact.id.as_str()),
+            "inputs.json did not contain {}: {}",
+            artifact.id,
+            sidecar_text,
+        );
+
+        // Refresh from disk: the patched artifact_id survives a cache rebuild.
+        let store2 = Store::open(&cluster).unwrap();
+        let inputs_after_refresh = store2.run_inputs("run_downstream").unwrap();
+        assert_eq!(
+            inputs_after_refresh[0].artifact_id.as_deref(),
+            Some(artifact.id.as_str())
+        );
+    }
+
+    #[test]
+    fn insert_artifact_moves_bytes_to_objects_and_creates_alias_symlink() {
+        // M1 forward-compat: insert_artifact takes a staging dir under
+        // <root>/<user>/<alias>/, atomically moves it to
+        // <root>/_objects/<prefix>/<hash>/, and leaves the alias as a
+        // relative symlink at <root>/aliases/<user>/<alias>.
+        let dir = tempdir().unwrap();
+        let mut roots = BTreeMap::new();
+        roots.insert("dataset".to_string(), dir.path().join("datasets"));
+        let cluster = test_cluster(dir.path(), roots.clone());
+        let mut store = Store::open(&cluster).unwrap();
+
+        let staging = roots["dataset"].join("alice/ds_v1");
+        fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("payload.bin"), b"hello").unwrap();
+
+        let hash = "abcd".repeat(16);
+        let a = store
+            .insert_artifact("dataset", &staging, &hash, None, &json!({}))
+            .unwrap();
+
+        // Bytes moved into _objects/.
+        let canonical = roots["dataset"].join("_objects").join("ab").join(&hash);
+        assert!(canonical.is_dir(), "{} should be a directory", canonical.display());
+        assert!(canonical.join("payload.bin").is_file());
+        assert!(!staging.exists(), "staging dir should have been moved away");
+        assert_eq!(a.path, canonical);
+
+        // Per-user alias overlay is a relative symlink.
+        let link = roots["dataset"].join("aliases/alice/ds_v1");
+        let target = std::fs::read_link(&link).unwrap();
+        assert!(target.is_relative(), "alias symlink target should be relative: {target:?}");
+        let resolved = std::fs::canonicalize(&link).unwrap();
+        assert_eq!(resolved, canonical.canonicalize().unwrap());
+
+        // Cache rebuild from disk re-discovers the artifact at the by-
+        // hash path; the (D) layout is read by the existing walk.
+        let store2 = Store::open(&cluster).unwrap();
+        let recovered = store2.get_artifact(&a.id).unwrap();
+        assert_eq!(recovered.path, canonical);
+        assert_eq!(recovered.content_hash, hash);
+    }
+
+    #[test]
+    fn insert_artifact_dedups_same_hash_and_records_second_user_alias() {
+        // Two users register byte-identical content under different
+        // aliases. The bytes get one canonical home; both alice and bob
+        // get per-user alias symlinks pointing at it.
+        let dir = tempdir().unwrap();
+        let mut roots = BTreeMap::new();
+        roots.insert("dataset".to_string(), dir.path().join("datasets"));
+        let cluster = test_cluster(dir.path(), roots.clone());
+        let mut store = Store::open(&cluster).unwrap();
+
+        let hash = "feed".repeat(16);
+        let alice_staging = roots["dataset"].join("alice/ds");
+        fs::create_dir_all(&alice_staging).unwrap();
+        std::fs::write(alice_staging.join("a.bin"), b"x").unwrap();
+        let a1 = store
+            .insert_artifact("dataset", &alice_staging, &hash, None, &json!({}))
+            .unwrap();
+
+        let bob_staging = roots["dataset"].join("bob/ds_mine");
+        fs::create_dir_all(&bob_staging).unwrap();
+        std::fs::write(bob_staging.join("a.bin"), b"x").unwrap();
+        let a2 = store
+            .insert_artifact("dataset", &bob_staging, &hash, None, &json!({}))
+            .unwrap();
+
+        // Same artifact returned.
+        assert_eq!(a1.id, a2.id);
+        // Bob's staging dir was discarded (bytes are deduplicated).
+        assert!(!bob_staging.exists());
+        // Both per-user symlinks exist and point at the canonical dir.
+        let alice_link = roots["dataset"].join("aliases/alice/ds");
+        let bob_link = roots["dataset"].join("aliases/bob/ds_mine");
+        assert_eq!(
+            std::fs::canonicalize(&alice_link).unwrap(),
+            a1.path.canonicalize().unwrap()
+        );
+        assert_eq!(
+            std::fs::canonicalize(&bob_link).unwrap(),
+            a1.path.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn cross_user_cache_hit_patches_resolved_path_to_producer_dir() {
+        // The point of option (A): when an upstream stage cache-hits to
+        // a different user's prior run, the downstream's resolved_path
+        // must point at the producer's directory, not at a synthetic
+        // <root>/<consumer>/<alias> path that was never written to disk.
+        let dir = tempdir().unwrap();
+        let mut roots = BTreeMap::new();
+        roots.insert("dataset".to_string(), dir.path().join("datasets"));
+        let cluster = test_cluster(dir.path(), roots.clone());
+        let mut store = Store::open(&cluster).unwrap();
+
+        // Artifact lives under alice.
+        let artifact_dir = roots["dataset"].join("alice/shared_ds");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let artifact = store
+            .insert_artifact("dataset", &artifact_dir, &"c".repeat(64), None, &json!({}))
+            .unwrap();
+
+        let empty_recipe = Recipe {
+            name: "ingest".into(),
+            repo: "foo".into(),
+            command: vec!["true".into()],
+            resources: Default::default(),
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            params: BTreeMap::new(),
+            args: BTreeMap::new(),
+            env: BTreeMap::new(),
+            tracking: Default::default(),
+            sweep: None,
+        };
+
+        // Bob's "new" ingest run (cache-hit destination); the prior run
+        // it caches against is alice's.
+        let alice_prior_dir = dir.path().join("runs/alice/run_prior");
+        store
+            .insert_run(
+                NewRun {
+                    id: "run_alice_prior",
+                    recipe: &empty_recipe,
+                    recipe_hash: "u",
+                    status: "succeeded",
+                    run_dir: &alice_prior_dir,
+                    source_path: &alice_prior_dir.join("source/foo"),
+                    context_json: &json!({}),
+                    submitted_by: Some("alice"),
+                    cache_key: None,
+                },
+                &[],
+            )
+            .unwrap();
+        store
+            .link_run_output("run_alice_prior", "ds", &artifact.id)
+            .unwrap();
+
+        let bob_new_dir = dir.path().join("runs/bob/run_new");
+        store
+            .insert_run(
+                NewRun {
+                    id: "run_bob_new",
+                    recipe: &empty_recipe,
+                    recipe_hash: "u",
+                    status: "created",
+                    run_dir: &bob_new_dir,
+                    source_path: &bob_new_dir.join("source/foo"),
+                    context_json: &json!({}),
+                    submitted_by: Some("bob"),
+                    cache_key: None,
+                },
+                &[],
+            )
+            .unwrap();
+
+        // Bob's downstream stage, submitted with the consumer-predicted
+        // path (under bob's dir — which does NOT exist on disk).
+        let consumer_predicted_path = roots["dataset"].join("bob/shared_ds");
+        let mut downstream_inputs = BTreeMap::new();
+        downstream_inputs.insert(
+            "data".into(),
+            InputSpec::Stage {
+                stage: "ingest".into(),
+                role: "ds".into(),
+            },
+        );
+        let downstream_recipe = Recipe {
+            name: "train".into(),
+            repo: "foo".into(),
+            command: vec!["true".into()],
+            resources: Default::default(),
+            inputs: downstream_inputs,
+            outputs: BTreeMap::new(),
+            params: BTreeMap::new(),
+            args: BTreeMap::new(),
+            env: BTreeMap::new(),
+            tracking: Default::default(),
+            sweep: None,
+        };
+        let bob_downstream_dir = dir.path().join("runs/bob/run_downstream");
+        store
+            .insert_run(
+                NewRun {
+                    id: "run_bob_downstream",
+                    recipe: &downstream_recipe,
+                    recipe_hash: "d",
+                    status: "created",
+                    run_dir: &bob_downstream_dir,
+                    source_path: &bob_downstream_dir.join("source/foo"),
+                    context_json: &json!({}),
+                    submitted_by: Some("bob"),
+                    cache_key: None,
+                },
+                &[InputResolution {
+                    role: "data".into(),
+                    artifact_id: None,
+                    resolved_path: consumer_predicted_path.clone(),
+                }],
+            )
+            .unwrap();
+
+        // Same pipeline; bob's new run is the "ingest" stage in his
+        // pipeline (which cache-hit to alice's prior).
+        store.insert_pipeline("pipe_xuser", "demo", None).unwrap();
+        store
+            .set_pipeline_membership(
+                "run_bob_new",
+                "pipe_xuser",
+                "ingest",
+                &json!({"afterok": []}),
+            )
+            .unwrap();
+        store
+            .set_pipeline_membership(
+                "run_bob_downstream",
+                "pipe_xuser",
+                "train",
+                &json!({"afterok": []}),
+            )
+            .unwrap();
+
+        // The cache-hit move: copy alice's prior outputs into bob's new run.
+        store
+            .copy_run_outputs("run_alice_prior", "run_bob_new")
+            .unwrap();
+
+        // Bob's downstream input must point at the canonical content-
+        // addressed dir (where the bytes actually live), not at the
+        // never-written-to-disk consumer-predicted path. Under (D) this
+        // is `_objects/<prefix>/<hash>/`, accessible to any user in the
+        // shared group.
+        let inputs = store.run_inputs("run_bob_downstream").unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].artifact_id.as_deref(), Some(artifact.id.as_str()));
+        assert_eq!(inputs[0].resolved_path, artifact.path);
+        assert!(
+            inputs[0]
+                .resolved_path
+                .to_string_lossy()
+                .contains("_objects/"),
+            "resolved_path should point inside _objects/, got {:?}",
+            inputs[0].resolved_path
+        );
+        assert_ne!(inputs[0].resolved_path, consumer_predicted_path);
+
+        // Alice's per-user alias overlay is in place: a symlink from
+        // <root>/aliases/alice/shared_ds → the by-hash dir.
+        let alice_link = roots["dataset"].join("aliases/alice/shared_ds");
+        let resolved = std::fs::canonicalize(&alice_link).unwrap();
+        assert_eq!(resolved, artifact.path.canonicalize().unwrap());
+
+        // Sidecar reflects the by-hash path.
+        let sidecar_text = std::fs::read_to_string(
+            dir.path().join("runs/bob/run_bob_downstream/.lab/inputs.json"),
+        )
+        .unwrap();
+        assert!(
+            sidecar_text.contains("_objects/"),
+            "inputs.json should reference the by-hash dir, got: {sidecar_text}"
+        );
+    }
+
+    #[test]
+    fn copy_run_outputs_end_to_end_wires_chain() {
+        // Same scenario as above, but driving the whole thing through
+        // copy_run_outputs (no direct call to backfill_stage_consumers).
+        // Mirrors the register_cache_hit / reconcile_follower code paths.
+        let dir = tempdir().unwrap();
+        let mut roots = BTreeMap::new();
+        roots.insert("dataset".to_string(), dir.path().join("datasets"));
+        let cluster = test_cluster(dir.path(), roots.clone());
+        let mut store = Store::open(&cluster).unwrap();
+
+        // Plant the artifact and a "prior" producer that links it.
+        let artifact_dir = roots["dataset"].join("alice/up");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let artifact = store
+            .insert_artifact("dataset", &artifact_dir, &"b".repeat(64), None, &json!({}))
+            .unwrap();
+
+        let empty_recipe = Recipe {
+            name: "ingest".into(),
+            repo: "foo".into(),
+            command: vec!["true".into()],
+            resources: Default::default(),
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            params: BTreeMap::new(),
+            args: BTreeMap::new(),
+            env: BTreeMap::new(),
+            tracking: Default::default(),
+            sweep: None,
+        };
+        // Prior run that owns the artifact link.
+        let prior_dir = dir.path().join("runs/alice/run_prior");
+        store
+            .insert_run(
+                NewRun {
+                    id: "run_prior",
+                    recipe: &empty_recipe,
+                    recipe_hash: "u",
+                    status: "succeeded",
+                    run_dir: &prior_dir,
+                    source_path: &prior_dir.join("source/foo"),
+                    context_json: &json!({}),
+                    submitted_by: Some("alice"),
+                    cache_key: None,
+                },
+                &[],
+            )
+            .unwrap();
+        store.link_run_output("run_prior", "ds", &artifact.id).unwrap();
+
+        // New ingest run (the cache-hit destination).
+        let new_dir = dir.path().join("runs/alice/run_new");
+        store
+            .insert_run(
+                NewRun {
+                    id: "run_new",
+                    recipe: &empty_recipe,
+                    recipe_hash: "u",
+                    status: "created",
+                    run_dir: &new_dir,
+                    source_path: &new_dir.join("source/foo"),
+                    context_json: &json!({}),
+                    submitted_by: Some("alice"),
+                    cache_key: None,
+                },
+                &[],
+            )
+            .unwrap();
+
+        // Downstream stage with type=stage input.
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            "data".into(),
+            InputSpec::Stage {
+                stage: "ingest".into(),
+                role: "ds".into(),
+            },
+        );
+        let downstream_recipe = Recipe {
+            name: "train".into(),
+            repo: "foo".into(),
+            command: vec!["true".into()],
+            resources: Default::default(),
+            inputs,
+            outputs: BTreeMap::new(),
+            params: BTreeMap::new(),
+            args: BTreeMap::new(),
+            env: BTreeMap::new(),
+            tracking: Default::default(),
+            sweep: None,
+        };
+        let downstream_dir = dir.path().join("runs/alice/run_downstream");
+        store
+            .insert_run(
+                NewRun {
+                    id: "run_downstream",
+                    recipe: &downstream_recipe,
+                    recipe_hash: "d",
+                    status: "created",
+                    run_dir: &downstream_dir,
+                    source_path: &downstream_dir.join("source/foo"),
+                    context_json: &json!({}),
+                    submitted_by: Some("alice"),
+                    cache_key: None,
+                },
+                &[InputResolution {
+                    role: "data".into(),
+                    artifact_id: None,
+                    resolved_path: artifact_dir.clone(),
+                }],
+            )
+            .unwrap();
+
+        // Pipeline membership.
+        store.insert_pipeline("pipe_2", "demo", None).unwrap();
+        store
+            .set_pipeline_membership("run_new", "pipe_2", "ingest", &json!({"afterok": []}))
+            .unwrap();
+        store
+            .set_pipeline_membership(
+                "run_downstream",
+                "pipe_2",
+                "train",
+                &json!({"afterok": []}),
+            )
+            .unwrap();
+
+        // The cache-hit move: link prior's outputs into new run.
+        store.copy_run_outputs("run_prior", "run_new").unwrap();
+
+        let inputs = store.run_inputs("run_downstream").unwrap();
+        assert_eq!(inputs[0].artifact_id.as_deref(), Some(artifact.id.as_str()));
     }
 
     #[test]

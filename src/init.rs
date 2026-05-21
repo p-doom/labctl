@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     config::{ClusterConfig, FilesystemConfig, SchedulerConfig, SlurmConfig},
+    fs_layout,
     prompt,
     service,
 };
@@ -36,6 +37,12 @@ pub struct InitOptions {
     pub no_agent: bool,
     pub no_doctor: bool,
     pub copy_config: bool,
+    /// When `Some(group)`, write `[filesystem].shared_group = "<group>"`
+    /// into the config and chmod `2770` + chgrp on `runs_base` and each
+    /// `artifact_roots[...]` during dir creation. None preserves the
+    /// existing value (None for greenfield) — single-user / private
+    /// cluster setup.
+    pub shared_group: Option<String>,
 }
 
 #[derive(Default)]
@@ -77,6 +84,11 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
     }
     for (kind, path) in &opts.artifact_roots {
         cfg.filesystem.artifact_roots.insert(kind.clone(), path.clone());
+    }
+    if let Some(group) = &opts.shared_group {
+        fs_layout::validate_group(group)
+            .with_context(|| format!("invalid --shared-group {group:?}"))?;
+        cfg.filesystem.shared_group = Some(group.clone());
     }
     for (name, path) in &opts.repos {
         cfg.repos.insert(name.clone(), path.clone());
@@ -489,14 +501,46 @@ fn write_or_link(
 
 fn create_user_dirs(cfg: &ClusterConfig) -> Result<()> {
     let user = env::var("USER").unwrap_or_else(|_| "unknown".into());
-    let mut targets: Vec<PathBuf> = Vec::new();
-    targets.push(cfg.filesystem.runs_base.join("runs").join(&user));
+    // Two layers: (1) the *roots* themselves get shared perms (chmod
+    // 2770 + chgrp <shared_group>) when configured, so subsequent
+    // per-user subdirs inherit the group via setgid; (2) the per-user
+    // subdirs are created and rely on setgid for group inheritance.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    roots.push(cfg.filesystem.runs_base.join("runs"));
     for (_kind, root) in &cfg.filesystem.artifact_roots {
-        targets.push(root.join(&user));
+        roots.push(root.clone());
     }
+    let mut user_subdirs: Vec<PathBuf> =
+        roots.iter().map(|r| r.join(&user)).collect();
+    // Also create runs_base itself so the indexer doesn't have to deal
+    // with first-run-nothing-exists. The roots loop covers
+    // runs_base/runs but not runs_base, and runs_base needs the perms
+    // applied too when shared_group is on (so peer users can `cd` in).
+    roots.insert(0, cfg.filesystem.runs_base.clone());
+
     let mut created = 0usize;
     let mut failed: Vec<(PathBuf, String)> = Vec::new();
-    for t in targets {
+    for root in &roots {
+        match std::fs::create_dir_all(root) {
+            Ok(()) => {
+                if let Some(group) = &cfg.filesystem.shared_group {
+                    if let Err(e) = fs_layout::apply_shared_perms(root, group) {
+                        println!("  ✗ {}: chmod/chgrp: {e:#}", root.display());
+                        failed.push((root.clone(), format!("{e:#}")));
+                        continue;
+                    }
+                }
+                println!("  ✓ {}", root.display());
+                created += 1;
+            }
+            Err(e) => {
+                println!("  ✗ {}: {}", root.display(), e);
+                failed.push((root.clone(), e.to_string()));
+            }
+        }
+    }
+    user_subdirs.dedup();
+    for t in user_subdirs {
         match std::fs::create_dir_all(&t) {
             Ok(()) => {
                 println!("  ✓ {}", t.display());
@@ -598,6 +642,7 @@ fn skeleton_config(name: Option<&str>) -> ClusterConfig {
             runs_base: PathBuf::from("/path/to/labctl_runs"),
             artifact_roots,
             output_roots: BTreeMap::new(),
+            shared_group: None,
         },
         repos: BTreeMap::new(),
         env: BTreeMap::new(),

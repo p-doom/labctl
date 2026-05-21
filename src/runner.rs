@@ -1336,11 +1336,27 @@ fn resolve_inputs(
                             )
                         },
                     )?;
-                let resolved_path =
-                    fs_layout::artifact_dir(parent_root, submitted_by, &parent_alias);
+                // If the upstream stage has already linked its output for
+                // `parent_role` (cache-hit / cache-hit-by-coalesce satisfied
+                // during the same submit_pipeline topo walk), wire the
+                // artifact_id directly and pin `resolved_path` to the
+                // artifact's actual on-disk location — which may live
+                // under a different user's dir when the cache hit landed
+                // on a peer's prior run. Otherwise leave artifact_id NULL
+                // and fall back to the predicted-user path; the upstream
+                // will fill both in when its output materializes (via
+                // Store::insert_artifact at normal completion, or
+                // Store::copy_run_outputs → backfill_stage_consumers on
+                // cache-hit / coalesced-follower).
+                let artifact_id =
+                    store.run_output_artifact_id(parent_run_id, parent_role)?;
+                let resolved_path = match &artifact_id {
+                    Some(aid) => store.get_artifact(aid)?.path,
+                    None => fs_layout::artifact_dir(parent_root, submitted_by, &parent_alias),
+                };
                 InputResolution {
                     role: role.clone(),
-                    artifact_id: None, // backfilled by Store::insert_artifact
+                    artifact_id,
                     resolved_path,
                 }
             }
@@ -1868,6 +1884,14 @@ fn register_outputs(store: &mut Store, run: &crate::store::RunRow) -> Result<usi
     let outputs: BTreeMap<String, OutputResolution> = serde_json::from_value(outputs_value)
         .with_context(|| format!("run {} context.json 'outputs' shape mismatch", run.id))?;
     let mut count = 0;
+    // `(role, artifact_id)` for non-streaming outputs we linked this pass.
+    // Used after the loop to backfill downstream pipeline-stage consumers
+    // structurally — mirrors the wiring `copy_run_outputs` does for
+    // cache-hit / coalesced-follower. Streaming-checkpoint outputs are
+    // intentionally excluded: a downstream `type=stage` input would
+    // reference the stream root, not a specific step, so per-step
+    // artifacts have no chain-input consumer to wire.
+    let mut linked_outputs: Vec<(String, String)> = Vec::new();
     for (role, resolution) in &outputs {
         if resolution.kind == "checkpoint_stream" {
             if !resolution.path.is_dir() {
@@ -1955,8 +1979,12 @@ fn register_outputs(store: &mut Store, run: &crate::store::RunRow) -> Result<usi
             )?;
             store.link_run_output(&run.id, role, &artifact.id)?;
             store.set_alias(&resolution.alias, &artifact.id)?;
+            linked_outputs.push((role.clone(), artifact.id.clone()));
             count += 1;
         }
+    }
+    if !linked_outputs.is_empty() {
+        store.backfill_stage_consumers(&run.id, &linked_outputs)?;
     }
     Ok(count)
 }

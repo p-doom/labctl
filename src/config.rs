@@ -179,6 +179,22 @@ pub struct FilesystemConfig {
     /// whose step subdirs are registered as `checkpoint` artifacts).
     #[serde(default)]
     pub output_roots: BTreeMap<String, PathBuf>,
+    /// Optional Unix group for shared multi-user access. When set,
+    /// `labctl init` creates `runs_base` and each `artifact_roots[...]`
+    /// with mode `2770` (group rwx + setgid) and chowns them to this
+    /// group, and every labctl process calls `umask(002)` at startup so
+    /// subsequent files inherit group-rwx. Setgid on parent dirs makes
+    /// new subdirs inherit the group automatically. None disables the
+    /// shared-group mode entirely (single-user / private cluster).
+    ///
+    /// Cross-user cache hits (Bob's pipeline reusing Alice's prior run)
+    /// require group-readable artifact roots — otherwise Bob's stage gets
+    /// `EACCES` when reading from `<root>/alice/<alias>`. Setting this
+    /// field is the portable, init-time way to ensure that; without it
+    /// labctl falls back to whatever the host umask + parent-dir setgid
+    /// happen to give you.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
