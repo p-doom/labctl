@@ -482,34 +482,36 @@ def main() -> int:
         print(f"(dry run — TSV files in {args.workdir}; no \\copy executed)")
         return 0
 
-    # TRUNCATE + COPY each table in dependency-safe order. Truncate
-    # with CASCADE so FK references (none currently, but might be
-    # added later) get reset cleanly.
+    # Single-transaction load: TRUNCATE CASCADE + \copy + setval all
+    # run inside one BEGIN/COMMIT so the DEFERRABLE FKs added in 0002
+    # (runs.pipeline_id, runs.coalesced_peer_run_id, artifacts.producer_run_id,
+    # eval_requests.eval_run_id) are validated only at COMMIT — i.e.
+    # after the entire graph is loaded. Per-row checking would reject
+    # intra-batch cross-references during the COPY of `runs`.
+    #
+    # CASCADE on TRUNCATE is necessary because 0002 added FKs from
+    # coalesce_claims (not in TABLES) to runs, plus the runs<->pipelines
+    # cycle.
     pg_args = ["-h", args.pg_socket, "-d", args.pg_db, "-v", "ON_ERROR_STOP=1"]
-    truncate_sql = "TRUNCATE " + ", ".join(t.name for t in TABLES) + " RESTART IDENTITY;"
-    r = run_psql(pg_args + ["-c", truncate_sql])
+    sql_path = args.workdir / "load.sql"
+    with sql_path.open("w") as f:
+        f.write("BEGIN;\n")
+        f.write("TRUNCATE " + ", ".join(t.name for t in TABLES)
+                + ", coalesce_claims RESTART IDENTITY CASCADE;\n")
+        for t in TABLES:
+            cols = ", ".join(t.columns)
+            f.write(f"\\copy {t.name} ({cols}) FROM '{t.file}'\n")
+        # Bump the events seq to max(id)+1 (so future inserts don't
+        # collide with imported rows).
+        f.write("SELECT setval('events_id_seq', "
+                "COALESCE((SELECT MAX(id) FROM events), 1));\n")
+        f.write("COMMIT;\n")
+    r = run_psql(pg_args + ["-f", str(sql_path)])
     if r.returncode != 0:
-        print(f"TRUNCATE failed: {r.stderr}", file=sys.stderr)
+        print(f"transactional load failed: {r.stderr}", file=sys.stderr)
+        print(r.stdout, file=sys.stderr)
         return 1
-
-    for t in TABLES:
-        cols = ", ".join(t.columns)
-        copy_sql = f"\\copy {t.name} ({cols}) FROM '{t.file}'"
-        r = run_psql(pg_args + ["-c", copy_sql])
-        if r.returncode != 0:
-            print(f"\\copy {t.name} failed: {r.stderr}", file=sys.stderr)
-            return 1
-        # psql prints "COPY N" to stdout
-        rows = r.stdout.strip().split()[-1] if r.stdout else "?"
-        print(f"  {t.name}: {rows} rows")
-
-    # Bump the events seq to max(id)+1 (so future inserts don't
-    # collide with imported rows).
-    r = run_psql(pg_args + ["-c",
-        "SELECT setval('events_id_seq', COALESCE((SELECT MAX(id) FROM events), 1));"])
-    if r.returncode != 0:
-        print(f"setval events_id_seq failed: {r.stderr}", file=sys.stderr)
-        return 1
+    print(r.stdout)
 
     print("Done.")
     return 0
