@@ -32,15 +32,6 @@ use serde_json::Value;
 // ---------- subdirectory names under runs_base ----------
 
 pub const RUNS_DIR: &str = "runs";
-pub const ALIASES_DIR: &str = "aliases";
-pub const EVAL_STATE_DIR: &str = "eval_state";
-pub const PIPELINES_DIR: &str = "pipelines";
-pub const EVENTS_DIR: &str = "events";
-/// Per-cache_key claim namespace for in-flight stage coalescing. mkdir of
-/// ``<runs_base>/coalesce_claims/<cache_key>/`` is the first-writer-wins
-/// primitive that picks the producer; followers find the producer via the
-/// ``.target.json`` recorded by the claimer.
-pub const COALESCE_CLAIMS_DIR: &str = "coalesce_claims";
 
 // ---------- file names inside a run's .lab/ ----------
 
@@ -58,7 +49,6 @@ pub const SUBMIT_SH: &str = "submit.sh";
 // ---------- sidecars elsewhere ----------
 
 pub const ARTIFACT_META: &str = ".meta.json";
-pub const ALIAS_TARGET: &str = ".target.json";
 
 // ---------- path computations ----------
 
@@ -74,22 +64,9 @@ pub fn run_dir(runs_base: &Path, user: &str, run_id: &str) -> PathBuf {
     user_runs_dir(runs_base, user).join(run_id)
 }
 
-pub fn aliases_root(runs_base: &Path) -> PathBuf {
-    runs_base.join(ALIASES_DIR)
-}
-
-pub fn alias_dir(runs_base: &Path, alias: &str) -> PathBuf {
-    aliases_root(runs_base).join(alias)
-}
-
-pub fn alias_target(runs_base: &Path, alias: &str) -> PathBuf {
-    alias_dir(runs_base, alias).join(ALIAS_TARGET)
-}
-
 pub fn artifact_dir(artifact_root: &Path, user: &str, alias: &str) -> PathBuf {
     artifact_root.join(user).join(alias)
 }
-
 
 // ---------- on-disk types ----------
 
@@ -103,13 +80,6 @@ pub struct ArtifactSidecar {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer_run_id: Option<String>,
     pub metadata: Value,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AliasTargetSidecar {
-    pub artifact_id: String,
-    pub artifact_path: PathBuf,
     pub created_at: i64,
 }
 
@@ -340,11 +310,8 @@ pub fn validate_user(user: &str) -> Result<()> {
     if user.contains('/') || user.contains('\\') || user == "." || user == ".." {
         bail!("user identifier must not contain slashes or be . / ..: {user:?}");
     }
-    if matches!(
-        user,
-        RUNS_DIR | ALIASES_DIR | EVAL_STATE_DIR | PIPELINES_DIR | EVENTS_DIR
-    ) {
-        bail!("user identifier collides with a reserved subdir name: {user:?}");
+    if user == RUNS_DIR {
+        bail!("user identifier collides with the reserved subdir name: {user:?}");
     }
     Ok(())
 }

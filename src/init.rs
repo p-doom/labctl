@@ -651,7 +651,6 @@ fn skeleton_config(name: Option<&str>) -> ClusterConfig {
         slurm: SlurmConfig::default(),
         dispatch: None,
         postgres: None,
-        remote: None,
     }
 }
 

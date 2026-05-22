@@ -194,22 +194,11 @@ impl Store {
     /// owned by this Store; nothing else uses that runtime, but
     /// `block_in_place` requires multi-thread so the wrapper composes
     /// cleanly when invoked from inside an existing tokio context (e.g.
-    /// the agent or HTTP server). Creates the top-level FS subdirs so
-    /// any code path that still writes legacy sidecars (per-user alias
-    /// symlinks, artifact `_objects/` tree) has a stable layout.
+    /// the agent or HTTP server). `runs/<user>/` dirs are created lazily
+    /// at run-submission time; PG owns everything else, no top-level
+    /// scaffolding needed here.
     pub fn open(cluster: &ClusterConfig) -> Result<Self> {
         let runs_base = cluster.filesystem.runs_base.clone();
-        for sub in [
-            fs_layout::RUNS_DIR,
-            fs_layout::ALIASES_DIR,
-            fs_layout::EVAL_STATE_DIR,
-            fs_layout::PIPELINES_DIR,
-            fs_layout::EVENTS_DIR,
-            fs_layout::COALESCE_CLAIMS_DIR,
-        ] {
-            fs::create_dir_all(runs_base.join(sub))
-                .with_context(|| format!("failed to create {}/{}", runs_base.display(), sub))?;
-        }
         let artifact_roots = cluster.filesystem.artifact_roots.clone();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

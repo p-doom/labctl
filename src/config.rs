@@ -30,50 +30,6 @@ pub struct ClusterConfig {
     /// hard-fail at `Store::open` rather than silently falling back.
     #[serde(default)]
     pub postgres: Option<PgConfig>,
-    /// How OTHER clusters reach this one. Consumed only when this
-    /// config is loaded as a *foreign* cluster (e.g. `labctl
-    /// import-from-cluster <this.toml> <alias>` invoked from another
-    /// cluster). Ignored when this file is the current cluster the
-    /// CLI/daemon is running against. Cluster.toml becomes the
-    /// cluster's complete identity card — filesystem + scheduler +
-    /// reachability — distributable via git.
-    pub remote: Option<RemoteConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RemoteConfig {
-    /// SSH config alias (`~/.ssh/config`) to use for this cluster.
-    /// When set, labctl invokes `ssh <alias> ...` and ignores
-    /// `host` / `ssh_user` — your SSH config carries the complexity
-    /// (ControlMaster, ProxyJump, OTP-friendly multiplex, etc.).
-    /// Recommended for any cluster that requires OTP or non-trivial
-    /// auth: put the ControlMaster directives in `~/.ssh/config` and
-    /// labctl's repeated calls reuse one authenticated session.
-    pub ssh_alias: Option<String>,
-    /// Hostname fallback when `ssh_alias` is absent. `host` + optional
-    /// `ssh_user` get composed into `[user@]host` and passed to ssh
-    /// directly. Suitable only for simple, key-auth-friendly hosts.
-    pub host: Option<String>,
-    pub ssh_user: Option<String>,
-}
-
-impl RemoteConfig {
-    /// The argument to pass to `ssh` / `rsync -e ssh`. Prefers
-    /// `ssh_alias` (so the user's `~/.ssh/config` is the source of
-    /// truth for everything else); otherwise composes `[user@]host`.
-    pub fn ssh_target(&self) -> Result<String> {
-        if let Some(alias) = &self.ssh_alias {
-            return Ok(alias.clone());
-        }
-        let host = self
-            .host
-            .as_ref()
-            .context("cluster.toml [remote] needs either ssh_alias or host")?;
-        match &self.ssh_user {
-            Some(user) => Ok(format!("{user}@{host}")),
-            None => Ok(host.clone()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

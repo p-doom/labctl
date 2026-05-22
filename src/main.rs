@@ -7,7 +7,6 @@ mod init;
 mod pg_store;
 mod prompt;
 mod provenance;
-mod remote;
 mod runner;
 #[cfg(feature = "ui")]
 mod server;
@@ -107,34 +106,6 @@ enum Command {
         path: PathBuf,
         #[arg(long, default_value = "external")]
         kind: String,
-    },
-    /// Import a foreign cluster's artifact into the local registry.
-    /// Reads the foreign alias + meta sidecars over SSH, rsyncs the
-    /// bytes into the local artifact_root, and registers a local
-    /// artifact row that preserves the foreign content hash (so
-    /// re-importing the same bytes dedupes) and records lineage. The
-    /// foreign cluster.toml must declare a [remote] section. OTP-gated
-    /// hosts work transparently when ControlMaster is configured in
-    /// `~/.ssh/config` — see docs/ONBOARDING.md.
-    ImportFromCluster {
-        /// Path to the foreign cluster's cluster.toml. Must contain a
-        /// [remote] section so labctl knows how to reach it.
-        #[arg(long)]
-        foreign: PathBuf,
-        /// Alias on the foreign cluster to resolve and import.
-        #[arg(long)]
-        from: String,
-        /// Local alias to bind the imported artifact to. Defaults to
-        /// the foreign alias name. Use this to avoid collisions or to
-        /// namespace ("julich_<alias>") imports.
-        #[arg(long)]
-        r#as: Option<String>,
-        /// Skip the rsync of the artifact bytes. Registers a
-        /// metadata-only stub at the local destination. Use only if
-        /// you're staging the bytes out-of-band (a shared mount,
-        /// manual rsync, etc.).
-        #[arg(long)]
-        no_copy: bool,
     },
     Evald {
         #[command(subcommand)]
@@ -563,23 +534,6 @@ fn main() -> Result<()> {
             println!("artifact_id: {}", artifact.id);
             println!("alias: {alias}");
         }
-        Command::ImportFromCluster {
-            foreign,
-            from,
-            r#as,
-            no_copy,
-        } => {
-            let foreign_cluster = config::ClusterConfig::load(&foreign)?;
-            let report = artifacts::import_from_cluster(
-                &cluster,
-                &store,
-                &foreign_cluster,
-                &from,
-                r#as.as_deref(),
-                !no_copy,
-            )?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
         Command::BackfillTracking => {
             let report = tracking::backfill(&cluster, &store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -802,17 +756,6 @@ fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
             ),
         }
 
-        // [remote] is consumed only when this config is loaded as a
-        // FOREIGN cluster (cross-cluster imports). When auditing one,
-        // confirm we can actually reach it from here — catches typos
-        // in the ssh_alias / host field, dead jump hosts, and lapsed
-        // ControlMaster sessions before the user hits them mid-import.
-        if let Some(r) = &cluster.remote {
-            match remote::probe_reachability(r) {
-                Ok(detail) => emit("remote reachability", true, &detail),
-                Err(detail) => emit("remote reachability", false, &detail),
-            }
-        }
     }
 
     let systemd_ok = service::systemd_available();
