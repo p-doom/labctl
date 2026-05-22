@@ -257,37 +257,25 @@ fn register_cache_hit(
 }
 
 /// Resolve a pipeline's ``from`` historical pin to a role-keyed map of
-/// artifact rows. Fast path uses the registry; if the row is missing
-/// (cache wasn't rebuilt or run was registered by another user), falls
-/// back to scanning ``runs/<user>/<from_id>/.lab/context.json`` on disk.
-/// Rejects pinning to non-succeeded runs — pinning to in-flight or failed
-/// runs is almost always a mistake.
+/// artifact rows. Rejects pinning to non-succeeded runs — pinning to
+/// in-flight or failed runs is almost always a mistake.
 fn resolve_from(
-    cluster: &ClusterConfig,
+    _cluster: &ClusterConfig,
     store: &Store,
     from_id: &str,
 ) -> Result<BTreeMap<String, ArtifactRow>> {
-    if let Ok(run) = store.get_run(from_id) {
-        match run.status.as_str() {
-            "succeeded" | "cache_hit" => {}
-            other => bail!(
-                "from = {from_id:?}: pinned run is {other:?}; pin only to runs that \
-                 succeeded or cache-hit a prior succeeded run"
-            ),
-        }
-        let outputs = store.run_outputs(from_id)?;
-        return key_outputs_by_role(from_id, outputs);
+    let run = store
+        .get_run(from_id)
+        .with_context(|| format!("from = {from_id:?}: no such run"))?;
+    match run.status.as_str() {
+        "succeeded" | "cache_hit" => {}
+        other => bail!(
+            "from = {from_id:?}: pinned run is {other:?}; pin only to runs that \
+             succeeded or cache-hit a prior succeeded run"
+        ),
     }
-
-    let runs_base = &cluster.filesystem.runs_base;
-    if let Some(ctx) = scan_context_json_for_run(runs_base, from_id)? {
-        return outputs_from_context(store, from_id, &ctx);
-    }
-
-    bail!(
-        "from = {from_id:?}: no registry row and no on-disk context.json found under {}",
-        runs_base.display()
-    )
+    let outputs = store.run_outputs(from_id)?;
+    key_outputs_by_role(from_id, outputs)
 }
 
 fn key_outputs_by_role(
@@ -311,78 +299,6 @@ fn key_outputs_by_role(
         by_role.insert(role, art);
     }
     Ok(by_role)
-}
-
-fn scan_context_json_for_run(runs_base: &Path, from_id: &str) -> Result<Option<Value>> {
-    let runs_root = fs_layout::runs_root(runs_base);
-    let entries = match fs::read_dir(&runs_root) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("failed to read runs/ root"),
-    };
-    for user_entry in entries {
-        let user_entry = user_entry?;
-        if !user_entry.file_type()?.is_dir() {
-            continue;
-        }
-        let candidate = user_entry
-            .path()
-            .join(from_id)
-            .join(fs_layout::LAB_DIRNAME)
-            .join(fs_layout::CONTEXT_JSON);
-        match fs::read_to_string(&candidate) {
-            Ok(text) => {
-                let value: Value = serde_json::from_str(&text).with_context(|| {
-                    format!("failed to parse {}", candidate.display())
-                })?;
-                return Ok(Some(value));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("failed to read {}", candidate.display()))
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn outputs_from_context(
-    store: &Store,
-    from_id: &str,
-    ctx: &Value,
-) -> Result<BTreeMap<String, ArtifactRow>> {
-    let outputs_value = ctx.get("outputs").with_context(|| {
-        format!("from = {from_id:?}: recovered context.json has no `outputs` field")
-    })?;
-    let by_role: BTreeMap<String, OutputResolution> =
-        serde_json::from_value(outputs_value.clone()).with_context(|| {
-            format!("from = {from_id:?}: context.json `outputs` shape mismatch")
-        })?;
-    let mut artifacts = BTreeMap::new();
-    for (role, resolution) in by_role {
-        let marker_path = resolution.path.join(&resolution.marker);
-        if !marker_path.exists() {
-            bail!(
-                "from = {from_id:?}: output role {role:?} is missing its marker file {} \
-                 — pin target's outputs are not materialized on disk",
-                marker_path.display()
-            );
-        }
-        let art = store
-            .find_artifact_by_path(&resolution.kind, &resolution.path)?
-            .with_context(|| {
-                format!(
-                    "from = {from_id:?}: output role {role:?} (kind={:?}, path={}) is \
-                     not registered in the artifacts table — was the artifact moved or \
-                     scrubbed?",
-                    resolution.kind,
-                    resolution.path.display(),
-                )
-            })?;
-        artifacts.insert(role, art);
-    }
-    Ok(artifacts)
 }
 
 /// Claim the coalesce slot for this cache_key. Returns ``Ok(Some(follower))``

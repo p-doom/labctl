@@ -120,7 +120,6 @@ pub fn serve(cluster: ClusterConfig, store: Store, addr: SocketAddr) -> Result<(
         .route("/stream", get(stream_handler));
 
     let tail_store = state.store.clone();
-    let refresh_store = state.store.clone();
     let app = Router::new()
         .nest("/api", api)
         .fallback(static_handler)
@@ -133,18 +132,10 @@ pub fn serve(cluster: ClusterConfig, store: Store, addr: SocketAddr) -> Result<(
         .context("failed to build tokio runtime")?;
 
     runtime.block_on(async move {
-        // Background task: tail the in-process events table for SSE
-        // subscribers. Since dispatch and the HTTP handlers share one
-        // Store in this process, dispatch writes are immediately
-        // visible — the tailer just queries the cache for new rows
-        // since its last cursor.
+        // Background task: tail the events table for SSE subscribers.
+        // Since the store is PG-backed and authoritative, the tailer
+        // sees writes from every process (CLI, agent, this UI) at once.
         tokio::spawn(events_tailer(tail_store, events_tx));
-
-        // Background task: re-walk the filesystem-truth registry on a
-        // timer so the in-memory cache stays current with sidecars
-        // written by out-of-process CLI invocations (`labctl run`,
-        // `labctl run-pipeline`) and by the per-user `labctl agent`.
-        tokio::spawn(crate::agent::periodic_refresh(refresh_store, Duration::from_secs(10)));
 
         let listener = tokio::net::TcpListener::bind(addr)
             .await

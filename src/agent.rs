@@ -1,6 +1,4 @@
-//! Per-user dispatch loops: reconcile + evald + throttle, plus the
-//! periodic filesystem→cache refresh task that keeps the in-memory
-//! cache aligned with sidecars written by other processes.
+//! Per-user dispatch loops: reconcile + evald + throttle.
 //!
 //! Run inside the standalone `labctl agent` process (no HTTP listener)
 //! — auto-installed as `labctl-agent.service` by `labctl init`. The UI
@@ -39,58 +37,6 @@ use crate::{
     store::Store,
     util,
 };
-
-/// Periodically re-walk the registry from disk so the cache reflects
-/// sidecars written by other processes (CLI submissions, other users'
-/// daemons in a multi-tenant deployment).
-///
-/// The work is split into three phases so the Store's std::Mutex is
-/// held only for microseconds at a time — never for the duration of
-/// the slow filesystem walk:
-///
-///   1. **Snapshot** (brief lock): copy `runs_base` / `artifact_roots`
-///      out of the Store, plus the live events table. ~ms.
-///   2. **Build** (no lock): on a blocking thread, construct a fresh
-///      in-memory SQLite cache from disk, then re-insert the
-///      preserved events (with their original ids so the SSE tailer's
-///      cursor stays valid). This is the 1-5s walk; concurrent HTTP
-///      readers and dispatch writers proceed normally because no lock
-///      is held during it.
-///   3. **Swap** (brief lock): atomically replace the Store's cache
-///      field with the new Connection. The previous Connection is
-///      dropped at the end of this scope. ~microseconds.
-///
-/// Net effect: a /api/runs request is no longer occasionally stuck
-/// behind a 1-5s refresh; reads consistently hit the cache directly.
-pub async fn periodic_refresh(store: Arc<Mutex<Store>>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Drop the first tick — the indexer just ran during `Store::open`.
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        let store = store.clone();
-        let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            // Phase 1 — brief lock.
-            let (runs_base, artifact_roots, events) = {
-                let s = store.lock().unwrap();
-                let (rb, ar) = s.snapshot_paths();
-                let ev = s.snapshot_events()?;
-                (rb, ar, ev)
-            };
-            // Phase 2 — no lock; this is the 1-5s filesystem walk.
-            let new_cache = Store::build_disk_snapshot(&runs_base, &artifact_roots, &events)?;
-            // Phase 3 — brief lock for the swap.
-            store.lock().unwrap().replace_cache(new_cache);
-            Ok(())
-        });
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("periodic_refresh: refresh failed: {e:#}"),
-            Err(e) => eprintln!("periodic_refresh: join failed: {e}"),
-        }
-    }
-}
 
 /// Spawn reconcile + evald + gc tokio tasks. Returns immediately; the
 /// tasks live until `shutdown` fires. With no `[dispatch]` block
@@ -160,7 +106,6 @@ pub fn run_standalone(cluster: ClusterConfig, store: Store) -> Result<()> {
     runtime.block_on(async move {
         let store = Arc::new(Mutex::new(store));
         let shutdown = Arc::new(Notify::new());
-        tokio::spawn(periodic_refresh(store.clone(), Duration::from_secs(10)));
         spawn(Arc::new(cluster), store.clone(), shutdown.clone());
         eprintln!("labctl agent running (no HTTP listener; ctrl-c to stop)");
         let _ = tokio::signal::ctrl_c().await;

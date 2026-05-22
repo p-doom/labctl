@@ -961,6 +961,52 @@ impl PgStore {
         Ok(())
     }
 
+    /// Bulk-patch run_inputs whose resolved_path matches `path` and whose
+    /// artifact_id is NULL — the operation that lights up `inputs.artifact_id`
+    /// once an artifact materializes at a path runs were waiting on.
+    pub async fn rehydrate_inputs_by_path(
+        &self,
+        path: &str,
+        artifact_id: &str,
+    ) -> Result<usize> {
+        let result = sqlx::query(
+            "UPDATE run_inputs SET artifact_id = $1 \
+             WHERE resolved_path = $2 AND artifact_id IS NULL",
+        )
+        .bind(artifact_id)
+        .bind(path)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("rehydrate_inputs_by_path({path})"))?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    /// Insert a per-user alias overlay row. Idempotent — re-adding the same
+    /// (user, alias, kind) tuple is a no-op so callers don't have to track
+    /// which overlays already exist.
+    pub async fn add_user_alias(
+        &self,
+        user: &str,
+        alias: &str,
+        kind: &str,
+        artifact_id: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO artifact_user_aliases (\"user\", alias, kind, artifact_id, created_at) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (\"user\", alias, kind) DO NOTHING",
+        )
+        .bind(user)
+        .bind(alias)
+        .bind(kind)
+        .bind(artifact_id)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("add_user_alias({user}, {alias}, {kind})"))?;
+        Ok(())
+    }
+
     /// Set `run_inputs[(run_id, role)].artifact_id` and `resolved_path`
     /// iff currently NULL. DB-only mirror of the SQLite helper of the
     /// same name. Returns `true` if a row was actually patched.
@@ -1311,6 +1357,73 @@ impl PgStore {
         .await
         .with_context(|| format!("set_tracking({run_id})"))?;
         Ok(())
+    }
+
+    // ---------- additional reads needed by the sync Store facade ----------
+
+    pub async fn artifacts_by_kind(&self, kind: &str) -> Result<Vec<ArtifactRow>> {
+        let rows = sqlx::query(&format!(
+            "{ARTIFACT_SELECT_BASE} WHERE kind = $1 ORDER BY created_at ASC"
+        ))
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("artifacts_by_kind({kind})"))?;
+        rows.into_iter().map(row_to_artifact).collect()
+    }
+
+    /// Artifacts of a given kind whose producing run was submitted by
+    /// `user`. Externally-registered artifacts (no producer run) are
+    /// excluded — they have no owner attribution.
+    pub async fn artifacts_by_kind_for_producer_user(
+        &self,
+        kind: &str,
+        user: &str,
+    ) -> Result<Vec<ArtifactRow>> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.kind, a.path, a.content_hash, a.producer_run_id,
+                    a.metadata_json, a.created_at
+             FROM artifacts a
+             JOIN runs r ON a.producer_run_id = r.id
+             WHERE a.kind = $1 AND r.submitted_by = $2
+             ORDER BY a.created_at ASC",
+        )
+        .bind(kind)
+        .bind(user)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("artifacts_by_kind_for_producer_user({kind}, {user})"))?;
+        rows.into_iter().map(row_to_artifact).collect()
+    }
+
+    /// Returns `(status, created_at)` tuples for the most recent `limit`
+    /// runs of this recipe, oldest-first (legacy reverses after LIMIT).
+    pub async fn recipe_history(
+        &self,
+        recipe_name: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT status, created_at FROM runs
+             WHERE recipe_name = $1
+             ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(recipe_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("recipe_history({recipe_name})"))?;
+        let mut out: Vec<(String, i64)> = rows
+            .into_iter()
+            .map(|r| {
+                Ok::<_, anyhow::Error>((
+                    r.try_get::<String, _>("status")?,
+                    r.try_get::<i64, _>("created_at")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        out.reverse();
+        Ok(out)
     }
 }
 
