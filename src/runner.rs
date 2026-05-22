@@ -1760,25 +1760,11 @@ fn render_script(
     script.push_str(
         "\nrc=$?\n",
     );
-    // Producer-side hashing: emit a {role: dir_content_hash} manifest
-    // next to context.json. register_outputs prefers it over re-walking
-    // outputs on the login side — cache-hot reads + compute-side
-    // parallelism beat agent-side serial walks. Best-effort: on any
-    // failure (manifest write race, binary missing, etc.) we still exit
-    // with the user command's rc and the agent falls back to walk-and-
-    // hash. The user's exit code is preserved.
-    let labctl_bin = std::env::current_exe()
-        .context("current_exe()")?
-        .display()
-        .to_string();
-    script.push_str(&format!(
-        "if [ \"$rc\" -eq 0 ]; then {} hash-outputs --run-dir {} || true; fi\n",
-        util::shell_quote(&labctl_bin),
-        util::shell_quote(&run_dir.display().to_string()),
-    ));
     script.push_str("exit \"$rc\"\n");
     // sacct is the sole source of truth for job state; bash wrapper exits
     // with the user command's rc and SLURM/sacct records the outcome.
+    // Compute has no PG-bound responsibilities — outputs land at their
+    // declared paths and login-side reconcile walks + registers them.
     Ok(script)
 }
 
@@ -1994,22 +1980,6 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
     };
     let outputs: BTreeMap<String, OutputResolution> = serde_json::from_value(outputs_value)
         .with_context(|| format!("run {} context.json 'outputs' shape mismatch", run.id))?;
-    // Producer-side hash manifest: emitted by the sbatch wrapper via
-    // `labctl hash-outputs` after the user command succeeds. Best-effort
-    // — absent or malformed manifest falls back to walking + hashing
-    // here on the login side. The hash function is identical
-    // (`util::dir_content_hash`), so a manifest entry is binary
-    // interchangeable with a re-walk.
-    let manifest: BTreeMap<String, String> = {
-        let path = run
-            .run_dir
-            .join(fs_layout::LAB_DIRNAME)
-            .join("output_hashes.json");
-        match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-            Err(_) => BTreeMap::new(),
-        }
-    };
     let mut count = 0;
     // `(role, artifact_id)` for non-streaming outputs we linked this pass.
     // Used after the loop to backfill downstream pipeline-stage consumers
@@ -2049,28 +2019,20 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
                     continue;
                 }
                 // Short-circuit: if we've already registered an artifact
-                // for exactly this path, skip the multi-GB SHA-256 walk.
-                // Each per-step checkpoint dir is path-unique (the orbax
-                // ``<step>`` subdir is a content-stable artifact), so
-                // path-equality is a sound dedup key here.
+                // for exactly this path, skip re-insert. Each per-step
+                // checkpoint dir is path-unique (the orbax ``<step>``
+                // subdir is a content-stable artifact), and `Store::
+                // insert_artifact` derives the id from that path
+                // canonically — so an existing row at this path would
+                // satisfy a fresh insert too, but skipping avoids the
+                // PG round-trip.
                 if let Some(existing) = store.find_artifact_by_path("checkpoint", &step_dir)? {
                     store.link_run_output(&run.id, role, &existing.id)?;
                     continue;
                 }
-                // Use a path-based identity hash, not dir contents. Orbax
-                // writes each step dir atomically (tmp + rename) and the
-                // ``_CHECKPOINT_METADATA`` marker is the completion barrier,
-                // so once the marker exists the path uniquely identifies a
-                // content-stable artifact. Hashing the multi-GB tensor
-                // payload added no information and was the dominant cost
-                // of every reconcile pass. Same identity scheme used by
-                // ``register-external``.
-                let canonical = step_dir.canonicalize().unwrap_or_else(|_| step_dir.clone());
-                let content_hash = util::sha256_bytes(canonical.display().to_string().as_bytes());
                 let artifact = store.insert_artifact(
                     "checkpoint",
                     &step_dir,
-                    &content_hash,
                     Some(&run.id),
                     &json!({
                         "role": role,
@@ -2091,10 +2053,6 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
             if !ready {
                 continue;
             }
-            let content_hash = match manifest.get(role) {
-                Some(h) => h.clone(),
-                None => util::dir_content_hash(&resolution.path)?,
-            };
             let mut metadata = json!({
                 "role": role,
                 "producer_recipe": run.recipe_name,
@@ -2112,7 +2070,6 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
             let artifact = store.insert_artifact(
                 &resolution.kind,
                 &resolution.path,
-                &content_hash,
                 Some(&run.id),
                 &metadata,
             )?;

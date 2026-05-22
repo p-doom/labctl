@@ -46,7 +46,6 @@ EVAL_REQUEST_JSON = "request.json"
 ALIAS_TARGET = ".target.json"
 META_FILENAME = ".meta.json"
 OBJECTS_DIR = "_objects"
-ALIASES_USER_DIR = "aliases"
 
 
 # Per-table TSV writers. We sidestep PG's default DELIMITER vs. JSON
@@ -84,7 +83,6 @@ class Counts:
     pipelines: int = 0
     artifacts: int = 0
     artifact_aliases: int = 0
-    artifact_user_aliases: int = 0
     run_inputs: int = 0
     run_outputs: int = 0
     eval_requests: int = 0
@@ -230,65 +228,49 @@ def emit_pipelines(runs_base: Path, w_pipelines, counts: Counts):
             counts.pipelines += 1
 
 
-def emit_artifacts_and_user_aliases(
-    artifact_roots: dict[str, Path], w_artifacts, w_user_aliases, counts: Counts
+def emit_artifacts(
+    artifact_roots: dict[str, Path], w_artifacts, counts: Counts
 ):
+    """Walk the legacy `_objects/<prefix>/<hash>/` trees populated by the
+    pre-c1d31e8 content-addressed code and emit one `artifacts` row per
+    sidecar. `<root>/<user>/<alias>/` (the post-c1d31e8 layout) is walked
+    via the run's `outputs.json` sidecars at run-import time, not here —
+    the producer's own bookkeeping is the canonical source for that
+    layout. `content_hash` is preserved from the sidecar for legacy
+    rows (the column is still NULLable post-0004 but we have a value
+    here, so we use it).
+    """
     seen_roots = set()
-    for kind, root in artifact_roots.items():
+    for _kind, root in artifact_roots.items():
         if root in seen_roots:
             continue
         seen_roots.add(root)
 
         objects_root = root / OBJECTS_DIR
-        if objects_root.is_dir():
-            for prefix_dir in sorted(objects_root.iterdir()):
-                if not prefix_dir.is_dir():
+        if not objects_root.is_dir():
+            continue
+        for prefix_dir in sorted(objects_root.iterdir()):
+            if not prefix_dir.is_dir():
+                continue
+            for hash_dir in sorted(prefix_dir.iterdir()):
+                if not hash_dir.is_dir():
                     continue
-                for hash_dir in sorted(prefix_dir.iterdir()):
-                    if not hash_dir.is_dir():
-                        continue
-                    sidecar = read_json_optional(hash_dir / META_FILENAME)
-                    if sidecar is None:
-                        continue
-                    w_artifacts.writerow([
-                        tsv_escape(sidecar["id"]),
-                        tsv_escape(sidecar["kind"]),
-                        tsv_escape(str(hash_dir)),
-                        tsv_escape(sidecar["content_hash"]),
-                        tsv_escape(sidecar.get("producer_run_id")),
-                        json_field(sidecar["metadata"]),
-                        tsv_escape(sidecar["created_at"]),
-                        tsv_escape(sidecar["user"]),
-                        tsv_escape(sidecar["alias"]),
-                    ])
-                    counts.artifacts += 1
-                    observe_user(counts, sidecar.get("user"), sidecar.get("created_at"))
-
-        # Per-user alias overlay symlinks.
-        aliases_root = root / ALIASES_USER_DIR
-        if aliases_root.is_dir():
-            for user_dir in sorted(aliases_root.iterdir()):
-                if not user_dir.is_dir():
+                sidecar = read_json_optional(hash_dir / META_FILENAME)
+                if sidecar is None:
                     continue
-                for entry in sorted(user_dir.iterdir()):
-                    if not entry.is_symlink():
-                        continue
-                    try:
-                        target = entry.resolve()
-                    except OSError:
-                        continue
-                    sidecar = read_json_optional(target / META_FILENAME)
-                    if sidecar is None:
-                        continue
-                    w_user_aliases.writerow([
-                        tsv_escape(user_dir.name),
-                        tsv_escape(entry.name),
-                        tsv_escape(sidecar["kind"]),
-                        tsv_escape(sidecar["id"]),
-                        tsv_escape(sidecar["created_at"]),
-                    ])
-                    counts.artifact_user_aliases += 1
-                    observe_user(counts, user_dir.name, sidecar.get("created_at"))
+                w_artifacts.writerow([
+                    tsv_escape(sidecar["id"]),
+                    tsv_escape(sidecar["kind"]),
+                    tsv_escape(str(hash_dir)),
+                    tsv_escape(sidecar.get("content_hash")),
+                    tsv_escape(sidecar.get("producer_run_id")),
+                    json_field(sidecar["metadata"]),
+                    tsv_escape(sidecar["created_at"]),
+                    tsv_escape(sidecar["user"]),
+                    tsv_escape(sidecar["alias"]),
+                ])
+                counts.artifacts += 1
+                observe_user(counts, sidecar.get("user"), sidecar.get("created_at"))
 
 
 def emit_global_aliases(runs_base: Path, w_aliases, counts: Counts):
@@ -377,10 +359,9 @@ class TableSpec:
 
 TABLES = [
     # Users must be loaded FIRST: migration 0003 added FKs from
-    # runs.submitted_by, pipelines."user", artifacts."user",
-    # artifact_user_aliases."user", and eval_requests."user" to
-    # users.name. Every downstream COPY validates against rows already
-    # present here.
+    # runs.submitted_by, pipelines."user", artifacts."user", and
+    # eval_requests."user" to users.name. Every downstream COPY
+    # validates against rows already present here.
     TableSpec("users", ["name", "created_at", "pg_role"]),
     TableSpec(
         "runs",
@@ -398,10 +379,6 @@ TABLES = [
          "metadata_json", "created_at", '"user"', "alias_segment"],
     ),
     TableSpec("artifact_aliases", ["alias", "artifact_id", "created_at"]),
-    TableSpec(
-        "artifact_user_aliases",
-        ['"user"', "alias", "kind", "artifact_id", "created_at"],
-    ),
     TableSpec("run_inputs", ["run_id", "role", "artifact_id", "resolved_path"]),
     TableSpec("run_outputs", ["run_id", "role", "artifact_id"]),
     TableSpec(
@@ -486,10 +463,9 @@ def main() -> int:
             counts,
         )
         emit_pipelines(runs_base, writers["pipelines"], counts)
-        emit_artifacts_and_user_aliases(
+        emit_artifacts(
             artifact_roots,
             writers["artifacts"],
-            writers["artifact_user_aliases"],
             counts,
         )
         emit_global_aliases(runs_base, writers["artifact_aliases"], counts)
@@ -516,7 +492,6 @@ def main() -> int:
 
     print(f"emitted: users={counts.users} runs={counts.runs} pipelines={counts.pipelines} "
           f"artifacts={counts.artifacts} artifact_aliases={counts.artifact_aliases} "
-          f"artifact_user_aliases={counts.artifact_user_aliases} "
           f"run_inputs={counts.run_inputs} run_outputs={counts.run_outputs} "
           f"eval_requests={counts.eval_requests} tracking={counts.tracking} "
           f"events={counts.events}")
