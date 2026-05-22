@@ -16,7 +16,7 @@ mod template;
 mod tracking;
 mod util;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -118,6 +118,16 @@ enum Command {
     /// output rows. Recovers runs whose outputs went unregistered because
     /// of the pre-fix terminal-transition bug. Idempotent.
     RecoverOutputs,
+    /// Producer-side output hashing. Invoked by the sbatch wrapper on
+    /// the compute node after the user command succeeds: walks each
+    /// declared output path, computes its dir_content_hash, and writes
+    /// `<run_dir>/.lab/output_hashes.json` as a `{role: hash}` map.
+    /// register_outputs prefers this manifest over re-walking on the
+    /// login side. No PG access — reads context.json from disk.
+    HashOutputs {
+        #[arg(long)]
+        run_dir: PathBuf,
+    },
     /// Recompute `finished_at` for terminal runs from sacct's End field.
     /// Use this after upgrading past the bug where finished_at was set
     /// to wall-clock time at reconcile observation rather than the
@@ -469,6 +479,13 @@ fn main() -> Result<()> {
     // the daemon owns every write. CLI invocations on a shared registry
     // would race on POSIX locks (broken on parallel filesystems) and
     // corrupt the DB.
+    // HashOutputs is invoked from the sbatch wrapper on a compute node.
+    // Compute has no PG access, so this subcommand reads `<run_dir>/.lab/
+    // context.json` directly and walks the declared output paths. No
+    // cluster config required.
+    if let Command::HashOutputs { run_dir } = &cli.command {
+        return hash_outputs_command(run_dir);
+    }
     if let Command::Run { recipe } = &cli.command {
         return run_recipe_command(&cluster_path, recipe);
     }
@@ -566,6 +583,7 @@ fn main() -> Result<()> {
         Command::Validate { .. }
         | Command::Service { .. }
         | Command::Doctor
+        | Command::HashOutputs { .. }
         | Command::Run { .. }
         | Command::RunSweep { .. }
         | Command::RunPipeline { .. }
@@ -934,7 +952,62 @@ fn group_traversable(path: &std::path::Path) -> Result<(), String> {
 /// configured for in-process dispatch but the user hasn't installed the
 /// systemd unit. Suppressed by `LABCTL_NO_HINT=1` and skipped on hosts
 /// without systemd-user. Designed to be ignorable — never blocks, never
-/// errors.
+/// Producer-side output hashing. Invoked from the sbatch wrapper on the
+/// compute node after the user command succeeds. Reads context.json to
+/// discover declared output paths, walks each, computes the same
+/// dir_content_hash login would compute, and atomically writes
+/// `<run_dir>/.lab/output_hashes.json` as `{role: hash}`. Login-side
+/// `register_outputs` reads this manifest first and only falls back to
+/// re-walking on cache miss. The hash function is identical so the
+/// resulting content_hash matches whether computed here or there.
+fn hash_outputs_command(run_dir: &Path) -> Result<()> {
+    let lab_dir = run_dir.join(fs_layout::LAB_DIRNAME);
+    let context_path = lab_dir.join(fs_layout::CONTEXT_JSON);
+    let context_text = std::fs::read_to_string(&context_path)
+        .with_context(|| format!("failed to read {}", context_path.display()))?;
+    let context: serde_json::Value = serde_json::from_str(&context_text)
+        .with_context(|| format!("failed to parse {}", context_path.display()))?;
+    let outputs = context
+        .get("outputs")
+        .and_then(|v| v.as_object())
+        .with_context(|| {
+            format!("{} has no 'outputs' object", context_path.display())
+        })?;
+
+    let mut manifest = serde_json::Map::with_capacity(outputs.len());
+    for (role, resolution) in outputs {
+        let path = resolution
+            .get("path")
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("output {role:?} has no 'path'"))?;
+        let kind = resolution
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // checkpoint_stream is a directory of step subdirs that get
+        // registered as separate artifacts later; skip hashing the
+        // top-level here.
+        if kind == "checkpoint_stream" {
+            continue;
+        }
+        let path = Path::new(path);
+        if !path.exists() {
+            eprintln!(
+                "hash-outputs: skipping role {role:?}: {} does not exist",
+                path.display()
+            );
+            continue;
+        }
+        let hash = util::dir_content_hash(path)
+            .with_context(|| format!("dir_content_hash({})", path.display()))?;
+        manifest.insert(role.clone(), serde_json::Value::String(hash));
+    }
+    let manifest_path = lab_dir.join("output_hashes.json");
+    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(manifest))?;
+    util::atomic_write(&manifest_path, &bytes)?;
+    Ok(())
+}
+
 /// Submit a recipe. The CLI is the only writer in the new model: it
 /// opens `Store` directly (against the filesystem-truth registry),
 /// snapshots the source repo as the invoking user, renders the sbatch

@@ -1556,13 +1556,20 @@ fn render_script(
                 .replace("{n}", &recipe.resources.gpus.to_string());
             script.push_str(&format!("#SBATCH --gres={syntax}\n"));
         }
-        // No afterok in agent-driven submission: by the time we render
-        // a stage's script, all upstream parents are terminal-succeeded
-        // (or cache-hit), so SLURM has no dependency to wait on. The
-        // coalesce-follower trampoline still uses afterok for its peer
-        // job (render_follower_script); pipeline-stage dependencies do
-        // not.
-        let _ = parent_job_ids;
+        // Pipeline-stage parents do not show up here under agent-driven
+        // submission — the agent only renders a child's script once
+        // every parent is terminal-succeeded, so no afterok is needed.
+        // What DOES still come through `parent_job_ids` is sweep-array
+        // → sweep-aggregate dependency: the aggregate stage runs after
+        // every array element succeeds, gated by SLURM's native
+        // afterok:<array_jobid> semantics.
+        if !parent_job_ids.is_empty() {
+            script.push_str(&format!(
+                "#SBATCH --dependency=afterok:{}\n",
+                parent_job_ids.join(":")
+            ));
+            script.push_str("#SBATCH --kill-on-invalid-dep=yes\n");
+        }
         script.push_str(&format!(
             "#SBATCH --cpus-per-task={}\n",
             recipe.resources.cpus
@@ -1671,7 +1678,26 @@ fn render_script(
         util::shell_quote(&source_path.display().to_string())
     ));
     script.push_str(&rendered_command);
-    script.push('\n');
+    script.push_str(
+        "\nrc=$?\n",
+    );
+    // Producer-side hashing: emit a {role: dir_content_hash} manifest
+    // next to context.json. register_outputs prefers it over re-walking
+    // outputs on the login side — cache-hot reads + compute-side
+    // parallelism beat agent-side serial walks. Best-effort: on any
+    // failure (manifest write race, binary missing, etc.) we still exit
+    // with the user command's rc and the agent falls back to walk-and-
+    // hash. The user's exit code is preserved.
+    let labctl_bin = std::env::current_exe()
+        .context("current_exe()")?
+        .display()
+        .to_string();
+    script.push_str(&format!(
+        "if [ \"$rc\" -eq 0 ]; then {} hash-outputs --run-dir {} || true; fi\n",
+        util::shell_quote(&labctl_bin),
+        util::shell_quote(&run_dir.display().to_string()),
+    ));
+    script.push_str("exit \"$rc\"\n");
     // sacct is the sole source of truth for job state; bash wrapper exits
     // with the user command's rc and SLURM/sacct records the outcome.
     Ok(script)
@@ -1886,6 +1912,22 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
         .clone();
     let outputs: BTreeMap<String, OutputResolution> = serde_json::from_value(outputs_value)
         .with_context(|| format!("run {} context.json 'outputs' shape mismatch", run.id))?;
+    // Producer-side hash manifest: emitted by the sbatch wrapper via
+    // `labctl hash-outputs` after the user command succeeds. Best-effort
+    // — absent or malformed manifest falls back to walking + hashing
+    // here on the login side. The hash function is identical
+    // (`util::dir_content_hash`), so a manifest entry is binary
+    // interchangeable with a re-walk.
+    let manifest: BTreeMap<String, String> = {
+        let path = run
+            .run_dir
+            .join(fs_layout::LAB_DIRNAME)
+            .join("output_hashes.json");
+        match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => BTreeMap::new(),
+        }
+    };
     let mut count = 0;
     // `(role, artifact_id)` for non-streaming outputs we linked this pass.
     // Used after the loop to backfill downstream pipeline-stage consumers
@@ -1960,7 +2002,10 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
             if !resolution.path.join(&resolution.marker).is_file() {
                 continue;
             }
-            let content_hash = util::dir_content_hash(&resolution.path)?;
+            let content_hash = match manifest.get(role) {
+                Some(h) => h.clone(),
+                None => util::dir_content_hash(&resolution.path)?,
+            };
             let mut metadata = json!({
                 "role": role,
                 "marker": resolution.marker,
