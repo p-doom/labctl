@@ -87,17 +87,6 @@ pub struct ArtifactSidecar {
     pub created_at: i64,
 }
 
-/// ``.target.json`` for an in-flight coalesce claim. Recorded by the
-/// producer at mkdir time so subsequent followers can identify who they
-/// are waiting on. The actual ``afterok:`` job id is looked up from the
-/// producer's registry row — keeping the claim sidecar minimal avoids
-/// a second flush when the producer's job_id eventually lands.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoalesceClaimSidecar {
-    pub producer_run_id: String,
-    pub claimed_at: i64,
-}
-
 // ---------- atomic primitives ----------
 
 /// Write `bytes` to `path` atomically (tmp + rename in same dir). Creates
@@ -119,14 +108,6 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-/// Outcome of an atomic-claim attempt: did we win the race? Kept for the
-/// PG-backed coalesce slot, whose claim path now goes through
-/// `INSERT ... ON CONFLICT DO NOTHING` rather than the legacy NFS mkdir.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimOutcome {
-    Claimed,
-    AlreadyExists,
-}
 
 /// Mode bits for the shared-multi-user setup: group rwx + setgid (so
 /// subdirs inherit the group), no permissions for other. Applied to

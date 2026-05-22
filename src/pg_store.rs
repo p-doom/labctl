@@ -32,7 +32,6 @@ use sqlx::{
 };
 
 use crate::config::{ClusterConfig, InputSpec, PgConfig, Recipe};
-use crate::fs_layout::ClaimOutcome;
 use crate::store::{
     ArtifactRow, EvalRequestSlot, EvalSeriesRow, EventRow, InputResolution, NewRun, PipelineRow,
     PolicySummaryRow, RunRow, RunView, TrackingRow, is_terminal,
@@ -244,41 +243,10 @@ impl PgStore {
         rows.into_iter().map(row_to_run).collect()
     }
 
-    pub async fn terminal_runs(&self) -> Result<Vec<RunRow>> {
-        let rows = sqlx::query(&format!(
-            "{RUN_SELECT_BASE} WHERE status IN \
-             ('succeeded','failed','cancelled','timeout','oom','unknown_terminal') \
-             ORDER BY created_at DESC"
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .context("terminal_runs query")?;
-        rows.into_iter().map(row_to_run).collect()
-    }
-
-    pub async fn terminal_runs_without_outputs(&self) -> Result<Vec<RunRow>> {
-        let rows = sqlx::query(
-            "SELECT r.id, r.recipe_name, r.recipe_hash, r.status, r.job_id, r.run_dir,
-                    r.repo, r.source_path, r.recipe_json, r.context_json, r.created_at,
-                    r.finished_at, r.pipeline_id, r.stage_name, r.dependency_on,
-                    r.submitted_by, r.cache_key, r.coalesced_peer_run_id
-             FROM runs r
-             LEFT JOIN run_outputs ro ON ro.run_id = r.id
-             WHERE r.status IN \
-               ('succeeded','failed','cancelled','timeout','oom','unknown_terminal')
-               AND ro.run_id IS NULL
-             ORDER BY r.created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("terminal_runs_without_outputs query")?;
-        rows.into_iter().map(row_to_run).collect()
-    }
-
     pub async fn list_active_runs(&self, submitted_by: &str) -> Result<Vec<RunRow>> {
         let rows = sqlx::query(&format!(
             "{RUN_SELECT_BASE} \
-             WHERE status IN ('created','submitted','running','awaiting_peer') \
+             WHERE status IN ('created','submitted','running') \
                AND submitted_by = $1 \
              ORDER BY created_at ASC"
         ))
@@ -364,7 +332,7 @@ impl PgStore {
 
     pub async fn run_outputs(&self, run_id: &str) -> Result<Vec<ArtifactRow>> {
         let rows = sqlx::query(
-            "SELECT a.id, a.kind, a.path, a.content_hash, a.producer_run_id,
+            "SELECT a.id, a.kind, a.path, a.producer_run_id,
                     a.metadata_json, a.created_at
              FROM artifacts a
              JOIN run_outputs ro ON ro.artifact_id = a.id
@@ -413,47 +381,6 @@ impl PgStore {
         .with_context(|| format!("find_cache_hit_candidate({cache_key})"))?;
         row.map(row_to_run).transpose()
     }
-
-    pub async fn find_coalesce_peer(&self, cache_key: &str) -> Result<Option<RunRow>> {
-        let row = sqlx::query(&format!(
-            "{RUN_SELECT_BASE} \
-             WHERE cache_key = $1 \
-               AND status IN ('submitted','running') \
-               AND job_id IS NOT NULL \
-             ORDER BY created_at ASC LIMIT 1"
-        ))
-        .bind(cache_key)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("find_coalesce_peer({cache_key})"))?;
-        row.map(row_to_run).transpose()
-    }
-
-    /// Read the producer run id currently holding the coalesce slot for
-    /// `cache_key`, plus the timestamp it was claimed. Returns `None` if
-    /// no slot is held. Used by a follower right after `claim_coalesce_slot`
-    /// returns `AlreadyExists` to learn who to wait on.
-    pub async fn read_coalesce_claim(
-        &self,
-        cache_key: &str,
-    ) -> Result<Option<crate::fs_layout::CoalesceClaimSidecar>> {
-        let row = sqlx::query(
-            "SELECT producer_run_id, claimed_at FROM coalesce_claims \
-             WHERE cache_key = $1"
-        )
-        .bind(cache_key)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("read_coalesce_claim({cache_key})"))?;
-        match row {
-            Some(r) => Ok(Some(crate::fs_layout::CoalesceClaimSidecar {
-                producer_run_id: r.try_get("producer_run_id")?,
-                claimed_at: r.try_get("claimed_at")?,
-            })),
-            None => Ok(None),
-        }
-    }
-
 
     pub async fn run_output_artifact_id(
         &self,
@@ -762,7 +689,7 @@ impl PgStore {
                         ('failed','cancelled','timeout','oom','unknown_terminal')
                         THEN 1 ELSE 0 END)::BIGINT AS failed,
                     SUM(CASE WHEN COALESCE(er_run.status, 'pending') IN
-                        ('created','submitted','running','awaiting_peer','pending')
+                        ('created','submitted','running','pending')
                         THEN 1 ELSE 0 END)::BIGINT AS running,
                     MAX(er.updated_at) AS last_fired
              FROM eval_requests er
@@ -838,23 +765,6 @@ impl PgStore {
         }
     }
 
-    pub async fn runs_missing_tracking(&self) -> Result<Vec<RunRow>> {
-        let rows = sqlx::query(
-            "SELECT r.id, r.recipe_name, r.recipe_hash, r.status, r.job_id, r.run_dir,
-                    r.repo, r.source_path, r.recipe_json, r.context_json, r.created_at,
-                    r.finished_at, r.pipeline_id, r.stage_name, r.dependency_on,
-                    r.submitted_by, r.cache_key, r.coalesced_peer_run_id
-             FROM runs r
-             LEFT JOIN tracking t ON t.run_id = r.id
-             WHERE t.run_id IS NULL
-             ORDER BY r.created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("runs_missing_tracking query")?;
-        rows.into_iter().map(row_to_run).collect()
-    }
-
     // ---------- additional write paths ----------
 
     /// Insert a fresh run row plus its input-resolution rows in one
@@ -885,9 +795,8 @@ impl PgStore {
         sqlx::query(
             "INSERT INTO runs
              (id, recipe_name, recipe_hash, status, run_dir, repo, source_path,
-              recipe_json, context_json, created_at, submitted_by, cache_key,
-              coalesced_peer_run_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL)
+              recipe_json, context_json, created_at, submitted_by, cache_key)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
              ON CONFLICT (id) DO UPDATE SET
                  recipe_name = EXCLUDED.recipe_name,
                  recipe_hash = EXCLUDED.recipe_hash,
@@ -1082,12 +991,7 @@ impl PgStore {
     }
 
     /// Insert an artifact row. DB-only: the caller owns the sidecar
-    /// (`.meta.json`) write and any other FS work. `content_hash` is
-    /// NULL on every row inserted through this method — the column
-    /// only carries values populated by the original importer / legacy
-    /// content-addressed code (migration 0004 relaxed NOT NULL and
-    /// dropped UNIQUE).
-    #[allow(clippy::too_many_arguments)]
+    /// (`.meta.json`) write and any other FS work.
     pub async fn insert_artifact(
         &self,
         id: &str,
@@ -1096,14 +1000,12 @@ impl PgStore {
         producer_run_id: Option<&str>,
         metadata: &Value,
         user: &str,
-        alias_segment: &str,
         created_at: i64,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO artifacts
-             (id, kind, path, content_hash, producer_run_id, metadata_json,
-              created_at, \"user\", alias_segment)
-             VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8)",
+             (id, kind, path, producer_run_id, metadata_json, created_at, \"user\")
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(id)
         .bind(kind)
@@ -1112,7 +1014,6 @@ impl PgStore {
         .bind(sqlx::types::Json(metadata))
         .bind(created_at)
         .bind(user)
-        .bind(alias_segment)
         .execute(&self.pool)
         .await
         .with_context(|| format!("insert_artifact({id})"))?;
@@ -1289,151 +1190,6 @@ impl PgStore {
             crate::util::now_ts(),
         )
         .await?;
-        Ok(())
-    }
-
-    pub async fn append_stage_coalesce_resolved_event(
-        &self,
-        run_id: &str,
-        peer_run_id: &str,
-    ) -> Result<()> {
-        self.append_event(
-            Some(run_id),
-            "stage_coalesce_resolved",
-            &json!({
-                "peer_run_id": peer_run_id,
-                "outcome": "cache_hit",
-            }),
-            crate::util::now_ts(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn append_stage_coalesce_failed_event(
-        &self,
-        run_id: &str,
-        peer_run_id: &str,
-        peer_status: &str,
-    ) -> Result<()> {
-        self.append_event(
-            Some(run_id),
-            "stage_coalesce_failed",
-            &json!({
-                "peer_run_id": peer_run_id,
-                "peer_status": peer_status,
-            }),
-            crate::util::now_ts(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    // ---------- in-flight coalescing ----------
-    //
-    // Leader election via the `coalesce_claims` table. PRIMARY KEY on
-    // `cache_key` + `INSERT ... ON CONFLICT DO NOTHING RETURNING` makes
-    // the claim genuinely atomic across all PG clients — replaces the
-    // legacy NFS-mkdir approach which had no atomicity guarantee across
-    // NFS clients.
-
-    pub async fn claim_coalesce_slot(
-        &self,
-        cache_key: &str,
-        producer_run_id: &str,
-    ) -> Result<ClaimOutcome> {
-        let row = sqlx::query(
-            "INSERT INTO coalesce_claims (cache_key, producer_run_id, claimed_at) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (cache_key) DO NOTHING \
-             RETURNING producer_run_id",
-        )
-        .bind(cache_key)
-        .bind(producer_run_id)
-        .bind(crate::util::now_ts())
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("claim_coalesce_slot({cache_key})"))?;
-        Ok(if row.is_some() {
-            ClaimOutcome::Claimed
-        } else {
-            ClaimOutcome::AlreadyExists
-        })
-    }
-
-    pub async fn release_coalesce_slot(&self, cache_key: &str) -> Result<()> {
-        sqlx::query("DELETE FROM coalesce_claims WHERE cache_key = $1")
-            .bind(cache_key)
-            .execute(&self.pool)
-            .await
-            .with_context(|| format!("release_coalesce_slot({cache_key})"))?;
-        Ok(())
-    }
-
-    /// Sweep coalesce_claims whose producer has reached a terminal status.
-    /// The normal release path (`release_coalesce_slot` after the producer
-    /// reconciles to terminal) covers the happy path; this sweep is the
-    /// safety net for producers that died between reaching terminal and
-    /// firing the release, plus any FK-cascade survivors from external
-    /// row deletion. Returns the number of claims swept.
-    pub async fn gc_terminal_coalesce_claims(&self) -> Result<u64> {
-        let result = sqlx::query(
-            "DELETE FROM coalesce_claims
-             WHERE producer_run_id IN (
-                 SELECT id FROM runs
-                 WHERE status IN (
-                     'succeeded','failed','cancelled','timeout','oom',
-                     'unknown_terminal','cache_hit'
-                 )
-             )",
-        )
-        .execute(&self.pool)
-        .await
-        .context("gc_terminal_coalesce_claims")?;
-        Ok(result.rows_affected())
-    }
-
-    pub async fn set_awaiting_peer(
-        &self,
-        run_id: &str,
-        job_id: &str,
-        peer_run_id: &str,
-        cache_key: &str,
-    ) -> Result<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("set_awaiting_peer: begin tx")?;
-        sqlx::query(
-            "UPDATE runs
-             SET status='awaiting_peer', job_id=$1, coalesced_peer_run_id=$2
-             WHERE id=$3",
-        )
-        .bind(job_id)
-        .bind(peer_run_id)
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await
-        .with_context(|| format!("set_awaiting_peer({run_id})"))?;
-        let now = crate::util::now_ts();
-        let payload = json!({
-            "peer_run_id": peer_run_id,
-            "cache_key": cache_key,
-            "job_id": job_id,
-        });
-        sqlx::query(
-            "INSERT INTO events (run_id, event_type, payload_json, created_at)
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(run_id)
-        .bind("stage_coalesced")
-        .bind(sqlx::types::Json(&payload))
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .context("set_awaiting_peer: event insert")?;
-        tx.commit().await.context("set_awaiting_peer: commit")?;
         Ok(())
     }
 
@@ -1692,7 +1448,7 @@ impl PgStore {
         user: &str,
     ) -> Result<Vec<ArtifactRow>> {
         let rows = sqlx::query(
-            "SELECT a.id, a.kind, a.path, a.content_hash, a.producer_run_id,
+            "SELECT a.id, a.kind, a.path, a.producer_run_id,
                     a.metadata_json, a.created_at
              FROM artifacts a
              JOIN runs r ON a.producer_run_id = r.id
@@ -1770,26 +1526,25 @@ fn build_connect_options(pg: &PgConfig) -> Result<PgConnectOptions> {
     Ok(opts)
 }
 
-// Column lists kept in sync with migrations/0001_initial_schema.sql.
+// Column lists kept in sync with migrations/0001_initial_schema.sql +
+// later migrations (notably 0005 dropped `coalesced_peer_run_id`).
 const RUN_SELECT_BASE: &str = "
     SELECT id, recipe_name, recipe_hash, status, job_id, run_dir, repo,
            source_path, recipe_json, context_json, created_at, finished_at,
-           pipeline_id, stage_name, dependency_on, submitted_by, cache_key,
-           coalesced_peer_run_id
+           pipeline_id, stage_name, dependency_on, submitted_by, cache_key
     FROM runs
 ";
 
 const RUN_SELECT_ALL: &str = "
     SELECT id, recipe_name, recipe_hash, status, job_id, run_dir, repo,
            source_path, recipe_json, context_json, created_at, finished_at,
-           pipeline_id, stage_name, dependency_on, submitted_by, cache_key,
-           coalesced_peer_run_id
+           pipeline_id, stage_name, dependency_on, submitted_by, cache_key
     FROM runs
     ORDER BY created_at DESC
 ";
 
 const ARTIFACT_SELECT_BASE: &str = "
-    SELECT id, kind, path, content_hash, producer_run_id, metadata_json, created_at
+    SELECT id, kind, path, producer_run_id, metadata_json, created_at
     FROM artifacts
 ";
 
@@ -1815,7 +1570,6 @@ fn row_to_run(r: sqlx::postgres::PgRow) -> Result<RunRow> {
         dependency_on: dependency_on.map(|j| j.0),
         submitted_by: r.try_get("submitted_by")?,
         cache_key: r.try_get("cache_key")?,
-        coalesced_peer_run_id: r.try_get("coalesced_peer_run_id")?,
     })
 }
 
@@ -1825,7 +1579,6 @@ fn row_to_artifact(r: sqlx::postgres::PgRow) -> Result<ArtifactRow> {
         id: r.try_get("id")?,
         kind: r.try_get("kind")?,
         path: PathBuf::from(r.try_get::<String, _>("path")?),
-        content_hash: r.try_get("content_hash")?,
         producer_run_id: r.try_get("producer_run_id")?,
         metadata_json: metadata_json.0,
         created_at: r.try_get("created_at")?,

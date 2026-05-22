@@ -37,7 +37,7 @@ use tokio::runtime::Runtime;
 
 use crate::{
     config::{ClusterConfig, Recipe},
-    fs_layout::{self, ArtifactSidecar, ClaimOutcome},
+    fs_layout::{self, ArtifactSidecar},
     pg_store::PgStore,
     util,
 };
@@ -65,11 +65,6 @@ pub struct RunRow {
     pub dependency_on: Option<Value>,
     pub submitted_by: Option<String>,
     pub cache_key: Option<String>,
-    /// Set on follower runs: the run_id this run is coalesced against.
-    /// When the peer reaches a terminal state, the resolver flips this run
-    /// to ``cache_hit`` (peer succeeded) or ``failed`` (peer failed) and
-    /// links the peer's outputs in. None on producer / non-coalesced runs.
-    pub coalesced_peer_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,12 +72,6 @@ pub struct ArtifactRow {
     pub id: String,
     pub kind: String,
     pub path: PathBuf,
-    /// Legacy diagnostic value from when artifacts were content-addressed
-    /// (`_objects/<prefix>/<hash>/`). `None` on all rows inserted after
-    /// migration 0004 — the column survives on those rows only to
-    /// preserve historic values from imports. No live code path reads
-    /// it for placement or dedup decisions.
-    pub content_hash: Option<String>,
     pub producer_run_id: Option<String>,
     pub metadata_json: Value,
     pub created_at: i64,
@@ -189,14 +178,6 @@ pub fn is_terminal(status: &str) -> bool {
         status,
         "succeeded" | "failed" | "cancelled" | "timeout" | "oom" | "unknown_terminal" | "cache_hit"
     )
-}
-
-/// Followers waiting on a coalesce peer. Non-terminal: the resolver loop
-/// must keep watching them. Separate from ``is_terminal`` so callers that
-/// gate on "this run can never change" don't accidentally treat a follower
-/// as final.
-pub fn is_awaiting_peer(status: &str) -> bool {
-    status == "awaiting_peer"
 }
 
 // ---------- the store ----------
@@ -330,14 +311,6 @@ impl Store {
         self.block_on_pg(self.pg.list_runs())
     }
 
-    pub fn terminal_runs(&self) -> Result<Vec<RunRow>> {
-        self.block_on_pg(self.pg.terminal_runs())
-    }
-
-    pub fn terminal_runs_without_outputs(&self) -> Result<Vec<RunRow>> {
-        self.block_on_pg(self.pg.terminal_runs_without_outputs())
-    }
-
     /// Active runs owned by `submitted_by`. Scoped so a daemon never
     /// reconciles another user's runs.
     pub fn list_active_runs(&self, submitted_by: &str) -> Result<Vec<RunRow>> {
@@ -394,7 +367,7 @@ impl Store {
         let id = format!("artifact_{}", &path_hash[..16]);
         // The staging path is <root>/<user>/<alias>/. Falls back to
         // placeholders for ad-hoc registrations not under a user dir.
-        let (user, alias_segment) = decompose_artifact_path(staging_path, &root)
+        let (user, alias) = decompose_artifact_path(staging_path, &root)
             .unwrap_or_else(|_| ("unknown".into(), id.clone()));
 
         let now = util::now_ts();
@@ -402,7 +375,7 @@ impl Store {
             id: id.clone(),
             kind: kind.to_string(),
             user: user.clone(),
-            alias: alias_segment.clone(),
+            alias,
             producer_run_id: producer_run_id.map(str::to_string),
             metadata: metadata.clone(),
             created_at: now,
@@ -416,7 +389,6 @@ impl Store {
             producer_run_id,
             metadata,
             &user,
-            &alias_segment,
             now,
         ))?;
         self.block_on_pg(
@@ -528,75 +500,6 @@ impl Store {
         self.block_on_pg(
             self.pg
                 .append_stage_cache_hit_event(run_id, cache_key, source_run_id),
-        )
-    }
-
-    // ---------- in-flight coalescing ----------
-
-    pub fn find_coalesce_peer(&self, cache_key: &str) -> Result<Option<RunRow>> {
-        self.block_on_pg(self.pg.find_coalesce_peer(cache_key))
-    }
-
-    pub fn claim_coalesce_slot(
-        &self,
-        cache_key: &str,
-        producer_run_id: &str,
-    ) -> Result<ClaimOutcome> {
-        self.block_on_pg(self.pg.claim_coalesce_slot(cache_key, producer_run_id))
-    }
-
-    pub fn read_coalesce_claim(
-        &self,
-        cache_key: &str,
-    ) -> Result<Option<fs_layout::CoalesceClaimSidecar>> {
-        self.block_on_pg(self.pg.read_coalesce_claim(cache_key))
-    }
-
-    pub fn release_coalesce_slot(&self, cache_key: &str) -> Result<()> {
-        self.block_on_pg(self.pg.release_coalesce_slot(cache_key))
-    }
-
-    /// Sweep coalesce_claims whose producer is terminal. Called from
-    /// the agent's gc loop; the FK ON DELETE CASCADE in 0002 covers
-    /// the deletion-of-run path, this sweep covers the
-    /// terminal-but-still-present path.
-    pub fn gc_terminal_coalesce_claims(&self) -> Result<u64> {
-        self.block_on_pg(self.pg.gc_terminal_coalesce_claims())
-    }
-
-    pub fn set_awaiting_peer(
-        &self,
-        run_id: &str,
-        job_id: &str,
-        peer_run_id: &str,
-        cache_key: &str,
-    ) -> Result<()> {
-        self.block_on_pg(
-            self.pg
-                .set_awaiting_peer(run_id, job_id, peer_run_id, cache_key),
-        )
-    }
-
-    pub fn append_stage_coalesce_resolved_event(
-        &self,
-        run_id: &str,
-        peer_run_id: &str,
-    ) -> Result<()> {
-        self.block_on_pg(
-            self.pg
-                .append_stage_coalesce_resolved_event(run_id, peer_run_id),
-        )
-    }
-
-    pub fn append_stage_coalesce_failed_event(
-        &self,
-        run_id: &str,
-        peer_run_id: &str,
-        peer_status: &str,
-    ) -> Result<()> {
-        self.block_on_pg(
-            self.pg
-                .append_stage_coalesce_failed_event(run_id, peer_run_id, peer_status),
         )
     }
 
@@ -810,10 +713,6 @@ impl Store {
 
     pub fn get_tracking(&self, run_id: &str) -> Result<Option<TrackingRow>> {
         self.block_on_pg(self.pg.get_tracking(run_id))
-    }
-
-    pub fn runs_missing_tracking(&self) -> Result<Vec<RunRow>> {
-        self.block_on_pg(self.pg.runs_missing_tracking())
     }
 }
 

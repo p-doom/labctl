@@ -163,7 +163,6 @@ def emit_runs_and_associated(
                 tsv_escape(sidecar.get("stage_name")),
                 tsv_escape(sidecar["submitted_by"]),
                 tsv_escape(sidecar.get("cache_key")),
-                tsv_escape(sidecar.get("coalesced_peer_run_id")),
             ])
             counts.runs += 1
             observe_user(counts, sidecar.get("submitted_by"), sidecar.get("created_at"))
@@ -236,9 +235,8 @@ def emit_artifacts(
     sidecar. `<root>/<user>/<alias>/` (the post-c1d31e8 layout) is walked
     via the run's `outputs.json` sidecars at run-import time, not here —
     the producer's own bookkeeping is the canonical source for that
-    layout. `content_hash` is preserved from the sidecar for legacy
-    rows (the column is still NULLable post-0004 but we have a value
-    here, so we use it).
+    layout. The legacy sidecar's `content_hash` / `alias` fields are
+    dropped on the floor; migration 0006 drops those columns.
     """
     seen_roots = set()
     for _kind, root in artifact_roots.items():
@@ -262,12 +260,10 @@ def emit_artifacts(
                     tsv_escape(sidecar["id"]),
                     tsv_escape(sidecar["kind"]),
                     tsv_escape(str(hash_dir)),
-                    tsv_escape(sidecar.get("content_hash")),
                     tsv_escape(sidecar.get("producer_run_id")),
                     json_field(sidecar["metadata"]),
                     tsv_escape(sidecar["created_at"]),
                     tsv_escape(sidecar["user"]),
-                    tsv_escape(sidecar["alias"]),
                 ])
                 counts.artifacts += 1
                 observe_user(counts, sidecar.get("user"), sidecar.get("created_at"))
@@ -369,14 +365,14 @@ TABLES = [
             "id", "recipe_name", "recipe_hash", "status", "job_id",
             "run_dir", "repo", "source_path", "recipe_json", "context_json",
             "created_at", "finished_at", "pipeline_id", "dependency_on",
-            "stage_name", "submitted_by", "cache_key", "coalesced_peer_run_id",
+            "stage_name", "submitted_by", "cache_key",
         ],
     ),
     TableSpec("pipelines", ["id", "name", "pipeline_path", '"user"', "created_at"]),
     TableSpec(
         "artifacts",
-        ["id", "kind", "path", "content_hash", "producer_run_id",
-         "metadata_json", "created_at", '"user"', "alias_segment"],
+        ["id", "kind", "path", "producer_run_id",
+         "metadata_json", "created_at", '"user"'],
     ),
     TableSpec("artifact_aliases", ["alias", "artifact_id", "created_at"]),
     TableSpec("run_inputs", ["run_id", "role", "artifact_id", "resolved_path"]),
@@ -502,20 +498,18 @@ def main() -> int:
 
     # Single-transaction load: TRUNCATE CASCADE + \copy + setval all
     # run inside one BEGIN/COMMIT so the DEFERRABLE FKs added in 0002
-    # (runs.pipeline_id, runs.coalesced_peer_run_id, artifacts.producer_run_id,
-    # eval_requests.eval_run_id) are validated only at COMMIT — i.e.
-    # after the entire graph is loaded. Per-row checking would reject
-    # intra-batch cross-references during the COPY of `runs`.
+    # (runs.pipeline_id, artifacts.producer_run_id, eval_requests.eval_run_id)
+    # are validated only at COMMIT — i.e. after the entire graph is loaded.
+    # Per-row checking would reject intra-batch cross-references during the
+    # COPY of `runs`.
     #
-    # CASCADE on TRUNCATE is necessary because 0002 added FKs from
-    # coalesce_claims (not in TABLES) to runs, plus the runs<->pipelines
-    # cycle.
+    # CASCADE on TRUNCATE handles the runs<->pipelines cycle.
     pg_args = ["-h", args.pg_socket, "-d", args.pg_db, "-v", "ON_ERROR_STOP=1"]
     sql_path = args.workdir / "load.sql"
     with sql_path.open("w") as f:
         f.write("BEGIN;\n")
         f.write("TRUNCATE " + ", ".join(t.name for t in TABLES)
-                + ", coalesce_claims RESTART IDENTITY CASCADE;\n")
+                + " RESTART IDENTITY CASCADE;\n")
         for t in TABLES:
             cols = ", ".join(t.columns)
             f.write(f"\\copy {t.name} ({cols}) FROM '{t.file}'\n")
