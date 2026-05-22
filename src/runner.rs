@@ -51,18 +51,6 @@ pub struct ReconcileReport {
     pub artifacts_registered: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct StatusFile {
-    status: String,
-    #[allow(dead_code)]
-    job_id: Option<String>,
-    /// Wall-clock unix timestamp of the last write_status call inside the
-    /// sbatch wrapper. For terminal transitions this is when the recipe
-    /// command actually exited (not when reconcile observed it), so we
-    /// prefer it over now_ts() when sacct doesn't return a usable End.
-    updated_at: Option<i64>,
-}
-
 #[derive(Debug, Clone)]
 struct SchedulerOutcome {
     status: String,
@@ -913,7 +901,6 @@ pub fn reconcile_one(
     };
     let (status, finished_at) = scheduler_outcome(cluster, run)
         .map(|o| (o.status, o.finished_at))
-        .or_else(|| status_file_outcome(&run.run_dir))
         .unwrap_or_else(|| (run.status.clone(), None));
     if status != run.status {
         store.update_status(&run.id, &status, finished_at)?;
@@ -1068,9 +1055,8 @@ pub struct RecoverReport {
 
 /// One-shot repair for runs whose ``finished_at`` was set to ``now_ts()`` at
 /// reconcile time instead of the run's actual end time. Recomputes from
-/// sacct's End (preferred) or status.json's updated_at (fallback). Idempotent
-/// — repeated invocations converge: a run whose finished_at already matches
-/// the recomputed value is left alone.
+/// sacct's End. Idempotent — repeated invocations converge: a run whose
+/// finished_at already matches the recomputed value is left alone.
 pub fn repair_finish_times(
     cluster: &ClusterConfig,
     store: &Store,
@@ -1078,9 +1064,7 @@ pub fn repair_finish_times(
     let mut report = RepairReport::default();
     for run in store.terminal_runs()? {
         report.scanned += 1;
-        let recomputed = scheduler_outcome(cluster, &run)
-            .and_then(|o| o.finished_at)
-            .or_else(|| status_file_outcome(&run.run_dir).and_then(|(_, ts)| ts));
+        let recomputed = scheduler_outcome(cluster, &run).and_then(|o| o.finished_at);
         let Some(ts) = recomputed else {
             report.unresolved += 1;
             continue;
@@ -1360,9 +1344,6 @@ fn render_script(
         };
         rendered_command.push_str(&format!(" --{}={}", arr.arg, expr));
     }
-    let status_path = run_dir
-        .join(fs_layout::LAB_DIRNAME)
-        .join(fs_layout::STATUS_JSON);
 
     let mut script = String::new();
     if cluster.scheduler.kind == SchedulerKind::Slurm {
@@ -1452,32 +1433,7 @@ fn render_script(
         script.push_str("#!/usr/bin/env bash\n");
     }
 
-    script.push_str(
-        r#"
-set -uo pipefail
-job_id="${SLURM_JOB_ID:-${LABCTL_JOB_ID:-local}}"
-write_status() {
-  state="$1"
-  rc="${2:-0}"
-  tmp=""#,
-    );
-    script.push_str(&util::shell_quote(&format!(
-        "{}.tmp",
-        status_path.display()
-    )));
-    script.push_str(
-        r#""
-  dst=""#,
-    );
-    script.push_str(&util::shell_quote(&status_path.display().to_string()));
-    script.push_str(
-        r#""
-  printf '{"status":"%s","job_id":"%s","rc":%s,"updated_at":%s}\n' "$state" "$job_id" "$rc" "$(date +%s)" > "$tmp"
-  mv "$tmp" "$dst"
-}
-write_status running 0
-"#,
-    );
+    script.push_str("\nset -uo pipefail\n");
 
     for module in &cluster.modules {
         script.push_str(&format!("module load {}\n", util::shell_quote(module)));
@@ -1544,16 +1500,8 @@ write_status running 0
     ));
     script.push_str(&rendered_command);
     script.push('\n');
-    script.push_str(
-        r#"rc=$?
-if [ "$rc" -eq 0 ]; then
-  write_status succeeded "$rc"
-else
-  write_status failed "$rc"
-fi
-exit "$rc"
-"#,
-    );
+    // sacct is the sole source of truth for job state; bash wrapper exits
+    // with the user command's rc and SLURM/sacct records the outcome.
     Ok(script)
 }
 
@@ -1570,9 +1518,6 @@ fn render_follower_script(
     peer_job_id: &str,
     parent_job_ids: &[String],
 ) -> Result<String> {
-    let status_path = run_dir
-        .join(fs_layout::LAB_DIRNAME)
-        .join(fs_layout::STATUS_JSON);
     let mut script = String::new();
     if cluster.scheduler.kind == SchedulerKind::Slurm {
         script.push_str("#!/usr/bin/env bash\n");
@@ -1620,31 +1565,10 @@ fn render_follower_script(
     }
     script.push_str(
         r#"
-set -uo pipefail
-job_id="${SLURM_JOB_ID:-${LABCTL_JOB_ID:-local}}"
-write_status() {
-  state="$1"
-  rc="${2:-0}"
-  tmp=""#,
-    );
-    script.push_str(&util::shell_quote(&format!(
-        "{}.tmp",
-        status_path.display()
-    )));
-    script.push_str(
-        r#""
-  dst=""#,
-    );
-    script.push_str(&util::shell_quote(&status_path.display().to_string()));
-    script.push_str(
-        r#""
-  printf '{"status":"%s","job_id":"%s","rc":%s,"updated_at":%s}\n' "$state" "$job_id" "$rc" "$(date +%s)" > "$tmp"
-  mv "$tmp" "$dst"
-}
 # Coalesce trampoline: the resolver loop normally flips this follower to
 # cache_hit before SLURM ever runs this script. If it didn't (fast queue,
-# slow reconcile), exit 0 so downstream afterok: stages proceed.
-write_status succeeded 0
+# slow reconcile), exit 0 so downstream afterok: stages proceed. sacct
+# records the COMPLETED state on its own.
 exit 0
 "#,
     );
@@ -1780,15 +1704,6 @@ fn map_slurm_state(state: &str) -> String {
         _ => "unknown_terminal",
     }
     .to_string()
-}
-
-fn status_file_outcome(run_dir: &Path) -> Option<(String, Option<i64>)> {
-    let path = run_dir
-        .join(fs_layout::LAB_DIRNAME)
-        .join(fs_layout::STATUS_JSON);
-    let text = fs::read_to_string(path).ok()?;
-    let status: StatusFile = serde_json::from_str(&text).ok()?;
-    Some((status.status, status.updated_at))
 }
 
 fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> {

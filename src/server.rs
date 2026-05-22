@@ -896,8 +896,7 @@ struct LogTail {
 
 fn read_tail_log(run_dir: &std::path::Path, tail: usize) -> LogTail {
     // SLURM writes to <run_dir>/.lab/<job_name>_<job_id>.log; pick the most
-    // recently modified one. Falls back to .lab/status.json's stderr if no
-    // log file (local scheduler / pre-submission state).
+    // recently modified one.
     let lab = run_dir.join(".lab");
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     if let Ok(entries) = std::fs::read_dir(&lab) {

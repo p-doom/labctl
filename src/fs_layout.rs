@@ -36,10 +36,6 @@ pub const RUNS_DIR: &str = "runs";
 // ---------- file names inside a run's .lab/ ----------
 
 pub const LAB_DIRNAME: &str = ".lab";
-/// Written by the sbatch wrapper at runtime. Source of truth for `status`
-/// until reconcile observes terminal state via sacct. Compute → login
-/// bridge for status; PG carries everything else.
-pub const STATUS_JSON: &str = "status.json";
 /// Written at submit time, consumed by the compute job via
 /// `$LABCTL_CONTEXT`. Carries the recipe/inputs/outputs/params the
 /// compute job needs — compute nodes can't reach PG, so this stays on NFS.

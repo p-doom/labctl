@@ -118,10 +118,10 @@ enum Command {
     /// output rows. Recovers runs whose outputs went unregistered because
     /// of the pre-fix terminal-transition bug. Idempotent.
     RecoverOutputs,
-    /// Recompute `finished_at` for terminal runs from sacct's End field
-    /// (or status.json's updated_at as fallback). Use this after upgrading
-    /// past the bug where finished_at was set to wall-clock time at
-    /// reconcile observation rather than the actual job end time.
+    /// Recompute `finished_at` for terminal runs from sacct's End field.
+    /// Use this after upgrading past the bug where finished_at was set
+    /// to wall-clock time at reconcile observation rather than the
+    /// actual job end time.
     RepairFinishTimes,
     /// Run a self-check: cluster config, filesystem perms, scheduler
     /// availability, and systemd unit status. Use this before reporting a
