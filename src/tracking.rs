@@ -1,10 +1,8 @@
-//! Backfill tracking rows for legacy runs whose recipe predates
-//! `[tracking.wandb]`. Walks every run missing a `tracking` row, scans the
-//! head of its log file for the URL `wandb.init` prints, and writes a `log`
-//! tracking row.
-//!
-//! Idempotent — safe to re-run; only touches runs that don't already have a
-//! tracking row, and `set_tracking` upserts.
+//! Per-run wandb tracking extraction. Called by `reconcile` on every run
+//! transition: scans the head of the SLURM log for the URL `wandb.init`
+//! prints, parses `entity/project`, and writes a `log`-source tracking
+//! row. Idempotent: a run that already has a `tracking` row is a single
+//! indexed SQL lookup and returns immediately.
 
 use std::{
     fs::File,
@@ -14,42 +12,11 @@ use std::{
 };
 
 use anyhow::Result;
-use serde::Serialize;
 
-use crate::{
-    config::ClusterConfig,
-    store::{RunRow, Store},
-};
+use crate::store::{RunRow, Store};
 
-#[derive(Debug, Serialize)]
-pub struct BackfillReport {
-    pub scanned: usize,
-    pub matched: usize,
-    pub no_url: usize,
-    pub no_log: usize,
-}
-
-pub fn backfill(_cluster: &ClusterConfig, store: &Store) -> Result<BackfillReport> {
-    let runs = store.runs_missing_tracking()?;
-    let mut report = BackfillReport {
-        scanned: runs.len(),
-        matched: 0,
-        no_url: 0,
-        no_log: 0,
-    };
-    for run in runs {
-        match try_populate_from_log(store, &run)? {
-            PopulateResult::Matched => report.matched += 1,
-            PopulateResult::NoUrl => report.no_url += 1,
-            PopulateResult::NoLog => report.no_log += 1,
-            PopulateResult::AlreadyTracked => {}
-        }
-    }
-    Ok(report)
-}
-
-/// Outcome of a single tracking-from-log attempt. Reported for visibility
-/// in `backfill-tracking`; ignored by `reconcile`.
+/// Outcome of a tracking-from-log attempt. Reported back for log-level
+/// visibility from `reconcile`.
 pub enum PopulateResult {
     Matched,
     NoUrl,

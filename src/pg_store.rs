@@ -243,37 +243,6 @@ impl PgStore {
         rows.into_iter().map(row_to_run).collect()
     }
 
-    pub async fn terminal_runs(&self) -> Result<Vec<RunRow>> {
-        let rows = sqlx::query(&format!(
-            "{RUN_SELECT_BASE} WHERE status IN \
-             ('succeeded','failed','cancelled','timeout','oom','unknown_terminal') \
-             ORDER BY created_at DESC"
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .context("terminal_runs query")?;
-        rows.into_iter().map(row_to_run).collect()
-    }
-
-    pub async fn terminal_runs_without_outputs(&self) -> Result<Vec<RunRow>> {
-        let rows = sqlx::query(
-            "SELECT r.id, r.recipe_name, r.recipe_hash, r.status, r.job_id, r.run_dir,
-                    r.repo, r.source_path, r.recipe_json, r.context_json, r.created_at,
-                    r.finished_at, r.pipeline_id, r.stage_name, r.dependency_on,
-                    r.submitted_by, r.cache_key
-             FROM runs r
-             LEFT JOIN run_outputs ro ON ro.run_id = r.id
-             WHERE r.status IN \
-               ('succeeded','failed','cancelled','timeout','oom','unknown_terminal')
-               AND ro.run_id IS NULL
-             ORDER BY r.created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("terminal_runs_without_outputs query")?;
-        rows.into_iter().map(row_to_run).collect()
-    }
-
     pub async fn list_active_runs(&self, submitted_by: &str) -> Result<Vec<RunRow>> {
         let rows = sqlx::query(&format!(
             "{RUN_SELECT_BASE} \
@@ -794,23 +763,6 @@ impl PgStore {
                 created_at: r.try_get("created_at")?,
             })),
         }
-    }
-
-    pub async fn runs_missing_tracking(&self) -> Result<Vec<RunRow>> {
-        let rows = sqlx::query(
-            "SELECT r.id, r.recipe_name, r.recipe_hash, r.status, r.job_id, r.run_dir,
-                    r.repo, r.source_path, r.recipe_json, r.context_json, r.created_at,
-                    r.finished_at, r.pipeline_id, r.stage_name, r.dependency_on,
-                    r.submitted_by, r.cache_key
-             FROM runs r
-             LEFT JOIN tracking t ON t.run_id = r.id
-             WHERE t.run_id IS NULL
-             ORDER BY r.created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("runs_missing_tracking query")?;
-        rows.into_iter().map(row_to_run).collect()
     }
 
     // ---------- additional write paths ----------

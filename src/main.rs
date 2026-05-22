@@ -112,18 +112,6 @@ enum Command {
         #[command(subcommand)]
         command: EvaldCommand,
     },
-    /// Backfill tracking rows for legacy runs by scanning their log files.
-    /// Idempotent — only touches runs that don't already have a tracking row.
-    BackfillTracking,
-    /// Run register_outputs against terminal runs that lack any registered
-    /// output rows. Recovers runs whose outputs went unregistered because
-    /// of the pre-fix terminal-transition bug. Idempotent.
-    RecoverOutputs,
-    /// Recompute `finished_at` for terminal runs from sacct's End field.
-    /// Use this after upgrading past the bug where finished_at was set
-    /// to wall-clock time at reconcile observation rather than the
-    /// actual job end time.
-    RepairFinishTimes,
     /// Run a self-check: cluster config, filesystem perms, scheduler
     /// availability, and systemd unit status. Use this before reporting a
     /// problem so the report includes the environment state.
@@ -567,18 +555,6 @@ fn main() -> Result<()> {
             let artifact = artifacts::register_external(&store, &alias, &path, &kind)?;
             println!("artifact_id: {}", artifact.id);
             println!("alias: {alias}");
-        }
-        Command::BackfillTracking => {
-            let report = tracking::backfill(&cluster, &store)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        Command::RecoverOutputs => {
-            let report = runner::recover_outputs(&cluster, &store)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        Command::RepairFinishTimes => {
-            let report = runner::repair_finish_times(&cluster, &store)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Admin { command } => match command {
             AdminCommand::AddUser { name, no_pg_role, no_create_dirs } => {

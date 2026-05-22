@@ -317,14 +317,6 @@ impl Store {
         self.block_on_pg(self.pg.list_runs())
     }
 
-    pub fn terminal_runs(&self) -> Result<Vec<RunRow>> {
-        self.block_on_pg(self.pg.terminal_runs())
-    }
-
-    pub fn terminal_runs_without_outputs(&self) -> Result<Vec<RunRow>> {
-        self.block_on_pg(self.pg.terminal_runs_without_outputs())
-    }
-
     /// Active runs owned by `submitted_by`. Scoped so a daemon never
     /// reconciles another user's runs.
     pub fn list_active_runs(&self, submitted_by: &str) -> Result<Vec<RunRow>> {
@@ -728,10 +720,6 @@ impl Store {
 
     pub fn get_tracking(&self, run_id: &str) -> Result<Option<TrackingRow>> {
         self.block_on_pg(self.pg.get_tracking(run_id))
-    }
-
-    pub fn runs_missing_tracking(&self) -> Result<Vec<RunRow>> {
-        self.block_on_pg(self.pg.runs_missing_tracking())
     }
 }
 
