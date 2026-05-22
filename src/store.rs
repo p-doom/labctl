@@ -77,7 +77,12 @@ pub struct ArtifactRow {
     pub id: String,
     pub kind: String,
     pub path: PathBuf,
-    pub content_hash: String,
+    /// Legacy diagnostic value from when artifacts were content-addressed
+    /// (`_objects/<prefix>/<hash>/`). `None` on all rows inserted after
+    /// migration 0004 — the column survives on those rows only to
+    /// preserve historic values from imports. No live code path reads
+    /// it for placement or dedup decisions.
+    pub content_hash: Option<String>,
     pub producer_run_id: Option<String>,
     pub metadata_json: Value,
     pub created_at: i64,
@@ -353,33 +358,22 @@ impl Store {
     // ---------- artifacts ----------
 
     /// Register an artifact at the staging path written by the producer.
-    /// Bridges the legacy `(kind, staging_path, content_hash,
-    /// producer_run_id, metadata)` shape onto the DB-only
-    /// `PgStore::insert_artifact` (which takes pre-decomposed args) by
-    /// writing the sidecar in place and inserting the row.
+    /// The producer writes to `<root>/<user>/<alias>/` and the artifact
+    /// lives there permanently — no content-addressed relocation, no
+    /// hash computation. Identity is path-canonical: `artifact_<sha256
+    /// of the canonical path, first 16 hex>`. Re-registering the same
+    /// path therefore yields the same id.
     ///
-    /// The producer writes to `<root>/<user>/<alias>/` (the staging path)
-    /// and the artifact stays there permanently — there is no
-    /// content-addressed relocation. This avoids two pre-migration
-    /// hazards: (1) `fs::rename` from staging into `_objects/<hash>/`
-    /// silently invalidated any absolute self-references baked into
-    /// the artifact body (e.g. `build_sft_chunk_index.py` stores its
-    /// payload_path as an absolute path; renaming the artifact moved
-    /// the bytes out from under it). (2) producers had to honour an
-    /// undocumented "no absolute self-references" contract that was
-    /// easy to violate as new artifact kinds were added.
-    ///
-    /// `content_hash` is retained in the PG row solely as a stored
-    /// property of the artifact — useful for diagnostics, dedup queries,
-    /// or future cross-cluster import. It plays no role in path
-    /// placement and is not consulted on the `insert_artifact` happy
-    /// path (no on-write dedup; cache hits are driven by
-    /// `compute_cache_key`, which has never depended on output bytes).
+    /// The previous content-hash-derived id and `_objects/<hash>/`
+    /// relocation are gone (c1d31e8). Their last vestige — the
+    /// `output_hashes.json` manifest the sbatch wrapper used to write so
+    /// reconcile could skip a cold-NFS hash walk — was deleted alongside
+    /// migration 0004; the `artifacts.content_hash` column survives only
+    /// to preserve legacy values from the importer.
     pub fn insert_artifact(
         &self,
         kind: &str,
         staging_path: &Path,
-        content_hash: &str,
         producer_run_id: Option<&str>,
         metadata: &Value,
     ) -> Result<ArtifactRow> {
@@ -388,7 +382,16 @@ impl Store {
             .get(kind)
             .with_context(|| format!("kind {kind:?} not in cluster.filesystem.artifact_roots"))?
             .clone();
-        let id = format!("artifact_{}", &content_hash[..16.min(content_hash.len())]);
+        // Canonicalize before deriving the id so symlinked paths collapse
+        // onto the same identity. Falls back to the literal staging path
+        // when canonicalize fails (e.g. the dir doesn't exist yet — the
+        // producer hasn't written it, which shouldn't happen on this
+        // call path but is a benign fallback).
+        let canonical = staging_path
+            .canonicalize()
+            .unwrap_or_else(|_| staging_path.to_path_buf());
+        let path_hash = util::sha256_bytes(canonical.display().to_string().as_bytes());
+        let id = format!("artifact_{}", &path_hash[..16]);
         // The staging path is <root>/<user>/<alias>/. Falls back to
         // placeholders for ad-hoc registrations not under a user dir.
         let (user, alias_segment) = decompose_artifact_path(staging_path, &root)
@@ -400,7 +403,6 @@ impl Store {
             kind: kind.to_string(),
             user: user.clone(),
             alias: alias_segment.clone(),
-            content_hash: content_hash.to_string(),
             producer_run_id: producer_run_id.map(str::to_string),
             metadata: metadata.clone(),
             created_at: now,
@@ -411,7 +413,6 @@ impl Store {
             &id,
             kind,
             staging_path,
-            content_hash,
             producer_run_id,
             metadata,
             &user,

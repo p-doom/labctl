@@ -1,10 +1,11 @@
 # Postgres deployment
 
-labctl is moving from filesystem-as-truth + in-memory SQLite cache to
-**Postgres-as-truth** for runs / artifacts / events / pipelines. The
-artifact bytes and provenance bundles continue to live in
-content-addressed FS trees (`_objects/`, `_provenance_objects/`); only
-the indexable metadata moves to PG.
+Postgres is the source of truth for runs, artifacts, aliases, eval
+requests, pipelines, and events. Artifact bytes live at the producer-
+written path under `<artifact_root>/<user>/<alias>/`; provenance
+bundles continue to live in a content-addressed tree
+(`_provenance_objects/`) under `runs_base`. Only the indexable
+metadata is in PG.
 
 This doc covers the **user-installed, single-instance** PG deployment
 under the labctl admin's user account, suitable for a lab-team
@@ -201,12 +202,15 @@ python3 scripts/import-to-pg.py \
 ```
 
 The importer walks `<runs_base>/runs/<user>/<run_id>/.lab/*.json`,
-`<artifact_roots>/<kind>/_objects/<prefix>/<hash>/.meta.json`,
-`<runs_base>/aliases/`, `<runs_base>/pipelines/`,
-`<runs_base>/eval_state/`, and `<runs_base>/events/*.jsonl`, emits
-per-table TSV files (including a derived `users.tsv` built from the
-distinct `submitted_by` / `"user"` values it observes), then `\copy`s
-them into PG in one transaction.
+the legacy `<artifact_roots>/<kind>/_objects/<prefix>/<hash>/.meta.json`
+trees written by pre-c1d31e8 runs, `<runs_base>/aliases/`,
+`<runs_base>/pipelines/`, `<runs_base>/eval_state/`, and
+`<runs_base>/events/*.jsonl`, emits per-table TSV files (including a
+derived `users.tsv` built from the distinct `submitted_by` / `"user"`
+values it observes), then `\copy`s them into PG in one transaction.
+Artifacts written post-c1d31e8 land at their producer path via the
+normal `insert_artifact` path at run-import time, not through the
+`_objects/` walk.
 
 The original `events_id_seq` is restored via `setval` so subsequent
 `INSERT INTO events` doesn't collide with imported event ids.
@@ -219,8 +223,9 @@ Daily `pg_dump` via cron:
 0 2 * * *  module load PostgreSQL/16.4-GCCcore-13.3.0 && pg_dump -h $PGROOT/run labctl | zstd > $PGROOT/backup/labctl-$(date +\%Y\%m\%d).sql.zst
 ```
 
-Combined with the NFS-side artifact bytes and provenance bundles
-(which are content-addressed and inherently restorable from each
+Combined with the NFS-side artifact bytes (under
+`<artifact_root>/<user>/<alias>/`) and provenance bundles
+(content-addressed under `_provenance_objects/`, inherently restorable from each
 other or from a peer cluster), this is the disaster-recovery story.
 
 ## Connecting from labctl

@@ -3,13 +3,19 @@
 //! Postgres is the source of truth for runs, artifacts, aliases, eval
 //! requests, pipelines, and events; this module owns the FS bits that
 //! still have to live on shared storage:
-//!   - Artifact bytes under `<artifact_roots[kind]>/_objects/<prefix>/<hash>/`,
-//!     plus the per-user `aliases/<user>/<alias>` symlink overlay.
-//!   - The slurm-compute → login bridge: `<run_dir>/.lab/context.json`
-//!     and `<run_dir>/.lab/output_hashes.json`, written by the compute
-//!     job because compute nodes can't reach PG.
-//!   - The `_objects/<prefix>/<hash>/.meta.json` sidecar, a human-readable
-//!     projection of the corresponding `artifacts` row.
+//!   - Artifact bytes under `<artifact_roots[kind]>/<user>/<alias>/`,
+//!     written directly by the producing run. There is no content-
+//!     addressed relocation: the staging path IS the canonical path
+//!     for the rest of the artifact's life (c1d31e8). A legacy
+//!     `_objects/<prefix>/<hash>/` tree may still exist on disk from
+//!     pre-c1d31e8 runs; PG records its canonical path verbatim, no
+//!     migration needed.
+//!   - The slurm-compute → login bridge: `<run_dir>/.lab/context.json`,
+//!     written at submit by the login side, read by the sbatch wrapper
+//!     on the compute node. The compute side writes nothing back —
+//!     reconcile walks the declared output paths and registers them.
+//!   - The `.meta.json` sidecar inside each artifact's dir, a
+//!     human-readable projection of the corresponding `artifacts` row.
 //!
 //! Atomicity rules:
 //!   - FS writes go tmp + rename(2) (atomic on Lustre/GPFS within the
@@ -75,7 +81,6 @@ pub struct ArtifactSidecar {
     pub kind: String,
     pub user: String,
     pub alias: String,
-    pub content_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer_run_id: Option<String>,
     pub metadata: Value,

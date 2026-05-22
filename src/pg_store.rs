@@ -1081,17 +1081,18 @@ impl PgStore {
         Ok(())
     }
 
-    /// Insert an artifact row. DB-only: caller is responsible for moving
-    /// bytes into the content-addressed slot and writing the per-user
-    /// alias overlays. The SQLite Store does FS work here too — this
-    /// port deliberately doesn't, leaving orchestration to higher layers.
+    /// Insert an artifact row. DB-only: the caller owns the sidecar
+    /// (`.meta.json`) write and any other FS work. `content_hash` is
+    /// NULL on every row inserted through this method — the column
+    /// only carries values populated by the original importer / legacy
+    /// content-addressed code (migration 0004 relaxed NOT NULL and
+    /// dropped UNIQUE).
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_artifact(
         &self,
         id: &str,
         kind: &str,
         path: &Path,
-        content_hash: &str,
         producer_run_id: Option<&str>,
         metadata: &Value,
         user: &str,
@@ -1102,12 +1103,11 @@ impl PgStore {
             "INSERT INTO artifacts
              (id, kind, path, content_hash, producer_run_id, metadata_json,
               created_at, \"user\", alias_segment)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8)",
         )
         .bind(id)
         .bind(kind)
         .bind(path.display().to_string())
-        .bind(content_hash)
         .bind(producer_run_id)
         .bind(sqlx::types::Json(metadata))
         .bind(created_at)
