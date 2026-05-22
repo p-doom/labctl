@@ -411,8 +411,14 @@ impl Recipe {
             if spec.kind.trim().is_empty() {
                 bail!("recipe {:?}: output {role:?} has empty type", self.name);
             }
-            if spec.marker.trim().is_empty() {
-                bail!("recipe {:?}: output {role:?} has empty marker", self.name);
+            match &spec.marker {
+                Some(m) if m.trim().is_empty() => {
+                    bail!("recipe {:?}: output {role:?} has empty marker (omit the field to gate on job success)", self.name);
+                }
+                None if spec.kind == "checkpoint_stream" => {
+                    bail!("recipe {:?}: output {role:?} (kind=checkpoint_stream) requires a marker", self.name);
+                }
+                _ => {}
             }
             if spec.alias.trim().is_empty() {
                 bail!(
@@ -495,7 +501,11 @@ pub enum InputSpec {
 pub struct OutputSpec {
     #[serde(rename = "type")]
     pub kind: String,
-    pub marker: String,
+    /// Required for ``checkpoint_stream`` (per-step completion signal).
+    /// Optional otherwise — when omitted, registration gates on
+    /// ``run.status == "succeeded"`` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
     /// Required. The rendered alias is the directory name under
     /// ``cluster.filesystem.output_roots[kind]`` that this output's marker
     /// must land in. Supports the same templating as ``[args]``: at minimum

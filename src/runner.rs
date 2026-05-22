@@ -25,7 +25,8 @@ pub struct OutputResolution {
     pub role: String,
     pub kind: String,
     pub alias: String,
-    pub marker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
     pub path: PathBuf,
 }
 
@@ -137,9 +138,9 @@ fn cache_hit_outputs_valid(
     // Build a map of role -> expected marker so we can verify each artifact
     // still has its completion marker (in case someone scrubbed the content
     // but left a stray dir).
-    let role_to_marker: BTreeMap<&str, &str> = outputs
+    let role_to_marker: BTreeMap<&str, Option<&str>> = outputs
         .iter()
-        .map(|(r, res)| (r.as_str(), res.marker.as_str()))
+        .map(|(r, res)| (r.as_str(), res.marker.as_deref()))
         .collect();
     for art in prior_outputs {
         // Find the role this artifact filled. The artifact's `metadata_json`
@@ -156,8 +157,10 @@ fn cache_hit_outputs_valid(
         if !art.path.exists() {
             return false;
         }
-        if !art.path.join(marker).exists() {
-            return false;
+        if let Some(m) = marker {
+            if !art.path.join(m).exists() {
+                return false;
+            }
         }
     }
     !prior_outputs.is_empty()
@@ -537,18 +540,20 @@ fn submit_recipe_inner(
     // so the top-level directory existing means nothing — let it through.
     for resolution in outputs.values() {
         if resolution.kind != "checkpoint_stream" {
-            let marker_path = resolution.path.join(&resolution.marker);
-            if marker_path.exists() {
-                bail!(
-                    "output marker already present: {} (role={:?}, alias={:?}, kind={:?}) and \
-                     no matching cache_key in registry. The path holds a stale artifact from a \
-                     different recipe/input combination. Delete the path explicitly or template \
-                     the alias with {{run.id}} for per-submission uniqueness.",
-                    marker_path.display(),
-                    resolution.role,
-                    resolution.alias,
-                    resolution.kind,
-                );
+            if let Some(m) = &resolution.marker {
+                let marker_path = resolution.path.join(m);
+                if marker_path.exists() {
+                    bail!(
+                        "output marker already present: {} (role={:?}, alias={:?}, kind={:?}) and \
+                         no matching cache_key in registry. The path holds a stale artifact from a \
+                         different recipe/input combination. Delete the path explicitly or template \
+                         the alias with {{run.id}} for per-submission uniqueness.",
+                        marker_path.display(),
+                        resolution.role,
+                        resolution.alias,
+                        resolution.kind,
+                    );
+                }
             }
         }
         fs::create_dir_all(&resolution.path).with_context(|| {
@@ -1963,7 +1968,10 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
                     Some(n) => n,
                     None => continue,
                 };
-                if !step_dir.join(&resolution.marker).exists() {
+                let marker = resolution.marker.as_deref().expect(
+                    "checkpoint_stream marker is validated in OutputSpec",
+                );
+                if !step_dir.join(marker).exists() {
                     continue;
                 }
                 // Short-circuit: if we've already registered an artifact
@@ -1993,7 +2001,7 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
                     &json!({
                         "role": role,
                         "step": step,
-                        "marker": resolution.marker,
+                        "marker": marker,
                         "stream_alias": resolution.alias,
                         "producer_recipe": run.recipe_name,
                     }),
@@ -2002,7 +2010,11 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
                 count += 1;
             }
         } else {
-            if !resolution.path.join(&resolution.marker).is_file() {
+            let ready = match &resolution.marker {
+                Some(m) => resolution.path.join(m).is_file(),
+                None => run.status == "succeeded",
+            };
+            if !ready {
                 continue;
             }
             let content_hash = match manifest.get(role) {
@@ -2011,13 +2023,15 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
             };
             let mut metadata = json!({
                 "role": role,
-                "marker": resolution.marker,
                 "producer_recipe": run.recipe_name,
             });
-            if resolution.kind == "eval_result" {
-                if let Ok(text) = fs::read_to_string(resolution.path.join(&resolution.marker)) {
-                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                        metadata["result"] = value;
+            if let Some(m) = &resolution.marker {
+                metadata["marker"] = json!(m);
+                if resolution.kind == "eval_result" {
+                    if let Ok(text) = fs::read_to_string(resolution.path.join(m)) {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            metadata["result"] = value;
+                        }
                     }
                 }
             }
