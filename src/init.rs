@@ -650,6 +650,7 @@ fn skeleton_config(name: Option<&str>) -> ClusterConfig {
         scheduler: SchedulerConfig::default(),
         slurm: SlurmConfig::default(),
         dispatch: None,
+        postgres: None,
         remote: None,
     }
 }

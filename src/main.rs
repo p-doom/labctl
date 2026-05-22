@@ -4,6 +4,7 @@ mod config;
 mod evald;
 mod fs_layout;
 mod init;
+mod pg_store;
 mod prompt;
 mod provenance;
 mod remote;

@@ -25,6 +25,11 @@ pub struct ClusterConfig {
     /// Optional reconcile/evald/throttle loops for the per-user agent.
     /// Read by `labctl agent`. When absent, the agent is a no-op.
     pub dispatch: Option<DispatchConfig>,
+    /// Postgres connection settings. Required for the PG-as-truth
+    /// registry; legacy example configs (no [postgres] section)
+    /// hard-fail at `Store::open` rather than silently falling back.
+    #[serde(default)]
+    pub postgres: Option<PgConfig>,
     /// How OTHER clusters reach this one. Consumed only when this
     /// config is loaded as a *foreign* cluster (e.g. `labctl
     /// import-from-cluster <this.toml> <alias>` invoked from another
@@ -223,6 +228,43 @@ pub enum SchedulerKind {
     #[default]
     Slurm,
     Local,
+}
+
+/// Postgres connection settings. `host` accepts either a TCP hostname/IP
+/// or an absolute filesystem path (Unix socket directory — peer auth
+/// on the PG host). `password_env` names an environment variable to
+/// read the password from (or omit for peer / `~/.pgpass`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PgConfig {
+    pub host: String,
+    #[serde(default = "default_pg_port")]
+    pub port: u16,
+    #[serde(default = "default_pg_db")]
+    pub database: String,
+    /// Defaults to `$USER` when unset — every PG user role is a
+    /// 1:1 mapping with a labctl user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Name of an env var that holds the password. Omit for peer auth
+    /// on the Unix socket or for ~/.pgpass-driven auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_env: Option<String>,
+    /// Max pool connections. Defaults to 8 — plenty for a single
+    /// user's agent + CLI + UI process group.
+    #[serde(default = "default_pg_max_connections")]
+    pub max_connections: u32,
+}
+
+fn default_pg_port() -> u16 {
+    5432
+}
+
+fn default_pg_db() -> String {
+    "labctl".to_string()
+}
+
+fn default_pg_max_connections() -> u32 {
+    8
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

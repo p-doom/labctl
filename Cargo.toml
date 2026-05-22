@@ -18,7 +18,24 @@ hex = "0.4"
 # umask() at process startup. Linux/macOS only; on other platforms the
 # shared-group code paths compile to no-ops.
 libc = "0.2"
+# Kept during the PG migration: the legacy in-memory `Store` (cache
+# rebuild from FS sidecars) still backs the production code paths.
+# Once all callers have moved to `PgStore` (sqlx + Postgres-as-truth),
+# this dependency is removed and `src/store.rs` is deleted.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Postgres client. `runtime-tokio-rustls` ties the driver to our
+# existing tokio runtime and links rustls statically (no openssl
+# system dep). `migrate` lets us run schema migrations from code at
+# agent / CLI startup. `chrono` enables direct mapping of BIGINT-as-
+# unix-timestamp columns to `i64` (the native rep we already use).
+# `json` enables jsonb<->serde_json::Value mapping.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "migrate",
+    "json",
+    "chrono",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

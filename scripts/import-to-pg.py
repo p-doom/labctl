@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+One-shot importer: walks labctl's existing FS sidecars and loads the data
+into a Postgres database created by migrations/0001_initial_schema.sql.
+
+Output strategy: emits per-table TSV files into a working dir, then runs
+`psql \\copy table FROM 'file.tsv'` for each. Bulk loading is meaningfully
+faster than per-row INSERTs at the events-table scale (~19k rows).
+
+Idempotent re-run by design: the script TRUNCATEs each table before
+loading. This is intended only for the one-shot cutover, not for
+incremental sync.
+
+Usage:
+    python3 scripts/import-to-pg.py \\
+        --cluster ~/.config/labctl/cluster.toml \\
+        --pg-socket /fast/project/.../postgres/run \\
+        --pg-db labctl \\
+        [--workdir /tmp/labctl-import] \\
+        [--dry-run]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib  # type: ignore
+
+
+LAB_DIRNAME = ".lab"
+RUN_JSON = "run.json"
+INPUTS_JSON = "inputs.json"
+OUTPUTS_JSON = "outputs.json"
+TRACKING_JSON = "tracking.json"
+PIPELINE_JSON = "pipeline.json"
+EVAL_REQUEST_JSON = "request.json"
+ALIAS_TARGET = ".target.json"
+META_FILENAME = ".meta.json"
+OBJECTS_DIR = "_objects"
+ALIASES_USER_DIR = "aliases"
+
+
+# Per-table TSV writers. We sidestep PG's default DELIMITER vs. JSON
+# field issues by using TSV with explicit field escapes — JSON columns
+# go in as TEXT and get cast on the PG side via JSONB.
+PG_NULL = "\\N"
+
+
+def tsv_escape(v: Any) -> str:
+    """Escape a value for PG \\copy TSV format."""
+    if v is None:
+        return PG_NULL
+    if isinstance(v, bool):
+        return "t" if v else "f"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v)
+    return (
+        s.replace("\\", "\\\\")
+         .replace("\t", "\\t")
+         .replace("\n", "\\n")
+         .replace("\r", "\\r")
+    )
+
+
+def json_field(v: Any) -> str:
+    """A value destined for a JSONB column: serialize to JSON, then escape."""
+    return tsv_escape(json.dumps(v, separators=(",", ":")))
+
+
+@dataclass
+class Counts:
+    runs: int = 0
+    pipelines: int = 0
+    artifacts: int = 0
+    artifact_aliases: int = 0
+    artifact_user_aliases: int = 0
+    run_inputs: int = 0
+    run_outputs: int = 0
+    eval_requests: int = 0
+    tracking: int = 0
+    events: int = 0
+
+
+def load_cluster(path: Path) -> dict:
+    with path.open("rb") as f:
+        return tomllib.load(f)
+
+
+def read_json_optional(path: Path) -> Any:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  ! cannot read {path}: {e}", file=sys.stderr)
+        return None
+
+
+# ---------- per-table extractors ----------
+
+
+def emit_runs_and_associated(
+    runs_base: Path, w_runs, w_inputs, w_outputs, w_tracking, counts: Counts
+):
+    runs_root = runs_base / "runs"
+    if not runs_root.is_dir():
+        return
+    for user_dir in sorted(runs_root.iterdir()):
+        if not user_dir.is_dir():
+            continue
+        for run_dir in sorted(user_dir.iterdir()):
+            if not run_dir.is_dir():
+                continue
+            lab = run_dir / LAB_DIRNAME
+            sidecar = read_json_optional(lab / RUN_JSON)
+            if sidecar is None:
+                continue
+            # runs row
+            w_runs.writerow([
+                tsv_escape(sidecar["id"]),
+                tsv_escape(sidecar["recipe_name"]),
+                tsv_escape(sidecar["recipe_hash"]),
+                tsv_escape(sidecar.get("status", "created")),
+                tsv_escape(sidecar.get("job_id")),
+                tsv_escape(sidecar["run_dir"]),
+                tsv_escape(sidecar["repo"]),
+                tsv_escape(sidecar["source_path"]),
+                json_field(sidecar["recipe"]),
+                json_field(sidecar["context"]),
+                tsv_escape(sidecar["created_at"]),
+                tsv_escape(sidecar.get("finished_at")),
+                tsv_escape(sidecar.get("pipeline_id")),
+                tsv_escape(
+                    json.dumps(sidecar["dependency_on"])
+                    if sidecar.get("dependency_on") is not None
+                    else None
+                ),
+                tsv_escape(sidecar.get("stage_name")),
+                tsv_escape(sidecar["submitted_by"]),
+                tsv_escape(sidecar.get("cache_key")),
+                tsv_escape(sidecar.get("coalesced_peer_run_id")),
+            ])
+            counts.runs += 1
+
+            # inputs.json
+            inputs = read_json_optional(lab / INPUTS_JSON) or []
+            for inp in inputs:
+                w_inputs.writerow([
+                    tsv_escape(sidecar["id"]),
+                    tsv_escape(inp["role"]),
+                    tsv_escape(inp.get("artifact_id")),
+                    tsv_escape(inp["resolved_path"]),
+                ])
+                counts.run_inputs += 1
+
+            # outputs.json
+            outputs = read_json_optional(lab / OUTPUTS_JSON) or []
+            for out in outputs:
+                w_outputs.writerow([
+                    tsv_escape(sidecar["id"]),
+                    tsv_escape(out["role"]),
+                    tsv_escape(out["artifact_id"]),
+                ])
+                counts.run_outputs += 1
+
+            # tracking.json
+            tracking = read_json_optional(lab / TRACKING_JSON)
+            if tracking is not None:
+                w_tracking.writerow([
+                    tsv_escape(sidecar["id"]),
+                    tsv_escape(tracking["entity"]),
+                    tsv_escape(tracking["project"]),
+                    tsv_escape(tracking["url"]),
+                    tsv_escape(tracking.get("group_name")),
+                    tsv_escape(tracking["source"]),
+                    tsv_escape(tracking["created_at"]),
+                ])
+                counts.tracking += 1
+
+
+def emit_pipelines(runs_base: Path, w_pipelines, counts: Counts):
+    root = runs_base / "pipelines"
+    if not root.is_dir():
+        return
+    for user_dir in sorted(root.iterdir()):
+        if not user_dir.is_dir():
+            continue
+        for pipeline_dir in sorted(user_dir.iterdir()):
+            if not pipeline_dir.is_dir():
+                continue
+            sidecar = read_json_optional(pipeline_dir / PIPELINE_JSON)
+            if sidecar is None:
+                continue
+            w_pipelines.writerow([
+                tsv_escape(sidecar["id"]),
+                tsv_escape(sidecar["name"]),
+                tsv_escape(sidecar.get("pipeline_path")),
+                tsv_escape(sidecar["user"]),
+                tsv_escape(sidecar["created_at"]),
+            ])
+            counts.pipelines += 1
+
+
+def emit_artifacts_and_user_aliases(
+    artifact_roots: dict[str, Path], w_artifacts, w_user_aliases, counts: Counts
+):
+    seen_roots = set()
+    for kind, root in artifact_roots.items():
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+
+        objects_root = root / OBJECTS_DIR
+        if objects_root.is_dir():
+            for prefix_dir in sorted(objects_root.iterdir()):
+                if not prefix_dir.is_dir():
+                    continue
+                for hash_dir in sorted(prefix_dir.iterdir()):
+                    if not hash_dir.is_dir():
+                        continue
+                    sidecar = read_json_optional(hash_dir / META_FILENAME)
+                    if sidecar is None:
+                        continue
+                    w_artifacts.writerow([
+                        tsv_escape(sidecar["id"]),
+                        tsv_escape(sidecar["kind"]),
+                        tsv_escape(str(hash_dir)),
+                        tsv_escape(sidecar["content_hash"]),
+                        tsv_escape(sidecar.get("producer_run_id")),
+                        json_field(sidecar["metadata"]),
+                        tsv_escape(sidecar["created_at"]),
+                        tsv_escape(sidecar["user"]),
+                        tsv_escape(sidecar["alias"]),
+                    ])
+                    counts.artifacts += 1
+
+        # Per-user alias overlay symlinks.
+        aliases_root = root / ALIASES_USER_DIR
+        if aliases_root.is_dir():
+            for user_dir in sorted(aliases_root.iterdir()):
+                if not user_dir.is_dir():
+                    continue
+                for entry in sorted(user_dir.iterdir()):
+                    if not entry.is_symlink():
+                        continue
+                    try:
+                        target = entry.resolve()
+                    except OSError:
+                        continue
+                    sidecar = read_json_optional(target / META_FILENAME)
+                    if sidecar is None:
+                        continue
+                    w_user_aliases.writerow([
+                        tsv_escape(user_dir.name),
+                        tsv_escape(entry.name),
+                        tsv_escape(sidecar["kind"]),
+                        tsv_escape(sidecar["id"]),
+                        tsv_escape(sidecar["created_at"]),
+                    ])
+                    counts.artifact_user_aliases += 1
+
+
+def emit_global_aliases(runs_base: Path, w_aliases, counts: Counts):
+    root = runs_base / "aliases"
+    if not root.is_dir():
+        return
+    for alias_dir in sorted(root.iterdir()):
+        if not alias_dir.is_dir():
+            continue
+        sidecar = read_json_optional(alias_dir / ALIAS_TARGET)
+        if sidecar is None:
+            continue
+        w_aliases.writerow([
+            tsv_escape(alias_dir.name),
+            tsv_escape(sidecar["artifact_id"]),
+            tsv_escape(sidecar["created_at"]),
+        ])
+        counts.artifact_aliases += 1
+
+
+def emit_eval_requests(runs_base: Path, w_eval, counts: Counts):
+    root = runs_base / "eval_state"
+    if not root.is_dir():
+        return
+    for user_dir in sorted(root.iterdir()):
+        if not user_dir.is_dir():
+            continue
+        for key_dir in sorted(user_dir.iterdir()):
+            if not key_dir.is_dir():
+                continue
+            sidecar = read_json_optional(key_dir / EVAL_REQUEST_JSON)
+            if sidecar is None:
+                continue
+            w_eval.writerow([
+                tsv_escape(sidecar["eval_key"]),
+                tsv_escape(sidecar["checkpoint_artifact_id"]),
+                tsv_escape(sidecar["eval_recipe_hash"]),
+                tsv_escape(sidecar["policy_id"]),
+                tsv_escape(sidecar.get("eval_run_id")),
+                tsv_escape(sidecar["state"]),
+                tsv_escape(sidecar["attempts"]),
+                tsv_escape(user_dir.name),
+                tsv_escape(sidecar["created_at"]),
+                tsv_escape(sidecar["updated_at"]),
+            ])
+            counts.eval_requests += 1
+
+
+def emit_events(runs_base: Path, w_events, counts: Counts):
+    root = runs_base / "events"
+    if not root.is_dir():
+        return
+    files = sorted(p for p in root.iterdir() if p.suffix == ".jsonl")
+    for path in files:
+        try:
+            with path.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    w_events.writerow([
+                        tsv_escape(ev.get("run_id")),
+                        tsv_escape(ev["event_type"]),
+                        json_field(ev.get("payload", {})),
+                        tsv_escape(ev["created_at"]),
+                    ])
+                    counts.events += 1
+        except OSError as e:
+            print(f"  ! cannot read events file {path}: {e}", file=sys.stderr)
+
+
+# ---------- driver ----------
+
+
+@dataclass
+class TableSpec:
+    name: str
+    columns: list[str]
+    file: Path = field(default=Path())
+
+
+TABLES = [
+    TableSpec(
+        "runs",
+        [
+            "id", "recipe_name", "recipe_hash", "status", "job_id",
+            "run_dir", "repo", "source_path", "recipe_json", "context_json",
+            "created_at", "finished_at", "pipeline_id", "dependency_on",
+            "stage_name", "submitted_by", "cache_key", "coalesced_peer_run_id",
+        ],
+    ),
+    TableSpec("pipelines", ["id", "name", "pipeline_path", '"user"', "created_at"]),
+    TableSpec(
+        "artifacts",
+        ["id", "kind", "path", "content_hash", "producer_run_id",
+         "metadata_json", "created_at", '"user"', "alias_segment"],
+    ),
+    TableSpec("artifact_aliases", ["alias", "artifact_id", "created_at"]),
+    TableSpec(
+        "artifact_user_aliases",
+        ['"user"', "alias", "kind", "artifact_id", "created_at"],
+    ),
+    TableSpec("run_inputs", ["run_id", "role", "artifact_id", "resolved_path"]),
+    TableSpec("run_outputs", ["run_id", "role", "artifact_id"]),
+    TableSpec(
+        "eval_requests",
+        ["eval_key", "checkpoint_artifact_id", "eval_recipe_hash", "policy_id",
+         "eval_run_id", "state", "attempts", '"user"', "created_at", "updated_at"],
+    ),
+    TableSpec(
+        "tracking",
+        ["run_id", "entity", "project", "url", "group_name", "source", "created_at"],
+    ),
+    TableSpec(
+        "events",
+        ["run_id", "event_type", "payload_json", "created_at"],
+    ),
+]
+
+
+def run_psql(args: list[str], stdin: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["psql", *args],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--cluster", required=True, type=Path)
+    p.add_argument(
+        "--pg-socket",
+        default="/fast/project/HFMI_SynergyUnit/p-doom_shared/labctl/postgres/run",
+    )
+    p.add_argument("--pg-db", default="labctl")
+    p.add_argument(
+        "--workdir",
+        type=Path,
+        default=Path("/tmp/labctl-import"),
+        help="Per-table TSV scratch files land here. Removed on success.",
+    )
+    p.add_argument("--dry-run", action="store_true",
+                   help="Emit TSV files; don't run \\copy.")
+    args = p.parse_args()
+
+    cfg = load_cluster(args.cluster.expanduser())
+    runs_base = Path(cfg["filesystem"]["runs_base"])
+    artifact_roots = {
+        kind: Path(p) for kind, p in cfg["filesystem"]["artifact_roots"].items()
+    }
+
+    args.workdir.mkdir(parents=True, exist_ok=True)
+    for t in TABLES:
+        t.file = args.workdir / f"{t.name}.tsv"
+
+    counts = Counts()
+    handles = {t.name: t.file.open("w", newline="") for t in TABLES}
+
+    class TsvWriter:
+        """Minimal TSV writer: row -> '\\t'-joined + '\\n'. All
+        per-cell escaping is the caller's responsibility (see
+        `tsv_escape` / `json_field`). This sidesteps the stdlib
+        csv module's reluctance to write rows containing the
+        delimiter even when we've already escaped them."""
+
+        def __init__(self, handle):
+            self.h = handle
+
+        def writerow(self, row):
+            self.h.write("\t".join(row))
+            self.h.write("\n")
+
+    writers = {n: TsvWriter(h) for n, h in handles.items()}
+    try:
+        emit_runs_and_associated(
+            runs_base,
+            writers["runs"],
+            writers["run_inputs"],
+            writers["run_outputs"],
+            writers["tracking"],
+            counts,
+        )
+        emit_pipelines(runs_base, writers["pipelines"], counts)
+        emit_artifacts_and_user_aliases(
+            artifact_roots,
+            writers["artifacts"],
+            writers["artifact_user_aliases"],
+            counts,
+        )
+        emit_global_aliases(runs_base, writers["artifact_aliases"], counts)
+        emit_eval_requests(runs_base, writers["eval_requests"], counts)
+        emit_events(runs_base, writers["events"], counts)
+    finally:
+        for h in handles.values():
+            h.close()
+
+    print(f"emitted: runs={counts.runs} pipelines={counts.pipelines} "
+          f"artifacts={counts.artifacts} artifact_aliases={counts.artifact_aliases} "
+          f"artifact_user_aliases={counts.artifact_user_aliases} "
+          f"run_inputs={counts.run_inputs} run_outputs={counts.run_outputs} "
+          f"eval_requests={counts.eval_requests} tracking={counts.tracking} "
+          f"events={counts.events}")
+
+    if args.dry_run:
+        print(f"(dry run — TSV files in {args.workdir}; no \\copy executed)")
+        return 0
+
+    # TRUNCATE + COPY each table in dependency-safe order. Truncate
+    # with CASCADE so FK references (none currently, but might be
+    # added later) get reset cleanly.
+    pg_args = ["-h", args.pg_socket, "-d", args.pg_db, "-v", "ON_ERROR_STOP=1"]
+    truncate_sql = "TRUNCATE " + ", ".join(t.name for t in TABLES) + " RESTART IDENTITY;"
+    r = run_psql(pg_args + ["-c", truncate_sql])
+    if r.returncode != 0:
+        print(f"TRUNCATE failed: {r.stderr}", file=sys.stderr)
+        return 1
+
+    for t in TABLES:
+        cols = ", ".join(t.columns)
+        copy_sql = f"\\copy {t.name} ({cols}) FROM '{t.file}'"
+        r = run_psql(pg_args + ["-c", copy_sql])
+        if r.returncode != 0:
+            print(f"\\copy {t.name} failed: {r.stderr}", file=sys.stderr)
+            return 1
+        # psql prints "COPY N" to stdout
+        rows = r.stdout.strip().split()[-1] if r.stdout else "?"
+        print(f"  {t.name}: {rows} rows")
+
+    # Bump the events seq to max(id)+1 (so future inserts don't
+    # collide with imported rows).
+    r = run_psql(pg_args + ["-c",
+        "SELECT setval('events_id_seq', COALESCE((SELECT MAX(id) FROM events), 1));"])
+    if r.returncode != 0:
+        print(f"setval events_id_seq failed: {r.stderr}", file=sys.stderr)
+        return 1
+
+    print("Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
