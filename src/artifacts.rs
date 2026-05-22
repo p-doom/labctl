@@ -22,7 +22,7 @@ use crate::{
 /// that. Re-registering the same path yields the same artifact id; moving
 /// the data to a new path and re-registering produces a fresh entry.
 pub fn register_external(
-    store: &mut Store,
+    store: &Store,
     alias: &str,
     path: &Path,
     kind: &str,
@@ -77,7 +77,7 @@ pub struct ImportReport {
 /// errors point at the right next step rather than papering over.
 pub fn import_from_cluster(
     local_cluster: &ClusterConfig,
-    local_store: &mut Store,
+    local_store: &Store,
     foreign_cluster: &ClusterConfig,
     foreign_alias: &str,
     local_alias: Option<&str>,

@@ -29,7 +29,7 @@ pub struct BackfillReport {
     pub no_log: usize,
 }
 
-pub fn backfill(_cluster: &ClusterConfig, store: &mut Store) -> Result<BackfillReport> {
+pub fn backfill(_cluster: &ClusterConfig, store: &Store) -> Result<BackfillReport> {
     let runs = store.runs_missing_tracking()?;
     let mut report = BackfillReport {
         scanned: runs.len(),
@@ -61,7 +61,7 @@ pub enum PopulateResult {
 /// without doing any I/O if a row exists. Suitable to call on every run
 /// from inside `reconcile` — the only cost when nothing changes is one
 /// indexed SQL lookup per run.
-pub fn try_populate_from_log(store: &mut Store, run: &RunRow) -> Result<PopulateResult> {
+pub fn try_populate_from_log(store: &Store, run: &RunRow) -> Result<PopulateResult> {
     if store.get_tracking(&run.id)?.is_some() {
         return Ok(PopulateResult::AlreadyTracked);
     }

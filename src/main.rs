@@ -509,7 +509,7 @@ fn main() -> Result<()> {
     }
 
     let cluster = config::ClusterConfig::load(&cluster_path)?;
-    let mut store = store::Store::open(&cluster)?;
+    let store = store::Store::open(&cluster)?;
 
     match cli.command {
         Command::PipelineShow { id } => {
@@ -536,7 +536,7 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Command::Reconcile => {
-            let report = runner::reconcile(&cluster, &mut store)?;
+            let report = runner::reconcile(&cluster, &store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Status => {
@@ -555,11 +555,11 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Command::Gc { terminal_snapshots } => {
-            let removed = runner::gc(&cluster, &mut store, terminal_snapshots)?;
+            let removed = runner::gc(&cluster, &store, terminal_snapshots)?;
             println!("removed_snapshots: {removed}");
         }
         Command::RegisterExternal { alias, path, kind } => {
-            let artifact = artifacts::register_external(&mut store, &alias, &path, &kind)?;
+            let artifact = artifacts::register_external(&store, &alias, &path, &kind)?;
             println!("artifact_id: {}", artifact.id);
             println!("alias: {alias}");
         }
@@ -572,7 +572,7 @@ fn main() -> Result<()> {
             let foreign_cluster = config::ClusterConfig::load(&foreign)?;
             let report = artifacts::import_from_cluster(
                 &cluster,
-                &mut store,
+                &store,
                 &foreign_cluster,
                 &from,
                 r#as.as_deref(),
@@ -581,21 +581,21 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::BackfillTracking => {
-            let report = tracking::backfill(&cluster, &mut store)?;
+            let report = tracking::backfill(&cluster, &store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::RecoverOutputs => {
-            let report = runner::recover_outputs(&cluster, &mut store)?;
+            let report = runner::recover_outputs(&cluster, &store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::RepairFinishTimes => {
-            let report = runner::repair_finish_times(&cluster, &mut store)?;
+            let report = runner::repair_finish_times(&cluster, &store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Evald { command } => match command {
             EvaldCommand::Once { policy } => {
                 let policy = config::EvalPolicy::load(&policy)?;
-                let report = evald::run_once(&cluster, &mut store, &policy)?;
+                let report = evald::run_once(&cluster, &store, &policy)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
         },
@@ -1002,8 +1002,8 @@ fn run_recipe_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<(
     let cluster = config::ClusterConfig::load(cluster_path)?;
     let recipe = config::Recipe::load(recipe_path)?;
     let submitted_by = current_user()?;
-    let mut store = store::Store::open(&cluster)?;
-    let submitted = runner::submit_recipe(&cluster, &mut store, &recipe, None, &submitted_by)?;
+    let store = store::Store::open(&cluster)?;
+    let submitted = runner::submit_recipe(&cluster, &store, &recipe, None, &submitted_by)?;
     println!("run_id: {}", submitted.run_id);
     println!("job_id: {}", submitted.job_id);
     println!("run_dir: {}", submitted.run_dir.display());
@@ -1033,8 +1033,8 @@ fn run_sweep_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()
         if sweep.aggregate.is_some() { " + aggregate" } else { "" },
     );
     let submitted_by = current_user()?;
-    let mut store = store::Store::open(&cluster)?;
-    let result = runner::submit_sweep(&cluster, &mut store, &recipe, &submitted_by)?;
+    let store = store::Store::open(&cluster)?;
+    let result = runner::submit_sweep(&cluster, &store, &recipe, &submitted_by)?;
     println!(
         "array_run_id: {}\narray_job_id: {}\narray_run_dir: {}",
         result.array_run.run_id,
@@ -1053,10 +1053,10 @@ fn run_pipeline_command(cluster_path: &PathBuf, pipeline_path: &PathBuf) -> Resu
     let cluster = config::ClusterConfig::load(cluster_path)?;
     let loaded = config::Pipeline::load(pipeline_path)?;
     let submitted_by = current_user()?;
-    let mut store = store::Store::open(&cluster)?;
+    let store = store::Store::open(&cluster)?;
     let submitted = runner::submit_pipeline(
         &cluster,
-        &mut store,
+        &store,
         &loaded,
         Some(pipeline_path),
         &submitted_by,

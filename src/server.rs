@@ -46,7 +46,7 @@ struct Assets;
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Mutex<Store>>,
+    store: Arc<Store>,
     cluster: Arc<ClusterConfig>,
     /// Broadcast channel for SSE clients. The events-table tail task posts
     /// here; each connected client subscribes via `/api/stream`.
@@ -80,7 +80,7 @@ pub fn serve(cluster: ClusterConfig, store: Store, addr: SocketAddr) -> Result<(
     // subscribers get lagged out and re-sync via REST on next focus.
     let (events_tx, _) = broadcast::channel::<StreamEvent>(256);
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        store: Arc::new(store),
         cluster: Arc::new(cluster),
         events_tx: events_tx.clone(),
         dataset_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -151,7 +151,7 @@ pub fn serve(cluster: ClusterConfig, store: Store, addr: SocketAddr) -> Result<(
 }
 
 async fn events_tailer(
-    store: Arc<Mutex<Store>>,
+    store: Arc<Store>,
     tx: broadcast::Sender<StreamEvent>,
 ) {
     // Start at the current tip so we don't replay the entire backlog
@@ -159,7 +159,7 @@ async fn events_tailer(
     // synchronously by dispatch writes (Store::event), so the tailer
     // just polls for ids strictly greater than its last cursor.
     let mut last_id: i64 = {
-        let s = store.lock().unwrap();
+        let s = &store;
         s.max_event_id().unwrap_or(0)
     };
     let mut interval = tokio::time::interval(Duration::from_millis(500));
@@ -170,7 +170,7 @@ async fn events_tailer(
             continue;
         }
         let new_events = {
-            let s = store.lock().unwrap();
+            let s = &store;
             match s.events_after(last_id) {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -305,7 +305,7 @@ fn artifact_summary(a: &ArtifactRow) -> Value {
 // ---------- handlers ----------
 
 async fn list_runs(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let runs: Vec<Value> = store.list_runs()?.iter().map(run_summary).collect();
     Ok(axum::Json(json!({ "runs": runs })))
 }
@@ -314,7 +314,7 @@ async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let view = store.run_view(&id).map_err(|_| not_found(format!("run not found: {id}")))?;
     let inputs: Vec<Value> = view
         .inputs
@@ -875,7 +875,7 @@ async fn get_run_log(
     Query(params): Query<LogParams>,
 ) -> Result<axum::Json<Value>, ApiError> {
     let run = {
-        let store = state.store.lock().unwrap();
+        let store = &state.store;
         store.get_run(&id).map_err(|_| not_found(format!("run not found: {id}")))?
     };
     let tail = params.tail.unwrap_or(200).min(5000);
@@ -934,7 +934,7 @@ async fn get_run_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let events = store.events_for_run(&id)?;
     Ok(axum::Json(json!({ "events": events })))
 }
@@ -951,7 +951,7 @@ async fn get_recipe_history(
     Query(params): Query<HistoryParams>,
 ) -> Result<axum::Json<Value>, ApiError> {
     let limit = params.limit.unwrap_or(20).min(200);
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let history: Vec<Value> = store
         .recipe_history(&name, limit)?
         .into_iter()
@@ -986,7 +986,7 @@ async fn compare_runs(
             "series_by_metric": [],
         })));
     }
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let mut runs: Vec<crate::store::RunRow> = Vec::with_capacity(ids.len());
     for id in &ids {
         if let Ok(r) = store.get_run(id) {
@@ -1002,7 +1002,7 @@ async fn get_recipe(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let runs = store.runs_by_recipe(&name)?;
     if runs.is_empty() {
         return Err(not_found(format!("recipe not found: {name}")));
@@ -1015,7 +1015,7 @@ async fn get_recipe(
 }
 
 async fn list_pipelines(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let pipelines = store.list_pipelines()?;
     let mut out = Vec::with_capacity(pipelines.len());
     for p in pipelines {
@@ -1054,7 +1054,7 @@ async fn get_pipeline(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let pipeline = store
         .get_pipeline(&id)?
         .ok_or_else(|| not_found(format!("pipeline not found: {id}")))?;
@@ -1084,7 +1084,7 @@ async fn get_pipeline(
 }
 
 async fn list_artifacts(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let artifacts = store.list_artifacts()?;
     let mut out = Vec::with_capacity(artifacts.len());
     for a in artifacts {
@@ -1100,7 +1100,7 @@ async fn get_artifact(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let artifact = store
         .get_artifact_optional(&id)?
         .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
@@ -1140,7 +1140,7 @@ async fn get_artifact_lineage(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let max_hops = 6usize;
     let root = store
         .get_artifact_optional(&id)?
@@ -1237,7 +1237,7 @@ async fn get_artifact_lineage(
 }
 
 async fn list_evals(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let evals = store.list_eval_requests()?;
     Ok(axum::Json(json!({ "evals": evals })))
 }
@@ -1248,7 +1248,7 @@ async fn list_evals(State(state): State<AppState>) -> Result<axum::Json<Value>, 
 /// most-common metric — enough to draw the row at a glance without
 /// fetching the full detail.
 async fn list_policies(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let summaries = store.policy_summaries()?;
     let mut out: Vec<Value> = Vec::with_capacity(summaries.len());
     for summary in summaries {
@@ -1266,7 +1266,7 @@ async fn get_policy(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = state.store.lock().unwrap();
+    let store = &state.store;
     let requests = store.eval_requests_by_policy(&name)?;
     if requests.is_empty() {
         return Err(not_found(format!("policy not found: {name}")));
@@ -1523,7 +1523,7 @@ async fn get_artifact_rollout(
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
     let artifact = {
-        let store = state.store.lock().unwrap();
+        let store = &state.store;
         store
             .get_artifact_optional(&id)?
             .ok_or_else(|| not_found(format!("artifact not found: {id}")))?
@@ -1577,7 +1577,7 @@ async fn get_artifact_frame(
     Path((id, n)): Path<(String, u32)>,
 ) -> Result<Response, ApiError> {
     let artifact = {
-        let store = state.store.lock().unwrap();
+        let store = &state.store;
         store
             .get_artifact_optional(&id)?
             .ok_or_else(|| not_found(format!("artifact not found: {id}")))?
@@ -1802,7 +1802,7 @@ fn dataset_summary_for(
     id: &str,
 ) -> Result<Option<(PathBuf, Arc<Option<DatasetSummary>>)>, ApiError> {
     let artifact = {
-        let store = state.store.lock().unwrap();
+        let store = &state.store;
         match store.get_artifact_optional(id)? {
             Some(a) => a,
             None => return Ok(None),

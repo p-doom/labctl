@@ -243,16 +243,16 @@ impl Store {
 
     // ---------- runs ----------
 
-    pub fn insert_run(&mut self, run: NewRun<'_>, inputs: &[InputResolution]) -> Result<()> {
+    pub fn insert_run(&self, run: NewRun<'_>, inputs: &[InputResolution]) -> Result<()> {
         self.block_on_pg(self.pg.insert_run(run, inputs))
     }
 
-    pub fn set_submitted(&mut self, run_id: &str, job_id: &str) -> Result<()> {
+    pub fn set_submitted(&self, run_id: &str, job_id: &str) -> Result<()> {
         self.block_on_pg(self.pg.set_submitted(run_id, job_id))
     }
 
     pub fn update_status(
-        &mut self,
+        &self,
         run_id: &str,
         status: &str,
         finished_at: Option<i64>,
@@ -260,7 +260,7 @@ impl Store {
         self.block_on_pg(self.pg.update_status(run_id, status, finished_at))
     }
 
-    pub fn set_finished_at(&mut self, run_id: &str, finished_at: i64) -> Result<()> {
+    pub fn set_finished_at(&self, run_id: &str, finished_at: i64) -> Result<()> {
         self.block_on_pg(self.pg.set_finished_at(run_id, finished_at))
     }
 
@@ -300,7 +300,7 @@ impl Store {
     /// dedup-or-rename of the staging dir into `_objects/<prefix>/<hash>/`,
     /// sidecar write, and per-user alias symlink creation.
     pub fn insert_artifact(
-        &mut self,
+        &self,
         kind: &str,
         staging_path: &Path,
         content_hash: &str,
@@ -496,7 +496,7 @@ impl Store {
 
     // ---------- aliases ----------
 
-    pub fn set_alias(&mut self, alias: &str, artifact_id: &str) -> Result<()> {
+    pub fn set_alias(&self, alias: &str, artifact_id: &str) -> Result<()> {
         self.block_on_pg(self.pg.set_alias(alias, artifact_id))
     }
 
@@ -506,7 +506,7 @@ impl Store {
 
     // ---------- run inputs/outputs ----------
 
-    pub fn link_run_output(&mut self, run_id: &str, role: &str, artifact_id: &str) -> Result<()> {
+    pub fn link_run_output(&self, run_id: &str, role: &str, artifact_id: &str) -> Result<()> {
         self.block_on_pg(self.pg.link_run_output(run_id, role, artifact_id))
     }
 
@@ -524,7 +524,7 @@ impl Store {
     }
 
     pub fn append_stage_cache_hit_event(
-        &mut self,
+        &self,
         run_id: &str,
         cache_key: &str,
         source_run_id: &str,
@@ -561,7 +561,7 @@ impl Store {
     }
 
     pub fn set_awaiting_peer(
-        &mut self,
+        &self,
         run_id: &str,
         job_id: &str,
         peer_run_id: &str,
@@ -574,7 +574,7 @@ impl Store {
     }
 
     pub fn append_stage_coalesce_resolved_event(
-        &mut self,
+        &self,
         run_id: &str,
         peer_run_id: &str,
     ) -> Result<()> {
@@ -585,7 +585,7 @@ impl Store {
     }
 
     pub fn append_stage_coalesce_failed_event(
-        &mut self,
+        &self,
         run_id: &str,
         peer_run_id: &str,
         peer_status: &str,
@@ -596,7 +596,7 @@ impl Store {
         )
     }
 
-    pub fn copy_run_outputs(&mut self, source_run_id: &str, dest_run_id: &str) -> Result<()> {
+    pub fn copy_run_outputs(&self, source_run_id: &str, dest_run_id: &str) -> Result<()> {
         self.block_on_pg(self.pg.copy_run_outputs(source_run_id, dest_run_id))
     }
 
@@ -636,7 +636,7 @@ impl Store {
     // ---------- pipelines ----------
 
     pub fn insert_pipeline(
-        &mut self,
+        &self,
         id: &str,
         name: &str,
         pipeline_path: Option<&Path>,
@@ -649,7 +649,7 @@ impl Store {
     }
 
     pub fn set_pipeline_membership(
-        &mut self,
+        &self,
         run_id: &str,
         pipeline_id: &str,
         stage_name: &str,
@@ -686,7 +686,7 @@ impl Store {
     }
 
     pub fn insert_eval_request(
-        &mut self,
+        &self,
         eval_key: &str,
         checkpoint_artifact_id: &str,
         eval_recipe_hash: &str,
@@ -706,7 +706,7 @@ impl Store {
     }
 
     pub fn retry_eval_request(
-        &mut self,
+        &self,
         eval_key: &str,
         new_eval_run_id: &str,
         new_attempts: i64,
@@ -757,7 +757,7 @@ impl Store {
     // ---------- tracking ----------
 
     pub fn set_tracking(
-        &mut self,
+        &self,
         run_id: &str,
         entity: &str,
         project: &str,

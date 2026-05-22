@@ -71,7 +71,7 @@ struct SchedulerOutcome {
 
 pub fn submit_recipe(
     cluster: &ClusterConfig,
-    store: &mut Store,
+    store: &Store,
     recipe: &Recipe,
     overrides: Option<SubmitOverrides>,
     submitted_by: &str,
@@ -178,7 +178,7 @@ fn cache_hit_outputs_valid(
 #[allow(clippy::too_many_arguments)]
 fn register_cache_hit(
     cluster: &ClusterConfig,
-    store: &mut Store,
+    store: &Store,
     recipe: &Recipe,
     run_id: &str,
     run_dir: &Path,
@@ -308,7 +308,7 @@ fn key_outputs_by_role(
 #[allow(clippy::too_many_arguments)]
 fn try_coalesce_as_follower(
     cluster: &ClusterConfig,
-    store: &mut Store,
+    store: &Store,
     recipe: &Recipe,
     run_id: &str,
     run_dir: &Path,
@@ -366,7 +366,7 @@ fn try_coalesce_as_follower(
 #[allow(clippy::too_many_arguments)]
 fn register_follower(
     cluster: &ClusterConfig,
-    store: &mut Store,
+    store: &Store,
     recipe: &Recipe,
     run_id: &str,
     run_dir: &Path,
@@ -438,7 +438,7 @@ fn register_follower(
 
 fn submit_recipe_inner(
     cluster: &ClusterConfig,
-    store: &mut Store,
+    store: &Store,
     recipe: &Recipe,
     overrides: Option<SubmitOverrides>,
     stage_ctx: Option<&StageContext<'_>>,
@@ -711,7 +711,7 @@ struct ArraySweepInfo {
 /// array tasks complete.
 pub fn submit_sweep(
     cluster: &ClusterConfig,
-    store: &mut Store,
+    store: &Store,
     recipe: &Recipe,
     submitted_by: &str,
 ) -> Result<SubmittedSweep> {
@@ -777,7 +777,7 @@ pub fn submit_sweep(
 
 pub fn submit_pipeline(
     cluster: &ClusterConfig,
-    store: &mut Store,
+    store: &Store,
     pipeline: &LoadedPipeline,
     pipeline_path: Option<&Path>,
     submitted_by: &str,
@@ -897,7 +897,7 @@ pub fn submit_pipeline(
 /// holding a single lock for the whole pass.
 pub fn reconcile_one(
     cluster: &ClusterConfig,
-    store: &mut Store,
+    store: &Store,
     run: &crate::store::RunRow,
 ) -> Result<ReconcileStep> {
     // Followers waiting on a coalesce peer have a different lifecycle: the
@@ -930,7 +930,7 @@ pub fn reconcile_one(
 /// outputs; failure → flip to ``failed`` with attribution. Still-running
 /// peers are a no-op (we'll be called again next reconcile pass).
 fn reconcile_follower(
-    store: &mut Store,
+    store: &Store,
     follower: &crate::store::RunRow,
 ) -> Result<ReconcileStep> {
     let mut step = ReconcileStep::default();
@@ -1004,7 +1004,7 @@ pub struct ReconcileStep {
     pub artifacts_registered: usize,
 }
 
-pub fn reconcile(cluster: &ClusterConfig, store: &mut Store) -> Result<ReconcileReport> {
+pub fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<ReconcileReport> {
     let mut runs_reconciled = 0;
     let mut artifacts_registered = 0;
     // Scope to the invoking user's own runs. `labctl reconcile` is a
@@ -1029,7 +1029,7 @@ pub fn reconcile(cluster: &ClusterConfig, store: &mut Store) -> Result<Reconcile
 /// (terminated before reconcile could register their outputs). Walks
 /// terminal runs that have zero recorded `run_outputs` and calls
 /// `register_outputs` for each. Idempotent — safe to re-run.
-pub fn recover_outputs(_cluster: &ClusterConfig, store: &mut Store) -> Result<RecoverReport> {
+pub fn recover_outputs(_cluster: &ClusterConfig, store: &Store) -> Result<RecoverReport> {
     let runs = store.terminal_runs_without_outputs()?;
     let scanned = runs.len();
     let mut recovered = 0;
@@ -1073,7 +1073,7 @@ pub struct RecoverReport {
 /// the recomputed value is left alone.
 pub fn repair_finish_times(
     cluster: &ClusterConfig,
-    store: &mut Store,
+    store: &Store,
 ) -> Result<RepairReport> {
     let mut report = RepairReport::default();
     for run in store.terminal_runs()? {
@@ -1103,7 +1103,7 @@ pub struct RepairReport {
     pub unresolved: usize,
 }
 
-pub fn gc(_cluster: &ClusterConfig, store: &mut Store, terminal_snapshots: bool) -> Result<usize> {
+pub fn gc(_cluster: &ClusterConfig, store: &Store, terminal_snapshots: bool) -> Result<usize> {
     if !terminal_snapshots {
         return Ok(0);
     }
@@ -1117,7 +1117,7 @@ pub fn gc(_cluster: &ClusterConfig, store: &mut Store, terminal_snapshots: bool)
 /// Used by the CLI (`gc()` wrapper, min_age=0) and by the agent's
 /// gc_loop (min_age>0, gives reconcile time to finalize artifacts
 /// before the working tree is removed).
-pub fn gc_terminal_sources(store: &mut Store, min_terminal_age_secs: u64) -> Result<usize> {
+pub fn gc_terminal_sources(store: &Store, min_terminal_age_secs: u64) -> Result<usize> {
     let now = util::now_ts();
     let cutoff = min_terminal_age_secs as i64;
     let mut removed = 0;
@@ -1791,7 +1791,7 @@ fn status_file_outcome(run_dir: &Path) -> Option<(String, Option<i64>)> {
     Some((status.status, status.updated_at))
 }
 
-fn register_outputs(store: &mut Store, run: &crate::store::RunRow) -> Result<usize> {
+fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> {
     let outputs_value = run
         .context_json
         .get("outputs")
