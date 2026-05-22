@@ -163,7 +163,6 @@ def emit_runs_and_associated(
                 tsv_escape(sidecar.get("stage_name")),
                 tsv_escape(sidecar["submitted_by"]),
                 tsv_escape(sidecar.get("cache_key")),
-                tsv_escape(sidecar.get("coalesced_peer_run_id")),
             ])
             counts.runs += 1
             observe_user(counts, sidecar.get("submitted_by"), sidecar.get("created_at"))
@@ -369,7 +368,7 @@ TABLES = [
             "id", "recipe_name", "recipe_hash", "status", "job_id",
             "run_dir", "repo", "source_path", "recipe_json", "context_json",
             "created_at", "finished_at", "pipeline_id", "dependency_on",
-            "stage_name", "submitted_by", "cache_key", "coalesced_peer_run_id",
+            "stage_name", "submitted_by", "cache_key",
         ],
     ),
     TableSpec("pipelines", ["id", "name", "pipeline_path", '"user"', "created_at"]),
@@ -502,20 +501,18 @@ def main() -> int:
 
     # Single-transaction load: TRUNCATE CASCADE + \copy + setval all
     # run inside one BEGIN/COMMIT so the DEFERRABLE FKs added in 0002
-    # (runs.pipeline_id, runs.coalesced_peer_run_id, artifacts.producer_run_id,
-    # eval_requests.eval_run_id) are validated only at COMMIT — i.e.
-    # after the entire graph is loaded. Per-row checking would reject
-    # intra-batch cross-references during the COPY of `runs`.
+    # (runs.pipeline_id, artifacts.producer_run_id, eval_requests.eval_run_id)
+    # are validated only at COMMIT — i.e. after the entire graph is loaded.
+    # Per-row checking would reject intra-batch cross-references during the
+    # COPY of `runs`.
     #
-    # CASCADE on TRUNCATE is necessary because 0002 added FKs from
-    # coalesce_claims (not in TABLES) to runs, plus the runs<->pipelines
-    # cycle.
+    # CASCADE on TRUNCATE handles the runs<->pipelines cycle.
     pg_args = ["-h", args.pg_socket, "-d", args.pg_db, "-v", "ON_ERROR_STOP=1"]
     sql_path = args.workdir / "load.sql"
     with sql_path.open("w") as f:
         f.write("BEGIN;\n")
         f.write("TRUNCATE " + ", ".join(t.name for t in TABLES)
-                + ", coalesce_claims RESTART IDENTITY CASCADE;\n")
+                + " RESTART IDENTITY CASCADE;\n")
         for t in TABLES:
             cols = ", ".join(t.columns)
             f.write(f"\\copy {t.name} ({cols}) FROM '{t.file}'\n")

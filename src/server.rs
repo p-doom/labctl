@@ -230,12 +230,7 @@ async fn run_events_listener(
 fn translate_event(ev: &crate::store::EventRow) -> Option<StreamEvent> {
     match ev.event_type.as_str() {
         "run_created" => ev.run_id.clone().map(|id| StreamEvent { kind: "run.created", id }),
-        "run_submitted"
-        | "run_status"
-        | "stage_cache_hit"
-        | "stage_coalesced"
-        | "stage_coalesce_resolved"
-        | "stage_coalesce_failed" => {
+        "run_submitted" | "run_status" | "stage_cache_hit" => {
             ev.run_id.clone().map(|id| StreamEvent { kind: "run.updated", id })
         }
         "artifact_registered" => {

@@ -260,15 +260,6 @@ fn do_gc(cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u64
         Ok(n) => eprintln!("labctl dispatch: gc reaped {n} source snapshot(s)"),
         Err(e) => eprintln!("labctl dispatch: gc failed: {e:#}"),
     }
-    // Sweep coalesce claims whose producer reached a terminal state but
-    // didn't release the slot (producer crash, reconcile race, etc.).
-    // The FK ON DELETE CASCADE in 0002 handles run-row deletion; this
-    // covers the live-row, terminal-status leak path.
-    match store.gc_terminal_coalesce_claims() {
-        Ok(0) => {}
-        Ok(n) => eprintln!("labctl dispatch: gc reaped {n} stale coalesce claim(s)"),
-        Err(e) => eprintln!("labctl dispatch: coalesce gc failed: {e:#}"),
-    }
     // Reap orphan run-dirs: <runs_base>/runs/<user>/<id>/ with no PG row.
     // Cushion the age so we don't race against an in-flight CLI submit
     // whose insert_run hasn't committed yet; the terminal-source cutoff
