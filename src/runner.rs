@@ -1183,6 +1183,15 @@ pub fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<ReconcileRepo
         }
         artifacts_registered += step.artifacts_registered;
     }
+    // try_submit_pending_children inside reconcile_one only fires when
+    // this pass observed the parent's status transition. Restart between
+    // transition and sweep leaves children orphaned in 'created'; idempotent
+    // retroactive sweep closes the gap.
+    for parent in store.list_terminal_runs_with_pending_children(&submitted_by)? {
+        if let Err(e) = try_submit_pending_children(cluster, store, &parent) {
+            eprintln!("reconcile: orphan sweep for {} failed: {e:#}", parent.id);
+        }
+    }
     Ok(ReconcileReport {
         runs_reconciled,
         artifacts_registered,

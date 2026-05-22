@@ -1036,6 +1036,33 @@ impl PgStore {
         rows.into_iter().map(row_to_run).collect()
     }
 
+    /// Terminal-state runs owned by `submitted_by` that still have at least
+    /// one pending child waiting on them. Used by reconcile to retroactively
+    /// advance children whose parent transitioned to terminal while the
+    /// agent was down (or in a prior reconcile pass): the in-pass
+    /// `try_submit_pending_children` only fires when `reconcile_one`
+    /// observes the transition itself.
+    pub async fn list_terminal_runs_with_pending_children(
+        &self,
+        submitted_by: &str,
+    ) -> Result<Vec<RunRow>> {
+        let rows = sqlx::query(&format!(
+            "{RUN_SELECT_BASE} p \
+             WHERE p.status IN ('succeeded','cache_hit','failed','cancelled','timeout','oom','unknown_terminal') \
+               AND p.submitted_by = $1 \
+               AND EXISTS ( \
+                   SELECT 1 FROM runs c \
+                   WHERE c.status = 'created' AND c.job_id IS NULL \
+                     AND c.dependency_on @> jsonb_build_object('afterok', jsonb_build_array(jsonb_build_object('run_id', p.id))) \
+               )"
+        ))
+        .bind(submitted_by)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("list_terminal_runs_with_pending_children({submitted_by})"))?;
+        rows.into_iter().map(row_to_run).collect()
+    }
+
     pub async fn update_status(
         &self,
         run_id: &str,

@@ -186,6 +186,29 @@ fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
             }
         }
     }
+    // Retroactive child-advance sweep — covers the gap where the agent
+    // restarted between a parent's terminal transition and the in-pass
+    // try_submit_pending_children call. Idempotent: already-advanced
+    // children no longer appear in list_terminal_runs_with_pending_children.
+    let orphans = {
+        let s = &store;
+        s.list_terminal_runs_with_pending_children(&submitted_by)
+    };
+    match orphans {
+        Ok(parents) => {
+            for parent in parents {
+                if let Err(e) = runner::try_submit_pending_children(cluster, &store, &parent) {
+                    eprintln!(
+                        "labctl dispatch: orphan sweep for {} failed: {e:#}",
+                        parent.id
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("labctl dispatch: list_terminal_runs_with_pending_children failed: {e:#}");
+        }
+    }
     if runs_reconciled > 0 || artifacts_registered > 0 {
         eprintln!(
             "labctl dispatch: reconciled {runs_reconciled} run(s), registered {artifacts_registered} artifact(s)"

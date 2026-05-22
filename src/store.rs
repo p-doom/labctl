@@ -340,6 +340,17 @@ impl Store {
         self.block_on_pg(self.pg.list_active_runs(submitted_by))
     }
 
+    /// Terminal runs owned by `submitted_by` that still have at least one
+    /// pending child. Used by reconcile to retroactively advance children
+    /// stranded by a prior agent restart between parent transition and
+    /// child sweep.
+    pub fn list_terminal_runs_with_pending_children(
+        &self,
+        submitted_by: &str,
+    ) -> Result<Vec<RunRow>> {
+        self.block_on_pg(self.pg.list_terminal_runs_with_pending_children(submitted_by))
+    }
+
     // ---------- artifacts ----------
 
     /// Register an artifact under content-addressed storage. Bridges the
