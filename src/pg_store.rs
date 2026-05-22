@@ -97,22 +97,6 @@ impl PgStore {
         row.map(row_to_artifact).transpose()
     }
 
-    pub async fn find_artifact_by_hash(
-        &self,
-        kind: &str,
-        content_hash: &str,
-    ) -> Result<Option<ArtifactRow>> {
-        let row = sqlx::query(&format!(
-            "{ARTIFACT_SELECT_BASE} WHERE kind = $1 AND content_hash = $2 LIMIT 1"
-        ))
-        .bind(kind)
-        .bind(content_hash)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("find_artifact_by_hash(kind={kind:?})"))?;
-        row.map(row_to_artifact).transpose()
-    }
-
     pub async fn list_artifacts(&self) -> Result<Vec<ArtifactRow>> {
         let rows = sqlx::query(&format!(
             "{ARTIFACT_SELECT_BASE} ORDER BY created_at DESC"
@@ -293,8 +277,8 @@ impl PgStore {
 
     /// Look up an artifact by its on-disk path. Returns the first match.
     /// Note: the PG schema doesn't constrain `(path)` to be unique on its
-    /// own, so callers that need disambiguation should use
-    /// `find_artifact_by_hash` instead.
+    /// own, so callers that need disambiguation must filter further on
+    /// the client side (e.g. by `kind`).
     pub async fn find_artifact_by_path(&self, path: &str) -> Result<Option<ArtifactRow>> {
         let row = sqlx::query(&format!(
             "{ARTIFACT_SELECT_BASE} WHERE path = $1 LIMIT 1"
@@ -1070,32 +1054,6 @@ impl PgStore {
         .await
         .with_context(|| format!("rehydrate_inputs_by_path({path})"))?;
         Ok(result.rows_affected() as usize)
-    }
-
-    /// Insert a per-user alias overlay row. Idempotent — re-adding the same
-    /// (user, alias, kind) tuple is a no-op so callers don't have to track
-    /// which overlays already exist.
-    pub async fn add_user_alias(
-        &self,
-        user: &str,
-        alias: &str,
-        kind: &str,
-        artifact_id: &str,
-        created_at: i64,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO artifact_user_aliases (\"user\", alias, kind, artifact_id, created_at) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (\"user\", alias, kind) DO NOTHING",
-        )
-        .bind(user)
-        .bind(alias)
-        .bind(kind)
-        .bind(artifact_id)
-        .bind(created_at)
-        .execute(&self.pool)
-        .await
-        .with_context(|| format!("add_user_alias({user}, {alias}, {kind})"))?;
-        Ok(())
     }
 
     /// Set `run_inputs[(run_id, role)].artifact_id` and `resolved_path`

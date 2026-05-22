@@ -19,11 +19,11 @@
 //! Methods that previously did sidecar writes alongside DB writes are
 //! now DB-only — the FS sidecars exist as the slurm-compute → login
 //! bridge and as human-debuggable projections, not as a source of
-//! truth. The two exceptions are `insert_artifact` and the private
-//! `add_user_alias`, which still move bytes / create symlinks under the
-//! per-kind artifact roots because nothing else does. Everything else
-//! (run rows, run inputs/outputs, pipelines, eval requests, tracking,
-//! events) is a pure PG operation.
+//! truth. The one exception is `insert_artifact`, which writes the
+//! per-artifact `.meta.json` sidecar at the artifact's on-disk location
+//! because nothing else does. Everything else (run rows, run
+//! inputs/outputs, pipelines, eval requests, tracking, events) is a
+//! pure PG operation.
 //!
 //! Tests live in `pg_store::tests` (live PG smoke tests with `#[ignore]`).
 
@@ -395,41 +395,6 @@ impl Store {
             ))?;
         }
         self.get_artifact(&id)
-    }
-
-    /// Write a per-user alias overlay: a symlink at
-    /// `<artifact_root>/aliases/<user>/<alias>` pointing at the
-    /// artifact's canonical `_objects/<prefix>/<hash>/` dir, plus an
-    /// `artifact_user_aliases` row. Idempotent.
-    fn add_user_alias(
-        &self,
-        kind: &str,
-        user: &str,
-        alias: &str,
-        artifact_id: &str,
-        target: &Path,
-    ) -> Result<()> {
-        let root = self.artifact_roots.get(kind).with_context(|| {
-            format!("kind {kind:?} not in cluster.filesystem.artifact_roots")
-        })?;
-        let link = fs_layout::alias_symlink_path(root, user, alias);
-        fs_layout::create_alias_symlink(&link, target)?;
-        self.block_on_pg(self.pg.add_user_alias(
-            user,
-            alias,
-            kind,
-            artifact_id,
-            util::now_ts(),
-        ))?;
-        Ok(())
-    }
-
-    pub fn find_artifact_by_hash(
-        &self,
-        kind: &str,
-        content_hash: &str,
-    ) -> Result<Option<ArtifactRow>> {
-        self.block_on_pg(self.pg.find_artifact_by_hash(kind, content_hash))
     }
 
     /// Look up an artifact by `(kind, path)`. The PG `find_artifact_by_path`
