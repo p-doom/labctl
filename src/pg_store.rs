@@ -784,12 +784,28 @@ impl PgStore {
             .context("insert_run: serialise recipe")?;
 
         let mut tx = self.pool.begin().await.context("insert_run: begin tx")?;
+        // Upsert. When agent-driven submission completes a previously
+        // inserted pending placeholder (status='created', null job_id),
+        // we hit ON CONFLICT and update with the now-known fields.
+        // pipeline_id/stage_name/dependency_on are preserved because they
+        // were set on the placeholder; we don't touch them here.
         sqlx::query(
             "INSERT INTO runs
              (id, recipe_name, recipe_hash, status, run_dir, repo, source_path,
               recipe_json, context_json, created_at, submitted_by, cache_key,
               coalesced_peer_run_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL)",
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL)
+             ON CONFLICT (id) DO UPDATE SET
+                 recipe_name = EXCLUDED.recipe_name,
+                 recipe_hash = EXCLUDED.recipe_hash,
+                 status      = EXCLUDED.status,
+                 run_dir     = EXCLUDED.run_dir,
+                 repo        = EXCLUDED.repo,
+                 source_path = EXCLUDED.source_path,
+                 recipe_json = EXCLUDED.recipe_json,
+                 context_json= EXCLUDED.context_json,
+                 submitted_by= EXCLUDED.submitted_by,
+                 cache_key   = EXCLUDED.cache_key",
         )
         .bind(run.id)
         .bind(&run.recipe.name)
@@ -805,8 +821,15 @@ impl PgStore {
         .bind(run.cache_key)
         .execute(&mut *tx)
         .await
-        .context("insert_run: runs insert")?;
+        .context("insert_run: runs upsert")?;
 
+        // Clear any prior run_inputs (placeholder may not have had any,
+        // but be defensive) then re-insert the now-resolved set.
+        sqlx::query("DELETE FROM run_inputs WHERE run_id = $1")
+            .bind(run.id)
+            .execute(&mut *tx)
+            .await
+            .context("insert_run: run_inputs cleanup")?;
         for input in inputs {
             sqlx::query(
                 "INSERT INTO run_inputs (run_id, role, artifact_id, resolved_path)
@@ -834,6 +857,74 @@ impl PgStore {
             .await
             .with_context(|| format!("set_submitted({run_id})"))?;
         Ok(())
+    }
+
+    /// Insert a placeholder row for a pipeline stage whose upstream
+    /// dependencies haven't completed yet. status='created', no job_id,
+    /// no cache_key, empty run_inputs. The agent's reconciler later
+    /// upgrades this row to a real submission via the normal `insert_run`
+    /// path (upsert) once upstream artifacts exist and inputs can be
+    /// resolved.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_pending_pipeline_stage(
+        &self,
+        run_id: &str,
+        recipe: &Recipe,
+        recipe_hash: &str,
+        run_dir: &Path,
+        source_path: &Path,
+        submitted_by: &str,
+        pipeline_id: &str,
+        stage_name: &str,
+        dependency_on: &Value,
+    ) -> Result<()> {
+        let now = crate::util::now_ts();
+        let recipe_value = serde_json::to_value(recipe)
+            .context("insert_pending_pipeline_stage: serialise recipe")?;
+        // context_json is a placeholder — the agent rewrites it at the
+        // moment of real submission with resolved inputs/outputs.
+        let ctx = json!({});
+        sqlx::query(
+            "INSERT INTO runs
+             (id, recipe_name, recipe_hash, status, run_dir, repo, source_path,
+              recipe_json, context_json, created_at, submitted_by,
+              pipeline_id, stage_name, dependency_on)
+             VALUES ($1,$2,$3,'created',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+        )
+        .bind(run_id)
+        .bind(&recipe.name)
+        .bind(recipe_hash)
+        .bind(run_dir.display().to_string())
+        .bind(&recipe.repo)
+        .bind(source_path.display().to_string())
+        .bind(sqlx::types::Json(&recipe_value))
+        .bind(sqlx::types::Json(ctx))
+        .bind(now)
+        .bind(submitted_by)
+        .bind(pipeline_id)
+        .bind(stage_name)
+        .bind(sqlx::types::Json(dependency_on))
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("insert_pending_pipeline_stage({run_id})"))?;
+        Ok(())
+    }
+
+    /// Return all pending (status='created', job_id IS NULL) runs whose
+    /// `dependency_on->'afterok'` references `parent_run_id`. Caller
+    /// decides whether each pending run's deps are NOW fully satisfied;
+    /// this just narrows the candidate set.
+    pub async fn pending_children_of(&self, parent_run_id: &str) -> Result<Vec<RunRow>> {
+        let rows = sqlx::query(&format!(
+            "{RUN_SELECT_BASE} \
+             WHERE status = 'created' AND job_id IS NULL \
+               AND dependency_on @> $1::jsonb"
+        ))
+        .bind(sqlx::types::Json(json!({"afterok": [{"run_id": parent_run_id}]})))
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("pending_children_of({parent_run_id})"))?;
+        rows.into_iter().map(row_to_run).collect()
     }
 
     pub async fn update_status(

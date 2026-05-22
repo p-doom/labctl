@@ -236,6 +236,36 @@ impl Store {
         self.block_on_pg(self.pg.insert_run(run, inputs))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_pending_pipeline_stage(
+        &self,
+        run_id: &str,
+        recipe: &crate::config::Recipe,
+        recipe_hash: &str,
+        run_dir: &Path,
+        source_path: &Path,
+        submitted_by: &str,
+        pipeline_id: &str,
+        stage_name: &str,
+        dependency_on: &Value,
+    ) -> Result<()> {
+        self.block_on_pg(self.pg.insert_pending_pipeline_stage(
+            run_id,
+            recipe,
+            recipe_hash,
+            run_dir,
+            source_path,
+            submitted_by,
+            pipeline_id,
+            stage_name,
+            dependency_on,
+        ))
+    }
+
+    pub fn pending_children_of(&self, parent_run_id: &str) -> Result<Vec<RunRow>> {
+        self.block_on_pg(self.pg.pending_children_of(parent_run_id))
+    }
+
     pub fn set_submitted(&self, run_id: &str, job_id: &str) -> Result<()> {
         self.block_on_pg(self.pg.set_submitted(run_id, job_id))
     }
