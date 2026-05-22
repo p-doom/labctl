@@ -540,7 +540,15 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Status => {
-            for run in store.list_runs()? {
+            // First PG-backed read path in the CLI. Other subcommands still
+            // hit the legacy Store; they migrate one by one.
+            let rt = tokio::runtime::Runtime::new()
+                .context("failed to build tokio runtime")?;
+            let runs = rt.block_on(async {
+                let pg = pg_store::PgStore::connect(&cluster).await?;
+                pg.list_runs().await
+            })?;
+            for run in runs {
                 println!(
                     "{:<28} {:<12} {:<10} {}",
                     run.id,
