@@ -1905,11 +1905,14 @@ fn map_slurm_state(state: &str) -> String {
 }
 
 fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> {
-    let outputs_value = run
-        .context_json
-        .get("outputs")
-        .with_context(|| format!("run {} context.json missing 'outputs' field", run.id))?
-        .clone();
+    // Pending-placeholder rows (inserted by `insert_pending_pipeline_stage`
+    // for intra-pipeline children whose parents haven't materialised yet)
+    // carry no `outputs` in `context_json` — the stage hasn't been rendered.
+    // Nothing to register; skip cleanly so the reconcile cascade can still
+    // reach `try_submit_pending_children`.
+    let Some(outputs_value) = run.context_json.get("outputs").cloned() else {
+        return Ok(0);
+    };
     let outputs: BTreeMap<String, OutputResolution> = serde_json::from_value(outputs_value)
         .with_context(|| format!("run {} context.json 'outputs' shape mismatch", run.id))?;
     // Producer-side hash manifest: emitted by the sbatch wrapper via
