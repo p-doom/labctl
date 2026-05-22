@@ -35,7 +35,7 @@ pub struct EvaldReport {
 
 pub fn run_once(
     cluster: &ClusterConfig,
-    store: &mut Store,
+    store: &Store,
     policy: &EvalPolicy,
 ) -> Result<EvaldReport> {
     let recipe = Recipe::load(&policy.recipe)?;

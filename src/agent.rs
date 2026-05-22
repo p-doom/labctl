@@ -1,6 +1,4 @@
-//! Per-user dispatch loops: reconcile + evald + throttle, plus the
-//! periodic filesystem→cache refresh task that keeps the in-memory
-//! cache aligned with sidecars written by other processes.
+//! Per-user dispatch loops: reconcile + evald + throttle.
 //!
 //! Run inside the standalone `labctl agent` process (no HTTP listener)
 //! — auto-installed as `labctl-agent.service` by `labctl init`. The UI
@@ -25,7 +23,7 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -40,64 +38,12 @@ use crate::{
     util,
 };
 
-/// Periodically re-walk the registry from disk so the cache reflects
-/// sidecars written by other processes (CLI submissions, other users'
-/// daemons in a multi-tenant deployment).
-///
-/// The work is split into three phases so the Store's std::Mutex is
-/// held only for microseconds at a time — never for the duration of
-/// the slow filesystem walk:
-///
-///   1. **Snapshot** (brief lock): copy `runs_base` / `artifact_roots`
-///      out of the Store, plus the live events table. ~ms.
-///   2. **Build** (no lock): on a blocking thread, construct a fresh
-///      in-memory SQLite cache from disk, then re-insert the
-///      preserved events (with their original ids so the SSE tailer's
-///      cursor stays valid). This is the 1-5s walk; concurrent HTTP
-///      readers and dispatch writers proceed normally because no lock
-///      is held during it.
-///   3. **Swap** (brief lock): atomically replace the Store's cache
-///      field with the new Connection. The previous Connection is
-///      dropped at the end of this scope. ~microseconds.
-///
-/// Net effect: a /api/runs request is no longer occasionally stuck
-/// behind a 1-5s refresh; reads consistently hit the cache directly.
-pub async fn periodic_refresh(store: Arc<Mutex<Store>>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Drop the first tick — the indexer just ran during `Store::open`.
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        let store = store.clone();
-        let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            // Phase 1 — brief lock.
-            let (runs_base, artifact_roots, events) = {
-                let s = store.lock().unwrap();
-                let (rb, ar) = s.snapshot_paths();
-                let ev = s.snapshot_events()?;
-                (rb, ar, ev)
-            };
-            // Phase 2 — no lock; this is the 1-5s filesystem walk.
-            let new_cache = Store::build_disk_snapshot(&runs_base, &artifact_roots, &events)?;
-            // Phase 3 — brief lock for the swap.
-            store.lock().unwrap().replace_cache(new_cache);
-            Ok(())
-        });
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("periodic_refresh: refresh failed: {e:#}"),
-            Err(e) => eprintln!("periodic_refresh: join failed: {e}"),
-        }
-    }
-}
-
 /// Spawn reconcile + evald + gc tokio tasks. Returns immediately; the
 /// tasks live until `shutdown` fires. With no `[dispatch]` block
 /// configured, logs a notice and returns without spawning anything.
 fn spawn(
     cluster: Arc<ClusterConfig>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<Store>,
     shutdown: Arc<Notify>,
 ) {
     let Some(dispatch) = cluster.dispatch.clone() else {
@@ -158,9 +104,8 @@ pub fn run_standalone(cluster: ClusterConfig, store: Store) -> Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build tokio runtime: {e}"))?;
     runtime.block_on(async move {
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(store);
         let shutdown = Arc::new(Notify::new());
-        tokio::spawn(periodic_refresh(store.clone(), Duration::from_secs(10)));
         spawn(Arc::new(cluster), store.clone(), shutdown.clone());
         eprintln!("labctl agent running (no HTTP listener; ctrl-c to stop)");
         let _ = tokio::signal::ctrl_c().await;
@@ -172,7 +117,7 @@ pub fn run_standalone(cluster: ClusterConfig, store: Store) -> Result<()> {
 
 async fn reconcile_loop(
     cluster: Arc<ClusterConfig>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<Store>,
     dispatch: DispatchConfig,
     shutdown: Arc<Notify>,
 ) {
@@ -193,7 +138,7 @@ async fn reconcile_loop(
     }
 }
 
-fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Mutex<Store>>) {
+fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
     // Snapshot the active-run list under one short lock, then iterate
     // outside the lock — taking the mutex per run. UI requests can
     // interleave between runs instead of waiting for the whole pass.
@@ -210,7 +155,7 @@ fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Mutex<Store>>) {
         }
     };
     let runs = match {
-        let s = store.lock().unwrap();
+        let s = &store;
         s.list_active_runs(&submitted_by)
     } {
         Ok(rs) => rs,
@@ -223,8 +168,8 @@ fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Mutex<Store>>) {
     let mut artifacts_registered = 0usize;
     for run in runs {
         let result = {
-            let mut s = store.lock().unwrap();
-            runner::reconcile_one(cluster, &mut s, &run)
+            let s = &store;
+            runner::reconcile_one(cluster, &s, &run)
         };
         match result {
             Ok(step) => {
@@ -256,7 +201,7 @@ fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Mutex<Store>>) {
 /// reproducibility, just the convenience of a pre-built working tree.
 async fn gc_loop(
     cluster: Arc<ClusterConfig>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<Store>,
     dispatch: DispatchConfig,
     shutdown: Arc<Notify>,
 ) {
@@ -282,10 +227,10 @@ async fn gc_loop(
     }
 }
 
-fn do_gc(_cluster: &ClusterConfig, store: &Arc<Mutex<Store>>, min_terminal_age_secs: u64) {
+fn do_gc(_cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u64) {
     let removed = {
-        let mut s = store.lock().unwrap();
-        runner::gc_terminal_sources(&mut s, min_terminal_age_secs)
+        let s = &store;
+        runner::gc_terminal_sources(&s, min_terminal_age_secs)
     };
     match removed {
         Ok(0) => {}
@@ -296,7 +241,7 @@ fn do_gc(_cluster: &ClusterConfig, store: &Arc<Mutex<Store>>, min_terminal_age_s
 
 async fn evald_loop(
     cluster: Arc<ClusterConfig>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<Store>,
     dispatch: DispatchConfig,
     shutdown: Arc<Notify>,
 ) {
@@ -318,7 +263,7 @@ async fn evald_loop(
 
 fn do_evald(
     cluster: &ClusterConfig,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<Store>,
     dispatch: &DispatchConfig,
 ) {
     let policies = match list_policies(&dispatch.policies_dir) {
@@ -344,8 +289,8 @@ fn do_evald(
             }
         };
         let result = {
-            let mut s = store.lock().unwrap();
-            evald::run_once(cluster, &mut s, &policy)
+            let s = &store;
+            evald::run_once(cluster, &s, &policy)
         };
         match result {
             Ok(report) => {

@@ -7,7 +7,6 @@ mod init;
 mod pg_store;
 mod prompt;
 mod provenance;
-mod remote;
 mod runner;
 #[cfg(feature = "ui")]
 mod server;
@@ -17,7 +16,7 @@ mod template;
 mod tracking;
 mod util;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -108,34 +107,6 @@ enum Command {
         #[arg(long, default_value = "external")]
         kind: String,
     },
-    /// Import a foreign cluster's artifact into the local registry.
-    /// Reads the foreign alias + meta sidecars over SSH, rsyncs the
-    /// bytes into the local artifact_root, and registers a local
-    /// artifact row that preserves the foreign content hash (so
-    /// re-importing the same bytes dedupes) and records lineage. The
-    /// foreign cluster.toml must declare a [remote] section. OTP-gated
-    /// hosts work transparently when ControlMaster is configured in
-    /// `~/.ssh/config` — see docs/ONBOARDING.md.
-    ImportFromCluster {
-        /// Path to the foreign cluster's cluster.toml. Must contain a
-        /// [remote] section so labctl knows how to reach it.
-        #[arg(long)]
-        foreign: PathBuf,
-        /// Alias on the foreign cluster to resolve and import.
-        #[arg(long)]
-        from: String,
-        /// Local alias to bind the imported artifact to. Defaults to
-        /// the foreign alias name. Use this to avoid collisions or to
-        /// namespace ("julich_<alias>") imports.
-        #[arg(long)]
-        r#as: Option<String>,
-        /// Skip the rsync of the artifact bytes. Registers a
-        /// metadata-only stub at the local destination. Use only if
-        /// you're staging the bytes out-of-band (a shared mount,
-        /// manual rsync, etc.).
-        #[arg(long)]
-        no_copy: bool,
-    },
     Evald {
         #[command(subcommand)]
         command: EvaldCommand,
@@ -147,10 +118,20 @@ enum Command {
     /// output rows. Recovers runs whose outputs went unregistered because
     /// of the pre-fix terminal-transition bug. Idempotent.
     RecoverOutputs,
-    /// Recompute `finished_at` for terminal runs from sacct's End field
-    /// (or status.json's updated_at as fallback). Use this after upgrading
-    /// past the bug where finished_at was set to wall-clock time at
-    /// reconcile observation rather than the actual job end time.
+    /// Producer-side output hashing. Invoked by the sbatch wrapper on
+    /// the compute node after the user command succeeds: walks each
+    /// declared output path, computes its dir_content_hash, and writes
+    /// `<run_dir>/.lab/output_hashes.json` as a `{role: hash}` map.
+    /// register_outputs prefers this manifest over re-walking on the
+    /// login side. No PG access — reads context.json from disk.
+    HashOutputs {
+        #[arg(long)]
+        run_dir: PathBuf,
+    },
+    /// Recompute `finished_at` for terminal runs from sacct's End field.
+    /// Use this after upgrading past the bug where finished_at was set
+    /// to wall-clock time at reconcile observation rather than the
+    /// actual job end time.
     RepairFinishTimes,
     /// Run a self-check: cluster config, filesystem perms, scheduler
     /// availability, and systemd unit status. Use this before reporting a
@@ -498,6 +479,13 @@ fn main() -> Result<()> {
     // the daemon owns every write. CLI invocations on a shared registry
     // would race on POSIX locks (broken on parallel filesystems) and
     // corrupt the DB.
+    // HashOutputs is invoked from the sbatch wrapper on a compute node.
+    // Compute has no PG access, so this subcommand reads `<run_dir>/.lab/
+    // context.json` directly and walks the declared output paths. No
+    // cluster config required.
+    if let Command::HashOutputs { run_dir } = &cli.command {
+        return hash_outputs_command(run_dir);
+    }
     if let Command::Run { recipe } = &cli.command {
         return run_recipe_command(&cluster_path, recipe);
     }
@@ -509,7 +497,7 @@ fn main() -> Result<()> {
     }
 
     let cluster = config::ClusterConfig::load(&cluster_path)?;
-    let mut store = store::Store::open(&cluster)?;
+    let store = store::Store::open(&cluster)?;
 
     match cli.command {
         Command::PipelineShow { id } => {
@@ -536,7 +524,7 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Command::Reconcile => {
-            let report = runner::reconcile(&cluster, &mut store)?;
+            let report = runner::reconcile(&cluster, &store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Status => {
@@ -555,47 +543,30 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Command::Gc { terminal_snapshots } => {
-            let removed = runner::gc(&cluster, &mut store, terminal_snapshots)?;
+            let removed = runner::gc(&cluster, &store, terminal_snapshots)?;
             println!("removed_snapshots: {removed}");
         }
         Command::RegisterExternal { alias, path, kind } => {
-            let artifact = artifacts::register_external(&mut store, &alias, &path, &kind)?;
+            let artifact = artifacts::register_external(&store, &alias, &path, &kind)?;
             println!("artifact_id: {}", artifact.id);
             println!("alias: {alias}");
         }
-        Command::ImportFromCluster {
-            foreign,
-            from,
-            r#as,
-            no_copy,
-        } => {
-            let foreign_cluster = config::ClusterConfig::load(&foreign)?;
-            let report = artifacts::import_from_cluster(
-                &cluster,
-                &mut store,
-                &foreign_cluster,
-                &from,
-                r#as.as_deref(),
-                !no_copy,
-            )?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
         Command::BackfillTracking => {
-            let report = tracking::backfill(&cluster, &mut store)?;
+            let report = tracking::backfill(&cluster, &store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::RecoverOutputs => {
-            let report = runner::recover_outputs(&cluster, &mut store)?;
+            let report = runner::recover_outputs(&cluster, &store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::RepairFinishTimes => {
-            let report = runner::repair_finish_times(&cluster, &mut store)?;
+            let report = runner::repair_finish_times(&cluster, &store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Evald { command } => match command {
             EvaldCommand::Once { policy } => {
                 let policy = config::EvalPolicy::load(&policy)?;
-                let report = evald::run_once(&cluster, &mut store, &policy)?;
+                let report = evald::run_once(&cluster, &store, &policy)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
         },
@@ -612,6 +583,7 @@ fn main() -> Result<()> {
         Command::Validate { .. }
         | Command::Service { .. }
         | Command::Doctor
+        | Command::HashOutputs { .. }
         | Command::Run { .. }
         | Command::RunSweep { .. }
         | Command::RunPipeline { .. }
@@ -802,17 +774,6 @@ fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
             ),
         }
 
-        // [remote] is consumed only when this config is loaded as a
-        // FOREIGN cluster (cross-cluster imports). When auditing one,
-        // confirm we can actually reach it from here — catches typos
-        // in the ssh_alias / host field, dead jump hosts, and lapsed
-        // ControlMaster sessions before the user hits them mid-import.
-        if let Some(r) = &cluster.remote {
-            match remote::probe_reachability(r) {
-                Ok(detail) => emit("remote reachability", true, &detail),
-                Err(detail) => emit("remote reachability", false, &detail),
-            }
-        }
     }
 
     let systemd_ok = service::systemd_available();
@@ -991,7 +952,62 @@ fn group_traversable(path: &std::path::Path) -> Result<(), String> {
 /// configured for in-process dispatch but the user hasn't installed the
 /// systemd unit. Suppressed by `LABCTL_NO_HINT=1` and skipped on hosts
 /// without systemd-user. Designed to be ignorable — never blocks, never
-/// errors.
+/// Producer-side output hashing. Invoked from the sbatch wrapper on the
+/// compute node after the user command succeeds. Reads context.json to
+/// discover declared output paths, walks each, computes the same
+/// dir_content_hash login would compute, and atomically writes
+/// `<run_dir>/.lab/output_hashes.json` as `{role: hash}`. Login-side
+/// `register_outputs` reads this manifest first and only falls back to
+/// re-walking on cache miss. The hash function is identical so the
+/// resulting content_hash matches whether computed here or there.
+fn hash_outputs_command(run_dir: &Path) -> Result<()> {
+    let lab_dir = run_dir.join(fs_layout::LAB_DIRNAME);
+    let context_path = lab_dir.join(fs_layout::CONTEXT_JSON);
+    let context_text = std::fs::read_to_string(&context_path)
+        .with_context(|| format!("failed to read {}", context_path.display()))?;
+    let context: serde_json::Value = serde_json::from_str(&context_text)
+        .with_context(|| format!("failed to parse {}", context_path.display()))?;
+    let outputs = context
+        .get("outputs")
+        .and_then(|v| v.as_object())
+        .with_context(|| {
+            format!("{} has no 'outputs' object", context_path.display())
+        })?;
+
+    let mut manifest = serde_json::Map::with_capacity(outputs.len());
+    for (role, resolution) in outputs {
+        let path = resolution
+            .get("path")
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("output {role:?} has no 'path'"))?;
+        let kind = resolution
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // checkpoint_stream is a directory of step subdirs that get
+        // registered as separate artifacts later; skip hashing the
+        // top-level here.
+        if kind == "checkpoint_stream" {
+            continue;
+        }
+        let path = Path::new(path);
+        if !path.exists() {
+            eprintln!(
+                "hash-outputs: skipping role {role:?}: {} does not exist",
+                path.display()
+            );
+            continue;
+        }
+        let hash = util::dir_content_hash(path)
+            .with_context(|| format!("dir_content_hash({})", path.display()))?;
+        manifest.insert(role.clone(), serde_json::Value::String(hash));
+    }
+    let manifest_path = lab_dir.join("output_hashes.json");
+    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(manifest))?;
+    util::atomic_write(&manifest_path, &bytes)?;
+    Ok(())
+}
+
 /// Submit a recipe. The CLI is the only writer in the new model: it
 /// opens `Store` directly (against the filesystem-truth registry),
 /// snapshots the source repo as the invoking user, renders the sbatch
@@ -1002,8 +1018,8 @@ fn run_recipe_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<(
     let cluster = config::ClusterConfig::load(cluster_path)?;
     let recipe = config::Recipe::load(recipe_path)?;
     let submitted_by = current_user()?;
-    let mut store = store::Store::open(&cluster)?;
-    let submitted = runner::submit_recipe(&cluster, &mut store, &recipe, None, &submitted_by)?;
+    let store = store::Store::open(&cluster)?;
+    let submitted = runner::submit_recipe(&cluster, &store, &recipe, None, &submitted_by)?;
     println!("run_id: {}", submitted.run_id);
     println!("job_id: {}", submitted.job_id);
     println!("run_dir: {}", submitted.run_dir.display());
@@ -1033,8 +1049,8 @@ fn run_sweep_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()
         if sweep.aggregate.is_some() { " + aggregate" } else { "" },
     );
     let submitted_by = current_user()?;
-    let mut store = store::Store::open(&cluster)?;
-    let result = runner::submit_sweep(&cluster, &mut store, &recipe, &submitted_by)?;
+    let store = store::Store::open(&cluster)?;
+    let result = runner::submit_sweep(&cluster, &store, &recipe, &submitted_by)?;
     println!(
         "array_run_id: {}\narray_job_id: {}\narray_run_dir: {}",
         result.array_run.run_id,
@@ -1053,10 +1069,10 @@ fn run_pipeline_command(cluster_path: &PathBuf, pipeline_path: &PathBuf) -> Resu
     let cluster = config::ClusterConfig::load(cluster_path)?;
     let loaded = config::Pipeline::load(pipeline_path)?;
     let submitted_by = current_user()?;
-    let mut store = store::Store::open(&cluster)?;
+    let store = store::Store::open(&cluster)?;
     let submitted = runner::submit_pipeline(
         &cluster,
-        &mut store,
+        &store,
         &loaded,
         Some(pipeline_path),
         &submitted_by,
