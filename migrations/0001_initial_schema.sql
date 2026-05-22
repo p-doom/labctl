@@ -27,7 +27,7 @@ CREATE TABLE runs (
     created_at               BIGINT NOT NULL,
     finished_at              BIGINT,
     pipeline_id              TEXT,
-    dependency_on            TEXT,
+    dependency_on            JSONB,
     stage_name               TEXT,
     submitted_by             TEXT NOT NULL,
     cache_key                TEXT,

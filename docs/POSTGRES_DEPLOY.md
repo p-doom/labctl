@@ -90,6 +90,10 @@ Write `~/.config/systemd/user/labctl-postgres.service`:
 [Unit]
 Description=labctl Postgres instance
 After=network.target
+# Data dir lives on NFS shared across all login nodes. Only one host
+# may run PG against it at a time — multi-host postmaster.pid contention
+# was observed when this unit was enabled on hai-login{1,3}.
+ConditionHost=hai-login2.haicore.berlin
 
 [Service]
 Type=forking
@@ -115,6 +119,25 @@ systemctl --user enable --now labctl-postgres.service
 `pg_ctl` exit-code semantics + `Type=forking` give systemd a reliable
 ready signal without needing the `notify` PG build flavor (the
 cluster's PG module lacks libsystemd integration).
+
+**Critical gotcha — `ConditionHost`.** The data dir lives on NFS and is
+visible from every login node. systemd-user units, once `enable`d on
+one login node, *autostart on every other login node the user logs
+into*. Without the host-pinning condition, multiple postmasters race
+for `postmaster.pid` over NFS — each kicks the other out with
+`performing immediate shutdown because data directory lock file is
+invalid`, observable as a ~30-second restart cycle and intermittent
+client connection failures with "No such file or directory" or "Stale
+file handle" on the socket. Always include `ConditionHost=` with the
+FQDN of the designated PG host. To recover after the fact, stop +
+disable the unit on every non-designated host:
+
+```bash
+for h in hai-login1 hai-login3; do
+    ssh "$h" "systemctl --user stop labctl-postgres.service \
+              && systemctl --user disable labctl-postgres.service"
+done
+```
 
 ## Schema
 

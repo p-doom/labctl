@@ -2656,6 +2656,7 @@ mod tests {
             scheduler: Default::default(),
             slurm: Default::default(),
             dispatch: None,
+            postgres: None,
             remote: None,
         }
     }
