@@ -1272,6 +1272,71 @@ pub fn gc(_cluster: &ClusterConfig, store: &Store, terminal_snapshots: bool) -> 
     gc_terminal_sources(store, 0)
 }
 
+/// Reap `<runs_base>/runs/<user>/<id>/` dirs that have no corresponding
+/// row in the `runs` table. Catches the failure mode where a compute
+/// job (or a labctl invocation) created the run-dir on NFS but died
+/// before `insert_run` reached commit, leaving an orphan tree that no
+/// dispatcher will ever touch.
+///
+/// Scoped to the agent's own user. Cross-user reaping would compete
+/// with that user's daemon and risk racing on a freshly-created dir
+/// that hasn't been inserted yet from their CLI process. `min_age` is
+/// the safety cushion: any dir whose mtime is younger than this is
+/// skipped — covers the brief window between mkdir and the `insert_run`
+/// commit on the local user's own machine too.
+pub fn gc_orphan_run_dirs(
+    cluster: &ClusterConfig,
+    store: &Store,
+    min_age_secs: u64,
+) -> Result<usize> {
+    let user = crate::store::current_user()?;
+    let user_root = fs_layout::user_runs_dir(&cluster.filesystem.runs_base, &user);
+    let entries = match fs::read_dir(&user_root) {
+        Ok(e) => e,
+        // Missing dir on a fresh deployment is fine; no orphans by
+        // definition.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| {
+            format!("gc_orphan_run_dirs: read_dir {}", user_root.display())
+        }),
+    };
+
+    let now_sys = std::time::SystemTime::now();
+    let min_age = std::time::Duration::from_secs(min_age_secs);
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        // The run-id is the directory name; if the name isn't UTF-8
+        // it can't be a labctl-created run-dir, leave alone.
+        let Some(run_id) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if store.get_run_optional(run_id)?.is_some() {
+            continue;
+        }
+        // No PG row — but the dir might be in-flight (created by a
+        // CLI process that hasn't committed yet). Require it to have
+        // been quiet for at least `min_age`.
+        let mtime = metadata
+            .modified()
+            .with_context(|| format!("mtime of {}", path.display()))?;
+        let age = now_sys.duration_since(mtime).unwrap_or_default();
+        if age < min_age {
+            continue;
+        }
+        fs::remove_dir_all(&path).with_context(|| {
+            format!("gc_orphan_run_dirs: remove_dir_all {}", path.display())
+        })?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 /// Reap `source/` for terminal runs whose `finished_at` is older than
 /// `min_terminal_age_secs`. `.lab/provenance/<repo>/` (git HEAD + diff +
 /// uv.lock copy) is kept regardless, so reproducibility survives.

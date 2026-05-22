@@ -141,20 +141,57 @@ done
 
 ## Schema
 
-Applied via `migrations/0001_initial_schema.sql` (in this repo). Run
-once after `CREATE DATABASE labctl`:
+Migrations live in `migrations/` and are applied automatically by
+`PgStore::connect` via `sqlx::migrate!`. Every labctl process applies
+any pending migrations as part of its startup; a failure aborts
+`connect()` (no half-applied schema is ever observable).
+
+On a brand-new instance you only need to create the empty database;
+the first agent or CLI invocation runs the migrations:
 
 ```bash
 psql -h "$PGROOT/run" -d postgres -c 'CREATE DATABASE labctl;'
-psql -h "$PGROOT/run" -d labctl -f migrations/0001_initial_schema.sql
+# next labctl invocation drives the migrations
+labctl status    # or any subcommand that opens PgStore
 ```
 
-In the long-running setup, schema migrations land via `sqlx-cli` from
-the labctl crate at agent / CLI startup.
+## First-time cutover from an existing labctl deployment
+
+If you already have an old labctl instance running (a PG database
+created when only `0001` existed, populated by the legacy importer
+or by hand), do **not** point the new binary at it directly: the new
+constraints (FKs in 0002, FKs to `users` in 0003) will fail to apply
+mid-`ALTER TABLE` against rows the old code never validated. The
+cleanest path is a full re-import on a fresh DB:
+
+```bash
+# 1. stop both services so nothing writes during the cutover.
+systemctl --user stop labctl-ui.service labctl-agent.service
+
+# 2. drop + recreate; sqlx::migrate! will lay down 0001+0002+0003 fresh.
+psql -h "$PGROOT/run" -d postgres -c 'DROP DATABASE labctl;'
+psql -h "$PGROOT/run" -d postgres -c 'CREATE DATABASE labctl;'
+
+# 3. let any labctl subcommand run migrations on the empty DB.
+labctl status
+
+# 4. re-import the FS sidecars under the new constrained schema.
+module load PostgreSQL/16.4-GCCcore-13.3.0
+python3 scripts/import-to-pg.py --cluster ~/.config/labctl/cluster.toml
+
+# 5. restart services.
+systemctl --user start labctl-agent.service labctl-ui.service
+```
+
+The importer is single-transaction (`BEGIN; TRUNCATE … CASCADE;
+\copy …; COMMIT;`), so the DEFERRABLE FKs in 0002 validate only at
+commit. `users` is loaded first; every downstream `submitted_by` /
+`"user"` reference resolves immediately.
 
 ## Importing existing FS-truth into PG
 
-One-shot, idempotent (`TRUNCATE … RESTART IDENTITY` then `\copy`):
+The cutover described above uses the same script the original
+substrate import used:
 
 ```bash
 module load PostgreSQL/16.4-GCCcore-13.3.0
@@ -167,8 +204,9 @@ The importer walks `<runs_base>/runs/<user>/<run_id>/.lab/*.json`,
 `<artifact_roots>/<kind>/_objects/<prefix>/<hash>/.meta.json`,
 `<runs_base>/aliases/`, `<runs_base>/pipelines/`,
 `<runs_base>/eval_state/`, and `<runs_base>/events/*.jsonl`, emits
-per-table TSV files, then `\copy`s them into PG. Currently imports
-~8.4k rows across 10 tables in seconds.
+per-table TSV files (including a derived `users.tsv` built from the
+distinct `submitted_by` / `"user"` values it observes), then `\copy`s
+them into PG in one transaction.
 
 The original `events_id_seq` is restored via `setval` so subsequent
 `INSERT INTO events` doesn't collide with imported event ids.
@@ -204,15 +242,32 @@ TCP target and provide credentials via `~/.pgpass` or env vars.
 
 ## Multi-user rollout
 
-Not yet automated. To grant another user write access:
+Use the `labctl admin add-user` subcommand, run by whoever owns the
+PG database (the user who ran `initdb` — on the canonical lab setup,
+that's the same user who hosts `labctl-postgres.service`):
 
-```sql
-CREATE ROLE alice WITH LOGIN;
-GRANT ALL ON SCHEMA public TO alice;
-GRANT ALL ON ALL TABLES IN SCHEMA public TO alice;
-GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO alice;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO alice;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO alice;
+```bash
+labctl admin add-user alice
 ```
 
-Future `labctl admin add-user <name>` should automate this.
+In one transaction's worth of bookkeeping, the command:
+
+  * Inserts the labctl-side row in the `users` table (FK target for
+    every per-user column).
+  * Creates the PG role with LOGIN and grants the full table /
+    sequence / default-privilege set on `public` (idempotent: a
+    pre-existing role is detected and only the GRANTs re-apply).
+  * Materialises the per-user FS dirs: `<runs_base>/runs/<alice>/`,
+    `<artifact_root>/<alice>/`, `<artifact_root>/aliases/<alice>/`
+    for every artifact root, honouring `[filesystem].shared_group`
+    perms if configured.
+
+Flags: `--no-pg-role` (the role already exists / is provisioned
+out-of-band), `--no-create-dirs` (FS lives elsewhere or has already
+been arranged).
+
+After `add-user` returns, the new collaborator copies a `cluster.toml`
+pointing at this PG instance (`labctl init --join <path>` is the
+intended path) and starts using labctl. Their PG connection uses the
+matching role; peer auth on the Unix socket works when they're on
+the PG host, password / `~/.pgpass` everywhere else.

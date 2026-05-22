@@ -854,7 +854,13 @@ async fn get_run_log(
             .ok_or_else(|| not_found(format!("run not found: {id}")))?
     };
     let tail = params.tail.unwrap_or(200).min(5000);
-    let log = read_tail_log(&run.run_dir, tail);
+    // NFS read_dir + read_to_string can stall for seconds; the spawn_blocking
+    // keeps the axum worker thread free while the blocking call runs on
+    // tokio's blocking-thread pool.
+    let run_dir = run.run_dir.clone();
+    let log = tokio::task::spawn_blocking(move || read_tail_log(&run_dir, tail))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("log task: {e}")))?;
     Ok(axum::Json(json!({
         "run_id": id,
         "lines": log.lines,
@@ -1519,32 +1525,38 @@ async fn get_artifact_rollout(
         .ok_or_else(|| not_found("artifact has no traj_path in result".to_string()))?
         .to_string();
 
-    let traj_path = std::path::Path::new(&traj_path_str);
+    let traj_path = PathBuf::from(&traj_path_str);
     let steps_dir = traj_path
         .parent()
         .ok_or_else(|| not_found("invalid traj_path: no parent dir".to_string()))?
         .join("steps");
 
-    let content = std::fs::read_to_string(traj_path).map_err(|e| {
-        ApiError(
-            StatusCode::NOT_FOUND,
-            format!("traj.jsonl not readable: {e}"),
-        )
-    })?;
-
-    let steps: Vec<Value> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-
-    let frame_count: u32 = std::fs::read_dir(&steps_dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map_or(false, |ext| ext == "png"))
-                .count() as u32
-        })
-        .unwrap_or(0);
+    // The traj.jsonl + steps/ dir live on NFS; both reads can stall.
+    // One spawn_blocking covers both so the handler never blocks the
+    // worker thread.
+    let (steps, frame_count) = tokio::task::spawn_blocking(move || {
+        let content = std::fs::read_to_string(&traj_path).map_err(|e| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("traj.jsonl not readable: {e}"),
+            )
+        })?;
+        let steps: Vec<Value> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let frame_count: u32 = std::fs::read_dir(&steps_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "png"))
+                    .count() as u32
+            })
+            .unwrap_or(0);
+        Ok::<_, ApiError>((steps, frame_count))
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("rollout task: {e}")))??;
 
     Ok(axum::Json(json!({
         "steps": steps,
@@ -1580,7 +1592,8 @@ async fn get_artifact_frame(
 
     let frame_path = steps_dir.join(format!("step_{n:03}.png"));
 
-    let bytes = std::fs::read(&frame_path)
+    let bytes = tokio::fs::read(&frame_path)
+        .await
         .map_err(|_| not_found(format!("frame {n} not found at {}", frame_path.display())))?;
 
     Ok(Response::builder()
@@ -1800,10 +1813,14 @@ async fn dataset_summary_for(
             return Ok(Some((artifact.path.clone(), entry.clone())));
         }
     }
-    // Walk outside the lock — a cold scan can take a few hundred ms on a
-    // dataset with thousands of segments, no point blocking concurrent
-    // requests for unrelated artifacts.
-    let summary = walk_dataset(&artifact.path);
+    // Walk outside the lock — a cold scan can take a few hundred ms on
+    // a dataset with thousands of segments, no point blocking concurrent
+    // requests for unrelated artifacts. spawn_blocking moves the walk
+    // off the axum worker thread; NFS read_dir is the latency tail here.
+    let walk_path = artifact.path.clone();
+    let summary = tokio::task::spawn_blocking(move || walk_dataset(&walk_path))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("dataset walk: {e}")))?;
     let entry = Arc::new(summary);
     {
         let mut cache = state.dataset_cache.lock().unwrap();
@@ -1836,7 +1853,7 @@ async fn get_artifact_dataset_segment(
     let meta_path = seg_dir.join("meta.json");
     let chat_path = seg_dir.join("chat_line.json");
 
-    let meta_bytes = std::fs::read(&meta_path).map_err(|e| {
+    let meta_bytes = tokio::fs::read(&meta_path).await.map_err(|e| {
         not_found(format!(
             "segment meta.json not readable: {} ({e})",
             meta_path.display()
@@ -1859,7 +1876,7 @@ async fn get_artifact_dataset_segment(
     // show the right frame.
     let mut actions: Vec<String> = Vec::new();
     let mut frame_indices: Vec<u32> = Vec::new();
-    if let Ok(bytes) = std::fs::read(&chat_path) {
+    if let Ok(bytes) = tokio::fs::read(&chat_path).await {
         if let Ok(chat) = serde_json::from_slice::<Value>(&bytes) {
             if let Some(msgs) = chat.get("messages").and_then(|x| x.as_array()) {
                 // Walk in source order, pairing consecutive user→assistant
@@ -1959,14 +1976,16 @@ async fn get_artifact_dataset_frame(
         .join(&seg)
         .join("frames")
         .join(format!("frame_{n:06}.jpg"));
-    let frame_path = if local.is_file() {
+    let frame_path = if tokio::fs::metadata(&local).await.map(|m| m.is_file()).unwrap_or(false) {
         local
     } else {
         resolve_frame_via_chat_line(&state, &id, &root, &split, &seg, n)
+            .await
             .ok_or_else(|| not_found(format!("frame {n} not resolvable for {seg}")))?
     };
 
-    let bytes = std::fs::read(&frame_path)
+    let bytes = tokio::fs::read(&frame_path)
+        .await
         .map_err(|_| not_found(format!("frame {n} not found at {}", frame_path.display())))?;
 
     Ok(Response::builder()
@@ -1980,7 +1999,7 @@ async fn get_artifact_dataset_frame(
 /// a single segment by parsing its chat_line.json. Used to serve frames
 /// for "chat_line-only" datasets (Stage B onwards) whose segment dir
 /// has no local `frames/` subdir.
-fn resolve_frame_via_chat_line(
+async fn resolve_frame_via_chat_line(
     state: &AppState,
     artifact_id: &str,
     root: &std::path::Path,
@@ -1997,7 +2016,7 @@ fn resolve_frame_via_chat_line(
     }
     // Build the cache outside the lock.
     let chat_path = root.join(split).join(seg).join("chat_line.json");
-    let bytes = std::fs::read(&chat_path).ok()?;
+    let bytes = tokio::fs::read(&chat_path).await.ok()?;
     let chat: Value = serde_json::from_slice(&bytes).ok()?;
     let mut map: HashMap<u32, PathBuf> = HashMap::new();
     if let Some(msgs) = chat.get("messages").and_then(|x| x.as_array()) {

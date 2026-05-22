@@ -227,7 +227,7 @@ async fn gc_loop(
     }
 }
 
-fn do_gc(_cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u64) {
+fn do_gc(cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u64) {
     let removed = {
         let s = &store;
         runner::gc_terminal_sources(&s, min_terminal_age_secs)
@@ -245,6 +245,17 @@ fn do_gc(_cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u6
         Ok(0) => {}
         Ok(n) => eprintln!("labctl dispatch: gc reaped {n} stale coalesce claim(s)"),
         Err(e) => eprintln!("labctl dispatch: coalesce gc failed: {e:#}"),
+    }
+    // Reap orphan run-dirs: <runs_base>/runs/<user>/<id>/ with no PG row.
+    // Cushion the age so we don't race against an in-flight CLI submit
+    // whose insert_run hasn't committed yet; the terminal-source cutoff
+    // is a sensible minimum (it's already the agent operator's "this
+    // run is settled" threshold).
+    let orphan_min_age = min_terminal_age_secs.max(3600);
+    match runner::gc_orphan_run_dirs(cluster, store, orphan_min_age) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("labctl dispatch: gc reaped {n} orphan run-dir(s)"),
+        Err(e) => eprintln!("labctl dispatch: orphan-dir gc failed: {e:#}"),
     }
 }
 

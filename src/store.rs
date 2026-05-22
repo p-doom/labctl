@@ -310,6 +310,14 @@ impl Store {
             .with_context(|| format!("run not found: {run_id}"))
     }
 
+    /// `Option<RunRow>` flavour for callers that need to differentiate
+    /// missing-row from PG-error (orphan-dir GC, polling existence
+    /// checks, etc.). `get_run` keeps the panic-on-absence shape for
+    /// the common "I expect this run to exist" call sites.
+    pub fn get_run_optional(&self, run_id: &str) -> Result<Option<RunRow>> {
+        self.block_on_pg(self.pg.get_run(run_id))
+    }
+
     pub fn runs_by_recipe(&self, recipe_name: &str) -> Result<Vec<RunRow>> {
         self.block_on_pg(self.pg.runs_by_recipe(recipe_name))
     }
@@ -680,6 +688,16 @@ impl Store {
 
     pub fn run_view(&self, run_id: &str) -> Result<RunView> {
         self.block_on_pg(self.pg.run_view(run_id))
+    }
+
+    // ---------- users / admin ----------
+
+    pub fn insert_user(&self, name: &str, created_at: i64) -> Result<bool> {
+        self.block_on_pg(self.pg.insert_user(name, created_at))
+    }
+
+    pub fn ensure_pg_role(&self, name: &str) -> Result<bool> {
+        self.block_on_pg(self.pg.ensure_pg_role(name))
     }
 
     // ---------- pipelines ----------
