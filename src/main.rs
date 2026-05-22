@@ -575,7 +575,7 @@ fn main() -> Result<()> {
             let addr: std::net::SocketAddr = bind
                 .parse()
                 .with_context(|| format!("invalid --bind address {bind:?}"))?;
-            server::serve(cluster, store, addr)?;
+            server::serve(cluster, store.pg(), addr)?;
         }
         Command::Agent => {
             agent::run_standalone(cluster, store)?;

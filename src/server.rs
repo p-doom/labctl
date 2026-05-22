@@ -1,10 +1,10 @@
 //! HTTP API + embedded SPA. Behind the `ui` feature.
 //!
-//! Read-only window onto the filesystem-truth registry. The CLI is the
-//! only writer in the new model — every `labctl run` / `labctl
-//! run-pipeline` writes sidecars directly under its own uid, never
-//! through here. This server's job is to surface the in-memory cache
-//! (built by the indexer at startup) over HTTP for the SPA. Bind to
+//! Read-only window onto the Postgres registry. The CLI / agent / evald
+//! are the only writers; this process never mutates state. Handlers
+//! talk to `PgStore` directly via async sqlx — no `block_in_place` on
+//! the HTTP path. The SSE tailer subscribes to `LISTEN labctl_events`
+//! so live deltas land in subscriber browsers without polling. Bind to
 //! 127.0.0.1 on a login node and reach it over an SSH tunnel; access
 //! control is "who can SSH in."
 
@@ -31,13 +31,15 @@ use axum::{
 use futures_util::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::postgres::PgListener;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
 
 use crate::{
     config::ClusterConfig,
-    store::{ArtifactRow, RunRow, Store, is_terminal},
+    pg_store::PgStore,
+    store::{ArtifactRow, RunRow, is_terminal},
 };
 
 #[derive(rust_embed::RustEmbed)]
@@ -46,7 +48,7 @@ struct Assets;
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Store>,
+    pg: Arc<PgStore>,
     cluster: Arc<ClusterConfig>,
     /// Broadcast channel for SSE clients. The events-table tail task posts
     /// here; each connected client subscribes via `/api/stream`.
@@ -75,12 +77,12 @@ struct StreamEvent {
     id: String,
 }
 
-pub fn serve(cluster: ClusterConfig, store: Store, addr: SocketAddr) -> Result<()> {
+pub fn serve(cluster: ClusterConfig, pg: Arc<PgStore>, addr: SocketAddr) -> Result<()> {
     // 256 is plenty — broadcast is for live deltas, not a queue. Slow
     // subscribers get lagged out and re-sync via REST on next focus.
     let (events_tx, _) = broadcast::channel::<StreamEvent>(256);
     let state = AppState {
-        store: Arc::new(store),
+        pg,
         cluster: Arc::new(cluster),
         events_tx: events_tx.clone(),
         dataset_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -119,7 +121,7 @@ pub fn serve(cluster: ClusterConfig, store: Store, addr: SocketAddr) -> Result<(
         .route("/cluster", get(get_cluster))
         .route("/stream", get(stream_handler));
 
-    let tail_store = state.store.clone();
+    let tail_pg = state.pg.clone();
     let app = Router::new()
         .nest("/api", api)
         .fallback(static_handler)
@@ -132,10 +134,11 @@ pub fn serve(cluster: ClusterConfig, store: Store, addr: SocketAddr) -> Result<(
         .context("failed to build tokio runtime")?;
 
     runtime.block_on(async move {
-        // Background task: tail the events table for SSE subscribers.
-        // Since the store is PG-backed and authoritative, the tailer
-        // sees writes from every process (CLI, agent, this UI) at once.
-        tokio::spawn(events_tailer(tail_store, events_tx));
+        // SSE tailer subscribes to LISTEN labctl_events (the trigger on
+        // `events` in migration 0002 fires pg_notify per insert). On
+        // listener-connection error the supervisor reconnects after a
+        // brief backoff — there is no silent fall-through to polling.
+        tokio::spawn(events_tailer(tail_pg, events_tx));
 
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -150,37 +153,70 @@ pub fn serve(cluster: ClusterConfig, store: Store, addr: SocketAddr) -> Result<(
     Ok(())
 }
 
-async fn events_tailer(
-    store: Arc<Store>,
-    tx: broadcast::Sender<StreamEvent>,
-) {
-    // Start at the current tip so we don't replay the entire backlog
-    // on every server restart. New events are appended to the cache
-    // synchronously by dispatch writes (Store::event), so the tailer
-    // just polls for ids strictly greater than its last cursor.
-    let mut last_id: i64 = {
-        let s = &store;
-        s.max_event_id().unwrap_or(0)
-    };
-    let mut interval = tokio::time::interval(Duration::from_millis(500));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+/// LISTEN/NOTIFY-driven SSE tailer. Subscribes to channel `labctl_events`
+/// (fired by the AFTER INSERT trigger on `events` in 0002), and on each
+/// notification drains rows > last_id and broadcasts translated stream
+/// events. On any listener error the supervisor logs and reconnects;
+/// there's no polling fallback by design — if PG is unreachable, the SSE
+/// stream is correctly silent until it's back.
+async fn events_tailer(pg: Arc<PgStore>, tx: broadcast::Sender<StreamEvent>) {
     loop {
-        interval.tick().await;
-        if tx.receiver_count() == 0 {
-            continue;
-        }
-        let new_events = {
-            let s = &store;
-            match s.events_after(last_id) {
-                Ok(rows) => rows,
-                Err(e) => {
-                    eprintln!("events_tailer: query failed: {e:#}");
-                    continue;
-                }
+        match run_events_listener(&pg, &tx).await {
+            Ok(()) => {
+                // The inner loop only returns Ok on graceful shutdown
+                // (the receiver was dropped, which only happens on
+                // process shutdown). Exit the supervisor.
+                return;
             }
-        };
+            Err(e) => {
+                eprintln!(
+                    "events_tailer: listener disconnected: {e:#}; \
+                     reconnecting in 2s"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+async fn run_events_listener(
+    pg: &PgStore,
+    tx: &broadcast::Sender<StreamEvent>,
+) -> Result<()> {
+    let mut listener = PgListener::connect_with(pg.pool())
+        .await
+        .context("PgListener::connect_with failed")?;
+    listener
+        .listen("labctl_events")
+        .await
+        .context("LISTEN labctl_events failed")?;
+    // High-water cursor: anything ≤ this id we've already broadcast (or
+    // existed before we started listening). Capture the tip *after*
+    // LISTEN so we don't miss events inserted between max_event_id and
+    // listen() — pg_notify is fire-and-forget within a session.
+    let mut last_id: i64 = pg
+        .max_event_id()
+        .await
+        .context("max_event_id at listener startup")?;
+    loop {
+        // Block until a notification arrives. PgListener handles keepalive
+        // and reports connection loss through this return.
+        let _notification = listener
+            .recv()
+            .await
+            .context("PgListener::recv failed (connection dropped)")?;
+        // Drain everything > last_id in one query. Coalesces bursts and
+        // recovers any notifications dropped while we were processing
+        // the previous batch.
+        let new_events = pg
+            .events_after(last_id, i64::MAX)
+            .await
+            .context("events_after in listener drain")?;
         for ev in new_events {
             last_id = last_id.max(ev.id);
+            if tx.receiver_count() == 0 {
+                continue;
+            }
             if let Some(out) = translate_event(&ev) {
                 let _ = tx.send(out);
             }
@@ -305,8 +341,8 @@ fn artifact_summary(a: &ArtifactRow) -> Value {
 // ---------- handlers ----------
 
 async fn list_runs(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let runs: Vec<Value> = store.list_runs()?.iter().map(run_summary).collect();
+    let pg = &state.pg;
+    let runs: Vec<Value> = pg.list_runs().await?.iter().map(run_summary).collect();
     Ok(axum::Json(json!({ "runs": runs })))
 }
 
@@ -314,8 +350,8 @@ async fn get_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let view = store.run_view(&id).map_err(|_| not_found(format!("run not found: {id}")))?;
+    let pg = &state.pg;
+    let view = pg.run_view(&id).await.map_err(|_| not_found(format!("run not found: {id}")))?;
     let inputs: Vec<Value> = view
         .inputs
         .iter()
@@ -351,7 +387,7 @@ async fn get_run(
             s
         })
         .collect();
-    let tracking = match store.get_tracking(&view.run.id)? {
+    let tracking = match pg.get_tracking(&view.run.id).await? {
         Some(t) => json!({
             "wandb": {
                 "entity": t.entity,
@@ -363,7 +399,8 @@ async fn get_run(
         }),
         None => json!({ "wandb": Value::Null }),
     };
-    let eval_series = build_eval_series(&store, &view.eval_requests);
+    let eval_series_rows = pg.eval_series_rows(&view.run.id).await?;
+    let eval_series = build_eval_series(&eval_series_rows);
     let body = json!({
         "run": run_full(&view.run),
         "inputs": inputs,
@@ -382,7 +419,7 @@ async fn get_run(
 /// `register_outputs` for `checkpoint_stream` outputs). Points without a
 /// step still get included but with `step = null` — the UI sorts those to
 /// the end.
-fn build_eval_series(store: &Store, raw: &[Value]) -> Vec<Value> {
+fn build_eval_series(rows: &[crate::store::EvalSeriesRow]) -> Vec<Value> {
     use std::collections::BTreeMap;
 
     struct Point {
@@ -396,42 +433,28 @@ fn build_eval_series(store: &Store, raw: &[Value]) -> Vec<Value> {
 
     let mut by_policy: BTreeMap<String, Vec<Point>> = BTreeMap::new();
 
-    for ev in raw {
-        let policy = ev.get("policy_id").and_then(|v| v.as_str()).unwrap_or("");
-        let state = ev.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let eval_run_id = ev
-            .get("eval_run_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let checkpoint_artifact_id = ev
-            .get("checkpoint_artifact_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+    for ev in rows {
+        let step = ev
+            .checkpoint_metadata
+            .as_ref()
+            .and_then(|m| m.get("step"))
+            .and_then(|v| v.as_i64());
 
-        // Pull step out of the checkpoint artifact's metadata, when known.
-        let step = store
-            .get_artifact_optional(&checkpoint_artifact_id)
-            .ok()
-            .flatten()
-            .and_then(|a| a.metadata_json.get("step").and_then(|v| v.as_i64()));
+        let (metric_name, value) = ev
+            .eval_result_metadata
+            .as_ref()
+            .and_then(|m| m.get("result"))
+            .and_then(first_metric)
+            .map(|(n, v)| (Some(n), Some(v)))
+            .unwrap_or((None, None));
 
-        // Pull the headline metric out of the eval run, when it has one.
-        let (metric_name, value) = match eval_run_id.as_deref() {
-            Some(rid) => match primary_metric_for_run(store, rid) {
-                Some((m, v)) => (Some(m), Some(v)),
-                None => (None, None),
-            },
-            None => (None, None),
-        };
-
-        by_policy.entry(policy.to_string()).or_default().push(Point {
+        by_policy.entry(ev.policy_id.clone()).or_default().push(Point {
             step,
             value,
             metric_name,
-            eval_run_id,
-            checkpoint_artifact_id,
-            state,
+            eval_run_id: ev.eval_run_id.clone(),
+            checkpoint_artifact_id: ev.checkpoint_artifact_id.clone(),
+            state: ev.state.clone(),
         });
     }
 
@@ -486,68 +509,37 @@ fn build_eval_series(store: &Store, raw: &[Value]) -> Vec<Value> {
 /// All metric points emitted by a run's evals, flattened: one row per
 /// (metric, eval, checkpoint). Drives the metric-pivot used by compare /
 /// recipe views.
-fn metric_points_for_run(store: &Store, run_id: &str) -> Vec<MetricPoint> {
-    let raw = match store.eval_requests_for_run(run_id) {
+async fn metric_points_for_run(pg: &PgStore, run_id: &str) -> Vec<MetricPoint> {
+    let rows = match pg.eval_series_rows(run_id).await {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
     let mut out: Vec<MetricPoint> = Vec::new();
-    for ev in raw {
-        let policy_id = ev
-            .get("policy_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let state = ev
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let eval_run_id = ev
-            .get("eval_run_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let checkpoint_artifact_id = ev
-            .get("checkpoint_artifact_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+    for ev in rows {
+        let step = ev
+            .checkpoint_metadata
+            .as_ref()
+            .and_then(|m| m.get("step"))
+            .and_then(|v| v.as_i64());
 
-        let step = store
-            .get_artifact_optional(&checkpoint_artifact_id)
-            .ok()
-            .flatten()
-            .and_then(|a| a.metadata_json.get("step").and_then(|v| v.as_i64()));
-
-        // Find the eval_result artifact for this eval_run, pull all metrics.
-        let metrics: Vec<(String, Value)> = match eval_run_id.as_deref() {
-            Some(rid) => {
-                let outputs = store.run_outputs(rid).unwrap_or_default();
-                let mut m = Vec::new();
-                for art in outputs {
-                    if art.kind == "eval_result" {
-                        if let Some(result) = art.metadata_json.get("result") {
-                            m = extract_all_metrics(result);
-                            break;
-                        }
-                    }
-                }
-                m
-            }
-            None => Vec::new(),
-        };
+        let metrics: Vec<(String, Value)> = ev
+            .eval_result_metadata
+            .as_ref()
+            .and_then(|m| m.get("result"))
+            .map(extract_all_metrics)
+            .unwrap_or_default();
 
         if metrics.is_empty() {
             // Still emit a marker row so the UI can show "eval pending"
             // for this checkpoint, keyed under a synthetic metric.
             out.push(MetricPoint {
-                metric_name: String::new(), // empty = no metric yet
+                metric_name: String::new(),
                 step,
                 value: None,
-                eval_run_id: eval_run_id.clone(),
-                checkpoint_artifact_id: checkpoint_artifact_id.clone(),
-                state: state.clone(),
-                policy_id: policy_id.clone(),
+                eval_run_id: ev.eval_run_id.clone(),
+                checkpoint_artifact_id: ev.checkpoint_artifact_id.clone(),
+                state: ev.state.clone(),
+                policy_id: ev.policy_id.clone(),
             });
         } else {
             for (name, value) in metrics {
@@ -555,10 +547,10 @@ fn metric_points_for_run(store: &Store, run_id: &str) -> Vec<MetricPoint> {
                     metric_name: name,
                     step,
                     value: Some(value),
-                    eval_run_id: eval_run_id.clone(),
-                    checkpoint_artifact_id: checkpoint_artifact_id.clone(),
-                    state: state.clone(),
-                    policy_id: policy_id.clone(),
+                    eval_run_id: ev.eval_run_id.clone(),
+                    checkpoint_artifact_id: ev.checkpoint_artifact_id.clone(),
+                    state: ev.state.clone(),
+                    policy_id: ev.policy_id.clone(),
                 });
             }
         }
@@ -580,7 +572,7 @@ struct MetricPoint {
 /// per metric; one trajectory per run inside each metric. Sort metrics
 /// so the most "common" one (most runs measuring it) comes first — that
 /// makes the natural default-selected metric the one users care about.
-fn build_metric_pivot(store: &Store, runs: &[crate::store::RunRow]) -> Value {
+async fn build_metric_pivot(pg: &PgStore, runs: &[crate::store::RunRow]) -> Value {
     use std::collections::BTreeMap;
 
     // For each metric: run_id → Vec<(step, value, eval_run_id, ...)>
@@ -588,7 +580,7 @@ fn build_metric_pivot(store: &Store, runs: &[crate::store::RunRow]) -> Value {
     let mut by_metric: BTreeMap<String, BTreeMap<String, RunPoints>> = BTreeMap::new();
 
     for run in runs {
-        let points = metric_points_for_run(store, &run.id);
+        let points = metric_points_for_run(pg, &run.id).await;
         for p in points {
             if p.metric_name.is_empty() || p.value.is_none() {
                 continue; // pending or no metric yet — skip from the chart
@@ -700,25 +692,6 @@ fn build_metric_pivot(store: &Store, runs: &[crate::store::RunRow]) -> Value {
         "metrics": metrics,
         "series_by_metric": series,
     })
-}
-
-/// Look up an eval run's headline metric. Pattern-matches `metadata.result`
-/// against several common eval-output shapes — anything that contains a
-/// flat `{name: number}` dict in a known position is treated as metrics.
-/// No coupling to a specific framework's schema; the recipe author writes
-/// their natural format and labctl recognizes it.
-fn primary_metric_for_run(store: &Store, run_id: &str) -> Option<(String, Value)> {
-    let outputs = store.run_outputs(run_id).ok()?;
-    for art in outputs {
-        if art.kind != "eval_result" {
-            continue;
-        }
-        let result = art.metadata_json.get("result")?;
-        if let Some((name, value)) = first_metric(result) {
-            return Some((name, value));
-        }
-    }
-    None
 }
 
 /// Return the first metric `(name, value)` extractable from a result blob.
@@ -875,8 +848,10 @@ async fn get_run_log(
     Query(params): Query<LogParams>,
 ) -> Result<axum::Json<Value>, ApiError> {
     let run = {
-        let store = &state.store;
-        store.get_run(&id).map_err(|_| not_found(format!("run not found: {id}")))?
+        let pg = &state.pg;
+        pg.get_run(&id)
+            .await?
+            .ok_or_else(|| not_found(format!("run not found: {id}")))?
     };
     let tail = params.tail.unwrap_or(200).min(5000);
     let log = read_tail_log(&run.run_dir, tail);
@@ -933,8 +908,8 @@ async fn get_run_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let events = store.events_for_run(&id)?;
+    let pg = &state.pg;
+    let events = pg.events_for_run(&id).await?;
     Ok(axum::Json(json!({ "events": events })))
 }
 
@@ -950,9 +925,10 @@ async fn get_recipe_history(
     Query(params): Query<HistoryParams>,
 ) -> Result<axum::Json<Value>, ApiError> {
     let limit = params.limit.unwrap_or(20).min(200);
-    let store = &state.store;
-    let history: Vec<Value> = store
-        .recipe_history(&name, limit)?
+    let pg = &state.pg;
+    let history: Vec<Value> = pg
+        .recipe_history(&name, limit as i64)
+        .await?
         .into_iter()
         .map(|(status, ts)| json!({ "status": status, "created_at": ts }))
         .collect();
@@ -985,14 +961,14 @@ async fn compare_runs(
             "series_by_metric": [],
         })));
     }
-    let store = &state.store;
+    let pg = &state.pg;
     let mut runs: Vec<crate::store::RunRow> = Vec::with_capacity(ids.len());
     for id in &ids {
-        if let Ok(r) = store.get_run(id) {
+        if let Ok(Some(r)) = pg.get_run(id).await {
             runs.push(r);
         }
     }
-    Ok(axum::Json(build_metric_pivot(&store, &runs)))
+    Ok(axum::Json(build_metric_pivot(pg, &runs).await))
 }
 
 /// Recipe view: every run of `name` plus eval_series transposed by policy
@@ -1001,12 +977,12 @@ async fn get_recipe(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let runs = store.runs_by_recipe(&name)?;
+    let pg = &state.pg;
+    let runs = pg.runs_by_recipe(&name).await?;
     if runs.is_empty() {
         return Err(not_found(format!("recipe not found: {name}")));
     }
-    let mut body = build_metric_pivot(&store, &runs);
+    let mut body = build_metric_pivot(pg, &runs).await;
     if let Some(obj) = body.as_object_mut() {
         obj.insert("recipe_name".into(), Value::String(name));
     }
@@ -1014,11 +990,11 @@ async fn get_recipe(
 }
 
 async fn list_pipelines(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let pipelines = store.list_pipelines()?;
+    let pg = &state.pg;
+    let pipelines = pg.list_pipelines().await?;
     let mut out = Vec::with_capacity(pipelines.len());
     for p in pipelines {
-        let runs = store.list_pipeline_runs(&p.id)?;
+        let runs = pg.list_pipeline_runs(&p.id).await?;
         let stage_count = runs.len();
         let status = aggregate_pipeline_status(&runs);
         out.push(json!({
@@ -1053,11 +1029,12 @@ async fn get_pipeline(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let pipeline = store
-        .get_pipeline(&id)?
+    let pg = &state.pg;
+    let pipeline = pg
+        .get_pipeline(&id)
+        .await?
         .ok_or_else(|| not_found(format!("pipeline not found: {id}")))?;
-    let runs = store.list_pipeline_runs(&id)?;
+    let runs = pg.list_pipeline_runs(&id).await?;
     let stages: Vec<Value> = runs
         .iter()
         .map(|r| {
@@ -1083,11 +1060,11 @@ async fn get_pipeline(
 }
 
 async fn list_artifacts(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let artifacts = store.list_artifacts()?;
+    let pg = &state.pg;
+    let artifacts = pg.list_artifacts().await?;
     let mut out = Vec::with_capacity(artifacts.len());
     for a in artifacts {
-        let aliases = store.aliases_for_artifact(&a.id)?;
+        let aliases = pg.aliases_for_artifact(&a.id).await?;
         let mut s = artifact_summary(&a);
         s.as_object_mut().unwrap().insert("aliases".into(), json!(aliases));
         out.push(s);
@@ -1099,29 +1076,27 @@ async fn get_artifact(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let artifact = store
-        .get_artifact_optional(&id)?
+    let pg = &state.pg;
+    let artifact = pg
+        .get_artifact_optional(&id)
+        .await?
         .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
-    let aliases = store.aliases_for_artifact(&id)?;
-    let consumers = store.artifact_consumers(&id)?;
-    let consumer_runs: Vec<Value> = consumers
-        .into_iter()
-        .filter_map(|(run_id, role)| {
-            store.get_run(&run_id).ok().map(|r| {
-                let mut v = run_summary(&r);
-                v.as_object_mut()
-                    .unwrap()
-                    .insert("input_role".into(), Value::String(role));
-                v
-            })
-        })
-        .collect();
-    let producer = artifact
-        .producer_run_id
-        .as_deref()
-        .and_then(|rid| store.get_run(rid).ok())
-        .map(|r| run_summary(&r));
+    let aliases = pg.aliases_for_artifact(&id).await?;
+    let consumers = pg.artifact_consumers(&id).await?;
+    let mut consumer_runs: Vec<Value> = Vec::with_capacity(consumers.len());
+    for (run_id, role) in consumers {
+        if let Ok(Some(r)) = pg.get_run(&run_id).await {
+            let mut v = run_summary(&r);
+            v.as_object_mut()
+                .unwrap()
+                .insert("input_role".into(), Value::String(role));
+            consumer_runs.push(v);
+        }
+    }
+    let producer = match artifact.producer_run_id.as_deref() {
+        Some(rid) => pg.get_run(rid).await.ok().flatten().map(|r| run_summary(&r)),
+        None => None,
+    };
     let mut s = artifact_summary(&artifact);
     let m = s.as_object_mut().unwrap();
     m.insert("aliases".into(), json!(aliases));
@@ -1139,30 +1114,34 @@ async fn get_artifact_lineage(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
+    let pg = &state.pg;
     let max_hops = 6usize;
-    let root = store
-        .get_artifact_optional(&id)?
+    let root = pg
+        .get_artifact_optional(&id)
+        .await?
         .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
 
     let mut artifact_nodes: std::collections::BTreeMap<String, Value> = Default::default();
     let mut run_nodes: std::collections::BTreeMap<String, Value> = Default::default();
     let mut edges: Vec<Value> = Vec::new();
 
-    let push_artifact = |a: &ArtifactRow,
-                         nodes: &mut std::collections::BTreeMap<String, Value>,
-                         is_root: bool| {
-        let aliases = store.aliases_for_artifact(&a.id).unwrap_or_default();
+    async fn push_artifact(
+        pg: &PgStore,
+        a: &ArtifactRow,
+        nodes: &mut std::collections::BTreeMap<String, Value>,
+        is_root: bool,
+    ) {
+        let aliases = pg.aliases_for_artifact(&a.id).await.unwrap_or_default();
         let mut s = artifact_summary(a);
         s.as_object_mut().unwrap().insert("aliases".into(), json!(aliases));
         s.as_object_mut().unwrap().insert("is_root".into(), json!(is_root));
         nodes.insert(a.id.clone(), s);
-    };
-    let push_run = |r: &RunRow, nodes: &mut std::collections::BTreeMap<String, Value>| {
+    }
+    fn push_run(r: &RunRow, nodes: &mut std::collections::BTreeMap<String, Value>) {
         nodes.insert(r.id.clone(), run_summary(r));
-    };
+    }
 
-    push_artifact(&root, &mut artifact_nodes, true);
+    push_artifact(pg, &root, &mut artifact_nodes, true).await;
 
     // Upstream: artifact -> producer run -> input artifacts -> their producers ...
     let mut frontier: Vec<(String, usize)> = vec![(root.id.clone(), 0)];
@@ -1170,17 +1149,17 @@ async fn get_artifact_lineage(
         if depth >= max_hops {
             continue;
         }
-        let Ok(Some(a)) = store.get_artifact_optional(&aid) else { continue };
+        let Ok(Some(a)) = pg.get_artifact_optional(&aid).await else { continue };
         let Some(prid) = a.producer_run_id else { continue };
-        let Ok(prun) = store.get_run(&prid) else { continue };
+        let Ok(Some(prun)) = pg.get_run(&prid).await else { continue };
         push_run(&prun, &mut run_nodes);
         edges.push(json!({ "from": prun.id, "to": a.id, "kind": "produces" }));
-        let Ok(inputs) = store.run_inputs(&prun.id) else { continue };
+        let Ok(inputs) = pg.run_inputs(&prun.id).await else { continue };
         for input in inputs {
             if let Some(input_aid) = input.artifact_id {
-                if let Ok(Some(input_a)) = store.get_artifact_optional(&input_aid) {
+                if let Ok(Some(input_a)) = pg.get_artifact_optional(&input_aid).await {
                     let new = !artifact_nodes.contains_key(&input_a.id);
-                    push_artifact(&input_a, &mut artifact_nodes, false);
+                    push_artifact(pg, &input_a, &mut artifact_nodes, false).await;
                     edges.push(json!({
                         "from": input_a.id,
                         "to": prun.id,
@@ -1201,9 +1180,9 @@ async fn get_artifact_lineage(
         if depth >= max_hops {
             continue;
         }
-        let consumers = store.artifact_consumers(&aid).unwrap_or_default();
+        let consumers = pg.artifact_consumers(&aid).await.unwrap_or_default();
         for (run_id, role) in consumers {
-            let Ok(crun) = store.get_run(&run_id) else { continue };
+            let Ok(Some(crun)) = pg.get_run(&run_id).await else { continue };
             let new_run = !run_nodes.contains_key(&crun.id);
             push_run(&crun, &mut run_nodes);
             edges.push(json!({
@@ -1215,10 +1194,10 @@ async fn get_artifact_lineage(
             if !new_run {
                 continue;
             }
-            let Ok(outputs) = store.run_outputs(&crun.id) else { continue };
+            let Ok(outputs) = pg.run_outputs(&crun.id).await else { continue };
             for out in outputs {
                 let new = !artifact_nodes.contains_key(&out.id);
-                push_artifact(&out, &mut artifact_nodes, false);
+                push_artifact(pg, &out, &mut artifact_nodes, false).await;
                 edges.push(json!({ "from": crun.id, "to": out.id, "kind": "produces" }));
                 if new {
                     frontier.push((out.id, depth + 1));
@@ -1236,8 +1215,8 @@ async fn get_artifact_lineage(
 }
 
 async fn list_evals(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let evals = store.list_eval_requests()?;
+    let pg = &state.pg;
+    let evals = pg.list_eval_requests().await?;
     Ok(axum::Json(json!({ "evals": evals })))
 }
 
@@ -1247,11 +1226,11 @@ async fn list_evals(State(state): State<AppState>) -> Result<axum::Json<Value>, 
 /// most-common metric — enough to draw the row at a glance without
 /// fetching the full detail.
 async fn list_policies(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let summaries = store.policy_summaries()?;
+    let pg = &state.pg;
+    let summaries = pg.policy_summaries().await?;
     let mut out: Vec<Value> = Vec::with_capacity(summaries.len());
     for summary in summaries {
-        let card = build_policy_card(&store, &summary)?;
+        let card = build_policy_card(pg, &summary).await?;
         out.push(card);
     }
     Ok(axum::Json(json!({ "policies": out })))
@@ -1265,8 +1244,8 @@ async fn get_policy(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let store = &state.store;
-    let requests = store.eval_requests_by_policy(&name)?;
+    let pg = &state.pg;
+    let requests = pg.eval_requests_by_policy(&name).await?;
     if requests.is_empty() {
         return Err(not_found(format!("policy not found: {name}")));
     }
@@ -1280,8 +1259,9 @@ async fn get_policy(
         let Some(ckpt_id) = req.get("checkpoint_artifact_id").and_then(|v| v.as_str()) else {
             continue;
         };
-        let Some(producer) = store
+        let Some(producer) = pg
             .get_artifact_optional(ckpt_id)
+            .await
             .ok()
             .flatten()
             .and_then(|a| a.producer_run_id)
@@ -1294,13 +1274,13 @@ async fn get_policy(
     }
     let mut runs: Vec<crate::store::RunRow> = Vec::with_capacity(run_ids.len());
     for id in &run_ids {
-        if let Ok(r) = store.get_run(id) {
+        if let Ok(Some(r)) = pg.get_run(id).await {
             runs.push(r);
         }
     }
     runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    let mut body = build_metric_pivot_for_policy(&store, &runs, &name);
+    let mut body = build_metric_pivot_for_policy(pg, &runs, &name).await;
     if let Some(obj) = body.as_object_mut() {
         obj.insert("policy_name".into(), Value::String(name));
         obj.insert("requests".into(), Value::Array(requests));
@@ -1311,13 +1291,13 @@ async fn get_policy(
 /// Header card for the policies list. Picks the most-common metric across
 /// this policy's eval runs as the headline and emits up to N sparkline
 /// trajectories (one per recent training run).
-fn build_policy_card(
-    store: &Store,
+async fn build_policy_card(
+    pg: &PgStore,
     summary: &crate::store::PolicySummaryRow,
 ) -> Result<Value, ApiError> {
     const SPARK_RUNS: usize = 4;
 
-    let requests = store.eval_requests_by_policy(&summary.name)?;
+    let requests = pg.eval_requests_by_policy(&summary.name).await?;
 
     // Group eval_requests by the producer run of the checkpoint. We only
     // need recent producers; cap at SPARK_RUNS distinct most-recent ones.
@@ -1327,8 +1307,9 @@ fn build_policy_card(
         let Some(ckpt_id) = req.get("checkpoint_artifact_id").and_then(|v| v.as_str()) else {
             continue;
         };
-        let Some(producer) = store
+        let Some(producer) = pg
             .get_artifact_optional(ckpt_id)
+            .await
             .ok()
             .flatten()
             .and_then(|a| a.producer_run_id)
@@ -1341,16 +1322,18 @@ fn build_policy_card(
     }
 
     // Sort producer runs by created_at desc, keep the top N.
-    let mut runs: Vec<crate::store::RunRow> = producer_order
-        .iter()
-        .filter_map(|id| store.get_run(id).ok())
-        .collect();
+    let mut runs: Vec<crate::store::RunRow> = Vec::with_capacity(producer_order.len());
+    for id in &producer_order {
+        if let Ok(Some(row)) = pg.get_run(id).await {
+            runs.push(row);
+        }
+    }
     runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     runs.truncate(SPARK_RUNS);
 
     // Pivot to find the policy's primary metric (most-common across recent
     // runs) — sparklines render only that metric so all rows are comparable.
-    let pivot = build_metric_pivot(store, &runs);
+    let pivot = build_metric_pivot(pg, &runs).await;
     let primary_metric = pivot
         .get("metrics")
         .and_then(|v| v.as_array())
@@ -1386,8 +1369,8 @@ fn build_policy_card(
 /// from eval runs whose `policy_id` matches `policy`. Cross-policy noise
 /// on the same training runs is filtered out so the chart for `mmlu`
 /// doesn't accidentally include points emitted by an `ifeval` policy.
-fn build_metric_pivot_for_policy(
-    store: &Store,
+async fn build_metric_pivot_for_policy(
+    pg: &PgStore,
     runs: &[crate::store::RunRow],
     policy: &str,
 ) -> Value {
@@ -1397,7 +1380,7 @@ fn build_metric_pivot_for_policy(
     let mut by_metric: BTreeMap<String, BTreeMap<String, RunPoints>> = BTreeMap::new();
 
     for run in runs {
-        let points = metric_points_for_run(store, &run.id);
+        let points = metric_points_for_run(pg, &run.id).await;
         for p in points {
             if p.metric_name.is_empty() || p.value.is_none() {
                 continue;
@@ -1522,9 +1505,9 @@ async fn get_artifact_rollout(
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
     let artifact = {
-        let store = &state.store;
-        store
-            .get_artifact_optional(&id)?
+        let pg = &state.pg;
+        pg.get_artifact_optional(&id)
+            .await?
             .ok_or_else(|| not_found(format!("artifact not found: {id}")))?
     };
 
@@ -1576,9 +1559,9 @@ async fn get_artifact_frame(
     Path((id, n)): Path<(String, u32)>,
 ) -> Result<Response, ApiError> {
     let artifact = {
-        let store = &state.store;
-        store
-            .get_artifact_optional(&id)?
+        let pg = &state.pg;
+        pg.get_artifact_optional(&id)
+            .await?
             .ok_or_else(|| not_found(format!("artifact not found: {id}")))?
     };
 
@@ -1796,13 +1779,13 @@ fn walk_dataset(root: &std::path::Path) -> Option<DatasetSummary> {
 /// Build (or fetch from cache) the dataset summary for an artifact, and
 /// at the same time return the on-disk root path. Returns `None` if the
 /// artifact exists but isn't a browseable per-segment dataset.
-fn dataset_summary_for(
+async fn dataset_summary_for(
     state: &AppState,
     id: &str,
 ) -> Result<Option<(PathBuf, Arc<Option<DatasetSummary>>)>, ApiError> {
     let artifact = {
-        let store = &state.store;
-        match store.get_artifact_optional(id)? {
+        let pg = &state.pg;
+        match pg.get_artifact_optional(id).await? {
             Some(a) => a,
             None => return Ok(None),
         }
@@ -1833,7 +1816,7 @@ async fn get_artifact_dataset(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let (_, entry) = dataset_summary_for(&state, &id)?
+    let (_, entry) = dataset_summary_for(&state, &id).await?
         .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
     match entry.as_ref() {
         Some(summary) => Ok(axum::Json(serde_json::to_value(summary).unwrap())),
@@ -1847,7 +1830,7 @@ async fn get_artifact_dataset_segment(
     State(state): State<AppState>,
     Path((id, split, seg)): Path<(String, String, String)>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let (root, _) = dataset_summary_for(&state, &id)?
+    let (root, _) = dataset_summary_for(&state, &id).await?
         .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
     let seg_dir = root.join(&split).join(&seg);
     let meta_path = seg_dir.join("meta.json");
@@ -1964,7 +1947,7 @@ async fn get_artifact_dataset_frame(
     State(state): State<AppState>,
     Path((id, split, seg, n)): Path<(String, String, String, u32)>,
 ) -> Result<Response, ApiError> {
-    let (root, _) = dataset_summary_for(&state, &id)?
+    let (root, _) = dataset_summary_for(&state, &id).await?
         .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
 
     // Stage A writes a local `frames/` subdir; if it exists, use it

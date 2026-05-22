@@ -1,29 +1,25 @@
-// Many query methods on `Store` (and `EventRow` itself) are exclusively
-// consumed by `server.rs`, which is gated behind the `ui` feature.
-// Without that feature they look dead to the compiler but they're load-
-// bearing for the UI build; tolerate the rust-analyzer noise rather
-// than peppering each method with `#[cfg(feature = "ui")]`.
 #![allow(dead_code)]
 
-//! Sync facade over the async `PgStore`.
+//! Sync facade over the async `PgStore` for the writer paths.
 //!
-//! The legacy `Store` was a filesystem-truth registry mirrored into an
-//! in-memory SQLite cache, rebuilt from disk on every process start.
-//! The Postgres-as-truth migration has replaced that model: PG is the
-//! authoritative store, and call sites still use sync method calls on
-//! `Store` (the harness is `Arc<Mutex<Store>>` everywhere — runner,
-//! agent, server, evald, CLI). This wrapper bridges the two by holding
-//! a `PgStore` plus a dedicated Tokio runtime, and dispatching each
-//! sync method onto the async PG client via `block_on_pg`.
+//! Postgres is the source of truth. The CLI / agent / evald / runner
+//! are sync (clap subcommands, blocking sacct invocations, FS work
+//! during artifact registration), and this wrapper dispatches each
+//! sync method onto the async sqlx client via `block_on_pg` so those
+//! callers don't have to know tokio exists. Sharing is via `Arc<Store>`
+//! — no Mutex; PG's own locking handles concurrent writes.
 //!
-//! Methods that previously did sidecar writes alongside DB writes are
-//! now DB-only — the FS sidecars exist as the slurm-compute → login
-//! bridge and as human-debuggable projections, not as a source of
-//! truth. The two exceptions are `insert_artifact` and the private
-//! `add_user_alias`, which still move bytes / create symlinks under the
-//! per-kind artifact roots because nothing else does. Everything else
-//! (run rows, run inputs/outputs, pipelines, eval requests, tracking,
-//! events) is a pure PG operation.
+//! The HTTP server is *not* a caller — `server.rs` holds an
+//! `Arc<PgStore>` directly and `.await`s, so the read path pays no
+//! `block_in_place` cost. Read-only methods on this struct exist only
+//! for sync test code and CLI commands like `labctl status` / `labctl
+//! show`.
+//!
+//! `insert_artifact` and the private `add_user_alias` are the only
+//! methods that still do FS work alongside the PG insert (moving bytes
+//! into `_objects/<prefix>/<hash>/`, creating the per-user alias
+//! symlinks, writing the `.meta.json` projection). Everything else is
+//! a pure PG operation.
 //!
 //! Tests live in `pg_store::tests` (live PG smoke tests with `#[ignore]`).
 
@@ -32,6 +28,7 @@ use std::{
     fs,
     future::Future,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
@@ -114,6 +111,25 @@ pub struct InputResolution {
     pub resolved_path: PathBuf,
 }
 
+/// One enriched row from the eval-series query: an `eval_requests` row
+/// joined with its checkpoint artifact's metadata (`checkpoint_metadata`,
+/// source of the `step` field) and with the first `eval_result`
+/// artifact's metadata produced by the eval run (`eval_result_metadata`,
+/// source of the headline metric). Both metadata fields are `Option`
+/// because the checkpoint may have been GC'd or the eval run may not
+/// have produced an `eval_result` artifact yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalSeriesRow {
+    pub eval_key: String,
+    pub checkpoint_artifact_id: String,
+    pub eval_recipe_hash: String,
+    pub policy_id: String,
+    pub eval_run_id: Option<String>,
+    pub state: String,
+    pub checkpoint_metadata: Option<Value>,
+    pub eval_result_metadata: Option<Value>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RunView {
     pub run: RunRow,
@@ -182,7 +198,7 @@ pub fn is_awaiting_peer(status: &str) -> bool {
 // ---------- the store ----------
 
 pub struct Store {
-    pg: PgStore,
+    pg: Arc<PgStore>,
     rt: Runtime,
     runs_base: PathBuf,
     artifact_roots: BTreeMap<String, PathBuf>,
@@ -194,9 +210,9 @@ impl Store {
     /// owned by this Store; nothing else uses that runtime, but
     /// `block_in_place` requires multi-thread so the wrapper composes
     /// cleanly when invoked from inside an existing tokio context (e.g.
-    /// the agent or HTTP server). `runs/<user>/` dirs are created lazily
-    /// at run-submission time; PG owns everything else, no top-level
-    /// scaffolding needed here.
+    /// the agent). The HTTP server doesn't go through this wrapper at
+    /// all — it gets the inner `Arc<PgStore>` via `Store::pg` and
+    /// awaits directly on its own runtime.
     pub fn open(cluster: &ClusterConfig) -> Result<Self> {
         let runs_base = cluster.filesystem.runs_base.clone();
         let artifact_roots = cluster.filesystem.artifact_roots.clone();
@@ -208,11 +224,17 @@ impl Store {
             .block_on(PgStore::connect(cluster))
             .context("Store::open: PgStore::connect failed")?;
         Ok(Self {
-            pg,
+            pg: Arc::new(pg),
             rt,
             runs_base,
             artifact_roots,
         })
+    }
+
+    /// Shared async PG handle for callers (notably `server.rs`) that
+    /// want to .await directly instead of going through `block_on_pg`.
+    pub fn pg(&self) -> Arc<PgStore> {
+        self.pg.clone()
     }
 
     /// Bridge sync → async. Works both inside an existing multi-thread
@@ -579,6 +601,14 @@ impl Store {
         self.block_on_pg(self.pg.release_coalesce_slot(cache_key))
     }
 
+    /// Sweep coalesce_claims whose producer is terminal. Called from
+    /// the agent's gc loop; the FK ON DELETE CASCADE in 0002 covers
+    /// the deletion-of-run path, this sweep covers the
+    /// terminal-but-still-present path.
+    pub fn gc_terminal_coalesce_claims(&self) -> Result<u64> {
+        self.block_on_pg(self.pg.gc_terminal_coalesce_claims())
+    }
+
     pub fn set_awaiting_peer(
         &self,
         run_id: &str,
@@ -704,17 +734,19 @@ impl Store {
         self.block_on_pg(self.pg.eval_request_status(eval_key, max_attempts))
     }
 
-    pub fn insert_eval_request(
+    /// Atomically take the eval slot for `eval_key` (Fresh path). True
+    /// iff we won the insert race. The user comes from `$USER`; PgStore
+    /// itself doesn't pull env so the sync facade resolves it.
+    pub fn claim_eval_slot_fresh(
         &self,
         eval_key: &str,
         checkpoint_artifact_id: &str,
         eval_recipe_hash: &str,
         policy_id: &str,
         eval_run_id: &str,
-    ) -> Result<()> {
-        // PgStore takes an explicit `user`; legacy derived it from $USER.
+    ) -> Result<bool> {
         let user = current_user()?;
-        self.block_on_pg(self.pg.insert_eval_request(
+        self.block_on_pg(self.pg.claim_eval_slot_fresh(
             eval_key,
             checkpoint_artifact_id,
             eval_recipe_hash,
@@ -724,17 +756,41 @@ impl Store {
         ))
     }
 
-    pub fn retry_eval_request(
+    /// Atomically advance the eval slot to a new attempt (Retry path).
+    /// `expected_run_id` and `expected_attempts` come from the snapshot
+    /// the caller computed; the UPDATE only fires if those still match
+    /// in PG. Returns true iff the row was updated.
+    pub fn claim_eval_slot_retry(
         &self,
         eval_key: &str,
+        expected_run_id: &str,
+        expected_attempts: i64,
         new_eval_run_id: &str,
-        new_attempts: i64,
-    ) -> Result<()> {
-        self.block_on_pg(self.pg.retry_eval_request(eval_key, new_eval_run_id, new_attempts))
+    ) -> Result<bool> {
+        self.block_on_pg(self.pg.claim_eval_slot_retry(
+            eval_key,
+            expected_run_id,
+            expected_attempts,
+            new_eval_run_id,
+        ))
+    }
+
+    /// Read the current `eval_run_id` bound to `eval_key`, if any.
+    /// Used by the retry path to capture the optimistic-concurrency
+    /// witness from the same snapshot that produced the `Retry` slot
+    /// decision.
+    pub fn eval_request_run_id(&self, eval_key: &str) -> Result<Option<String>> {
+        self.block_on_pg(self.pg.eval_request_run_id(eval_key))
     }
 
     pub fn eval_requests_for_run(&self, run_id: &str) -> Result<Vec<Value>> {
         self.block_on_pg(self.pg.eval_requests_for_run(run_id))
+    }
+
+    /// Enriched per-eval rows for the chart/series payload. Single
+    /// query, no N+1.
+    pub fn eval_series_rows(&self, run_id: &str) -> Result<Vec<EvalSeriesRow>> {
+        self.block_on_pg(self.pg.eval_series_rows(run_id))
     }
 
     pub fn list_eval_requests(&self) -> Result<Vec<Value>> {

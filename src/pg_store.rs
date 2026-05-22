@@ -1,21 +1,23 @@
-//! Postgres-backed registry store. Parallel to the legacy in-memory
-//! SQLite `Store`; the two coexist during the migration. Once all call
-//! sites have moved to `PgStore`, `Store` and its rebuild walker get
-//! deleted.
+//! Postgres-backed registry store — the authoritative registry.
 //!
-//! Async-everywhere. Callers from sync contexts need to spawn a Tokio
-//! runtime or use `tokio::runtime::Handle::current().block_on(...)`.
+//! Async-everywhere. The HTTP server (`server.rs`) calls these methods
+//! directly via `.await`. Sync callers (`runner`, `evald`, CLI
+//! subcommands) go through the `Store` sync facade in `store.rs`, which
+//! holds its own tokio runtime.
 //!
-//! Reuses the row types from `store.rs` so call sites don't churn:
-//! `RunRow`, `ArtifactRow`, `EventRow`, `TrackingRow`, `InputResolution`,
-//! `PipelineRow`. JSON columns map to `serde_json::Value` directly via
-//! sqlx's `Json` wrapper.
+//! Row types come from `store.rs` (`RunRow`, `ArtifactRow`, `EventRow`,
+//! `TrackingRow`, `InputResolution`, `PipelineRow`); JSON columns map to
+//! `serde_json::Value` via sqlx's `Json` wrapper.
 //!
-//! Currently `dead_code`-allow'd at the module level: nothing in the
-//! production code paths uses `PgStore` yet — call-site migration is
-//! incremental and lands in follow-up commits. The smoke tests below
-//! exercise the connection + a representative read/write each.
+//! Schema lives in `migrations/`; `PgStore::connect` runs `sqlx::migrate!`
+//! before returning, so every process applies pending migrations at
+//! startup. There is no skip-on-error path: a failing migration aborts
+//! `connect()`.
 
+// Many query methods on PgStore are exclusively consumed by `server.rs`
+// (behind the `ui` feature). Without `ui` they look dead to the
+// compiler but they're load-bearing for the UI build; tolerate the
+// noise rather than peppering each method with `#[cfg(feature = "ui")]`.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -25,15 +27,21 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use sqlx::{
     PgPool, Row,
+    migrate::Migrator,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
 use crate::config::{ClusterConfig, InputSpec, PgConfig, Recipe};
 use crate::fs_layout::ClaimOutcome;
 use crate::store::{
-    ArtifactRow, EvalRequestSlot, EventRow, InputResolution, NewRun, PipelineRow,
+    ArtifactRow, EvalRequestSlot, EvalSeriesRow, EventRow, InputResolution, NewRun, PipelineRow,
     PolicySummaryRow, RunRow, RunView, TrackingRow, is_terminal,
 };
+
+/// Embedded migration set. Resolved at compile time from `migrations/`;
+/// applied to every PG instance the first time `PgStore::connect` runs
+/// against it. Tracked in the standard `_sqlx_migrations` table.
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 pub struct PgStore {
     pool: PgPool,
@@ -41,13 +49,15 @@ pub struct PgStore {
 
 impl PgStore {
     /// Open a connection pool against the cluster's configured PG
-    /// instance. `cluster.postgres` must be set — this is a hard
-    /// requirement post-migration, no fallback.
+    /// instance and apply any pending schema migrations. `cluster.postgres`
+    /// must be set — this is a hard requirement post-migration, no
+    /// fallback. A migration failure aborts startup: we never run
+    /// against a half-applied schema.
     pub async fn connect(cluster: &ClusterConfig) -> Result<Self> {
         let pg = cluster.postgres.as_ref().with_context(|| {
             format!(
                 "cluster {:?} has no [postgres] section; the PG-as-truth \
-                 registry is now required — see docs/POSTGRES_DEPLOY.md",
+                 registry is required — see docs/POSTGRES_DEPLOY.md",
                 cluster.name,
             )
         })?;
@@ -62,6 +72,10 @@ impl PgStore {
                     pg.host, pg.port, pg.database
                 )
             })?;
+        MIGRATOR
+            .run(&pool)
+            .await
+            .context("sqlx::migrate! failed; refusing to run on partial schema")?;
         Ok(Self { pool })
     }
 
@@ -585,6 +599,59 @@ impl PgStore {
                 }
             }
         }
+    }
+
+    /// Enriched per-eval rows for a single parent run: each eval_request
+    /// joined with its checkpoint artifact's metadata (for `step`) and
+    /// the first `eval_result` artifact's metadata (for the headline
+    /// metric). One PG round-trip — the previous shape required N+1 by
+    /// looping `get_artifact_optional` + `run_outputs` per eval in the
+    /// HTTP handler.
+    pub async fn eval_series_rows(&self, run_id: &str) -> Result<Vec<EvalSeriesRow>> {
+        let rows = sqlx::query(
+            "SELECT
+                 er.eval_key,
+                 er.checkpoint_artifact_id,
+                 er.eval_recipe_hash,
+                 er.policy_id,
+                 er.eval_run_id,
+                 er.state,
+                 cp.metadata_json AS checkpoint_metadata,
+                 (
+                     SELECT a.metadata_json
+                     FROM run_outputs ro
+                     JOIN artifacts a ON a.id = ro.artifact_id
+                     WHERE ro.run_id = er.eval_run_id AND a.kind = 'eval_result'
+                     ORDER BY a.created_at, a.id
+                     LIMIT 1
+                 ) AS eval_result_metadata
+             FROM eval_requests er
+             LEFT JOIN artifacts cp ON cp.id = er.checkpoint_artifact_id
+             WHERE cp.producer_run_id = $1 OR er.eval_run_id = $1
+             ORDER BY er.created_at",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("eval_series_rows({run_id})"))?;
+        rows.into_iter()
+            .map(|r| {
+                let checkpoint_metadata: Option<sqlx::types::Json<Value>> =
+                    r.try_get("checkpoint_metadata")?;
+                let eval_result_metadata: Option<sqlx::types::Json<Value>> =
+                    r.try_get("eval_result_metadata")?;
+                Ok(EvalSeriesRow {
+                    eval_key: r.try_get("eval_key")?,
+                    checkpoint_artifact_id: r.try_get("checkpoint_artifact_id")?,
+                    eval_recipe_hash: r.try_get("eval_recipe_hash")?,
+                    policy_id: r.try_get("policy_id")?,
+                    eval_run_id: r.try_get("eval_run_id")?,
+                    state: r.try_get("state")?,
+                    checkpoint_metadata: checkpoint_metadata.map(|j| j.0),
+                    eval_result_metadata: eval_result_metadata.map(|j| j.0),
+                })
+            })
+            .collect()
     }
 
     pub async fn eval_requests_for_run(&self, run_id: &str) -> Result<Vec<Value>> {
@@ -1276,6 +1343,29 @@ impl PgStore {
         Ok(())
     }
 
+    /// Sweep coalesce_claims whose producer has reached a terminal status.
+    /// The normal release path (`release_coalesce_slot` after the producer
+    /// reconciles to terminal) covers the happy path; this sweep is the
+    /// safety net for producers that died between reaching terminal and
+    /// firing the release, plus any FK-cascade survivors from external
+    /// row deletion. Returns the number of claims swept.
+    pub async fn gc_terminal_coalesce_claims(&self) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM coalesce_claims
+             WHERE producer_run_id IN (
+                 SELECT id FROM runs
+                 WHERE status IN (
+                     'succeeded','failed','cancelled','timeout','oom',
+                     'unknown_terminal','cache_hit'
+                 )
+             )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("gc_terminal_coalesce_claims")?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn set_awaiting_peer(
         &self,
         run_id: &str,
@@ -1365,7 +1455,11 @@ impl PgStore {
         Ok(())
     }
 
-    pub async fn insert_eval_request(
+    /// Atomically take the eval slot for `eval_key` on a fresh insert.
+    /// Returns true iff this caller won the race. Loser callers must
+    /// either `claim_eval_slot_retry` (if the snapshot indicated Retry)
+    /// or surface the lost-race (orphan SLURM job risk).
+    pub async fn claim_eval_slot_fresh(
         &self,
         eval_key: &str,
         checkpoint_artifact_id: &str,
@@ -1373,13 +1467,15 @@ impl PgStore {
         policy_id: &str,
         eval_run_id: &str,
         user: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let now = crate::util::now_ts();
-        sqlx::query(
+        let row = sqlx::query(
             "INSERT INTO eval_requests
              (eval_key, checkpoint_artifact_id, eval_recipe_hash, policy_id,
               eval_run_id, state, attempts, \"user\", created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, 'submitted', 1, $6, $7, $7)",
+             VALUES ($1, $2, $3, $4, $5, 'submitted', 1, $6, $7, $7)
+             ON CONFLICT (eval_key) DO NOTHING
+             RETURNING eval_key",
         )
         .bind(eval_key)
         .bind(checkpoint_artifact_id)
@@ -1388,32 +1484,59 @@ impl PgStore {
         .bind(eval_run_id)
         .bind(user)
         .bind(now)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .with_context(|| format!("insert_eval_request({eval_key})"))?;
-        Ok(())
+        .with_context(|| format!("claim_eval_slot_fresh({eval_key})"))?;
+        Ok(row.is_some())
     }
 
-    pub async fn retry_eval_request(
+    /// Atomically advance the eval slot to a new attempt. Optimistic
+    /// concurrency: the UPDATE only fires when the row still has the
+    /// `expected_attempts` count and the prior `expected_run_id`
+    /// reference we read in our snapshot — otherwise another caller
+    /// already retried this slot and we abort. Returns true iff the
+    /// update applied.
+    pub async fn claim_eval_slot_retry(
         &self,
         eval_key: &str,
+        expected_run_id: &str,
+        expected_attempts: i64,
         new_eval_run_id: &str,
-        new_attempts: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let now = crate::util::now_ts();
-        sqlx::query(
+        let row = sqlx::query(
             "UPDATE eval_requests
              SET eval_run_id = $1, state = 'submitted', attempts = $2, updated_at = $3
-             WHERE eval_key = $4",
+             WHERE eval_key = $4
+               AND attempts = $5
+               AND eval_run_id = $6
+             RETURNING eval_key",
         )
         .bind(new_eval_run_id)
-        .bind(new_attempts)
+        .bind(expected_attempts + 1)
         .bind(now)
         .bind(eval_key)
-        .execute(&self.pool)
+        .bind(expected_attempts)
+        .bind(expected_run_id)
+        .fetch_optional(&self.pool)
         .await
-        .with_context(|| format!("retry_eval_request({eval_key})"))?;
-        Ok(())
+        .with_context(|| format!("claim_eval_slot_retry({eval_key})"))?;
+        Ok(row.is_some())
+    }
+
+    /// Returns the run id currently bound to `eval_key`. Used by callers
+    /// that need to read the snapshot's eval_run_id for optimistic
+    /// concurrency on the retry path.
+    pub async fn eval_request_run_id(&self, eval_key: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT eval_run_id FROM eval_requests WHERE eval_key = $1")
+            .bind(eval_key)
+            .fetch_optional(&self.pool)
+            .await
+            .with_context(|| format!("eval_request_run_id({eval_key})"))?;
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(r.try_get::<Option<String>, _>("eval_run_id")?),
+        }
     }
 
     pub async fn set_tracking(
@@ -1488,33 +1611,35 @@ impl PgStore {
     }
 
     /// Returns `(status, created_at)` tuples for the most recent `limit`
-    /// runs of this recipe, oldest-first (legacy reverses after LIMIT).
+    /// runs of this recipe, oldest-first.
     pub async fn recipe_history(
         &self,
         recipe_name: &str,
         limit: i64,
     ) -> Result<Vec<(String, i64)>> {
+        // Inner LIMIT picks the most recent N; outer ORDER BY ASC ships
+        // them oldest-first. One query, no client-side reversal.
         let rows = sqlx::query(
-            "SELECT status, created_at FROM runs
-             WHERE recipe_name = $1
-             ORDER BY created_at DESC LIMIT $2",
+            "SELECT status, created_at FROM (
+                 SELECT status, created_at FROM runs
+                 WHERE recipe_name = $1
+                 ORDER BY created_at DESC LIMIT $2
+             ) recent
+             ORDER BY created_at ASC",
         )
         .bind(recipe_name)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
         .with_context(|| format!("recipe_history({recipe_name})"))?;
-        let mut out: Vec<(String, i64)> = rows
-            .into_iter()
+        rows.into_iter()
             .map(|r| {
-                Ok::<_, anyhow::Error>((
+                Ok((
                     r.try_get::<String, _>("status")?,
                     r.try_get::<i64, _>("created_at")?,
                 ))
             })
-            .collect::<Result<Vec<_>>>()?;
-        out.reverse();
-        Ok(out)
+            .collect()
     }
 }
 

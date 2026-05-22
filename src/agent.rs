@@ -237,6 +237,15 @@ fn do_gc(_cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u6
         Ok(n) => eprintln!("labctl dispatch: gc reaped {n} source snapshot(s)"),
         Err(e) => eprintln!("labctl dispatch: gc failed: {e:#}"),
     }
+    // Sweep coalesce claims whose producer reached a terminal state but
+    // didn't release the slot (producer crash, reconcile race, etc.).
+    // The FK ON DELETE CASCADE in 0002 handles run-row deletion; this
+    // covers the live-row, terminal-status leak path.
+    match store.gc_terminal_coalesce_claims() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("labctl dispatch: gc reaped {n} stale coalesce claim(s)"),
+        Err(e) => eprintln!("labctl dispatch: coalesce gc failed: {e:#}"),
+    }
 }
 
 async fn evald_loop(
