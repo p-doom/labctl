@@ -104,6 +104,18 @@ CREATE TABLE eval_requests (
     updated_at               BIGINT NOT NULL
 );
 
+-- Coalesce slot. A new run hitting an unseen cache_key races to insert
+-- here first; PG's PRIMARY KEY enforcement is the atomic primitive that
+-- elects a single producer. Other contenders for the same cache_key
+-- fall back to `runs.coalesced_peer_run_id` and await the producer's
+-- outputs. Replaces the legacy NFS-mkdir-based claim_dir scheme — NFS
+-- mkdir atomicity is not guaranteed across clients.
+CREATE TABLE coalesce_claims (
+    cache_key         TEXT PRIMARY KEY,
+    producer_run_id   TEXT NOT NULL,
+    claimed_at        BIGINT NOT NULL
+);
+
 CREATE TABLE tracking (
     run_id      TEXT PRIMARY KEY,
     entity      TEXT NOT NULL,
