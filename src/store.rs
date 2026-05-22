@@ -72,12 +72,6 @@ pub struct ArtifactRow {
     pub id: String,
     pub kind: String,
     pub path: PathBuf,
-    /// Legacy diagnostic value from when artifacts were content-addressed
-    /// (`_objects/<prefix>/<hash>/`). `None` on all rows inserted after
-    /// migration 0004 — the column survives on those rows only to
-    /// preserve historic values from imports. No live code path reads
-    /// it for placement or dedup decisions.
-    pub content_hash: Option<String>,
     pub producer_run_id: Option<String>,
     pub metadata_json: Value,
     pub created_at: i64,
@@ -373,7 +367,7 @@ impl Store {
         let id = format!("artifact_{}", &path_hash[..16]);
         // The staging path is <root>/<user>/<alias>/. Falls back to
         // placeholders for ad-hoc registrations not under a user dir.
-        let (user, alias_segment) = decompose_artifact_path(staging_path, &root)
+        let (user, alias) = decompose_artifact_path(staging_path, &root)
             .unwrap_or_else(|_| ("unknown".into(), id.clone()));
 
         let now = util::now_ts();
@@ -381,7 +375,7 @@ impl Store {
             id: id.clone(),
             kind: kind.to_string(),
             user: user.clone(),
-            alias: alias_segment.clone(),
+            alias,
             producer_run_id: producer_run_id.map(str::to_string),
             metadata: metadata.clone(),
             created_at: now,
@@ -395,7 +389,6 @@ impl Store {
             producer_run_id,
             metadata,
             &user,
-            &alias_segment,
             now,
         ))?;
         self.block_on_pg(

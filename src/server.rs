@@ -327,7 +327,6 @@ fn artifact_summary(a: &ArtifactRow) -> Value {
         "id": a.id,
         "kind": a.kind,
         "path": a.path.display().to_string(),
-        "content_hash": a.content_hash,
         "producer_run_id": a.producer_run_id,
         "created_at": a.created_at,
     })

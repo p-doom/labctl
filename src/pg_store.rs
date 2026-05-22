@@ -332,7 +332,7 @@ impl PgStore {
 
     pub async fn run_outputs(&self, run_id: &str) -> Result<Vec<ArtifactRow>> {
         let rows = sqlx::query(
-            "SELECT a.id, a.kind, a.path, a.content_hash, a.producer_run_id,
+            "SELECT a.id, a.kind, a.path, a.producer_run_id,
                     a.metadata_json, a.created_at
              FROM artifacts a
              JOIN run_outputs ro ON ro.artifact_id = a.id
@@ -991,12 +991,7 @@ impl PgStore {
     }
 
     /// Insert an artifact row. DB-only: the caller owns the sidecar
-    /// (`.meta.json`) write and any other FS work. `content_hash` is
-    /// NULL on every row inserted through this method — the column
-    /// only carries values populated by the original importer / legacy
-    /// content-addressed code (migration 0004 relaxed NOT NULL and
-    /// dropped UNIQUE).
-    #[allow(clippy::too_many_arguments)]
+    /// (`.meta.json`) write and any other FS work.
     pub async fn insert_artifact(
         &self,
         id: &str,
@@ -1005,14 +1000,12 @@ impl PgStore {
         producer_run_id: Option<&str>,
         metadata: &Value,
         user: &str,
-        alias_segment: &str,
         created_at: i64,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO artifacts
-             (id, kind, path, content_hash, producer_run_id, metadata_json,
-              created_at, \"user\", alias_segment)
-             VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8)",
+             (id, kind, path, producer_run_id, metadata_json, created_at, \"user\")
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(id)
         .bind(kind)
@@ -1021,7 +1014,6 @@ impl PgStore {
         .bind(sqlx::types::Json(metadata))
         .bind(created_at)
         .bind(user)
-        .bind(alias_segment)
         .execute(&self.pool)
         .await
         .with_context(|| format!("insert_artifact({id})"))?;
@@ -1456,7 +1448,7 @@ impl PgStore {
         user: &str,
     ) -> Result<Vec<ArtifactRow>> {
         let rows = sqlx::query(
-            "SELECT a.id, a.kind, a.path, a.content_hash, a.producer_run_id,
+            "SELECT a.id, a.kind, a.path, a.producer_run_id,
                     a.metadata_json, a.created_at
              FROM artifacts a
              JOIN runs r ON a.producer_run_id = r.id
@@ -1552,7 +1544,7 @@ const RUN_SELECT_ALL: &str = "
 ";
 
 const ARTIFACT_SELECT_BASE: &str = "
-    SELECT id, kind, path, content_hash, producer_run_id, metadata_json, created_at
+    SELECT id, kind, path, producer_run_id, metadata_json, created_at
     FROM artifacts
 ";
 
@@ -1587,7 +1579,6 @@ fn row_to_artifact(r: sqlx::postgres::PgRow) -> Result<ArtifactRow> {
         id: r.try_get("id")?,
         kind: r.try_get("kind")?,
         path: PathBuf::from(r.try_get::<String, _>("path")?),
-        content_hash: r.try_get("content_hash")?,
         producer_run_id: r.try_get("producer_run_id")?,
         metadata_json: metadata_json.0,
         created_at: r.try_get("created_at")?,
