@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -771,16 +771,17 @@ pub fn submit_pipeline(
     submitted_by: &str,
 ) -> Result<SubmittedPipeline> {
     fs_layout::validate_user(submitted_by)?;
-    // Resolve the `from` pin (if any) to a role-keyed map of artifact rows.
-    // Done once at the top so every stage shares the same view; cache-hit /
-    // coalesce decisions for downstream stages use these artifact_ids as
-    // canonical inputs in their cache_key.
+    // Resolve the `from` pin (if any). Stages whose only parents are the
+    // pin (or have no parents at all) become root stages and get
+    // submitted immediately. Stages with intra-pipeline parents are
+    // deferred until those parents are observed terminal-succeeded by
+    // the agent's reconcile loop — see `try_submit_pending_children`.
     let pinned_outputs: BTreeMap<String, ArtifactRow> = match pipeline.from.as_deref() {
         Some(from_id) => resolve_from(cluster, store, from_id)?,
         None => BTreeMap::new(),
     };
-    // Allocate run_ids for every stage up-front so downstream stages can render
-    // input paths that point at upstream run_dirs that haven't been created yet.
+    // Allocate run_ids up-front: pending placeholders need them, and
+    // dependent stages reference parent ids in their `dependency_on`.
     let stage_run_ids: BTreeMap<String, String> = pipeline
         .topo_order
         .iter()
@@ -790,86 +791,103 @@ pub fn submit_pipeline(
     let pipeline_id = util::new_id("pipeline");
     store.insert_pipeline(&pipeline_id, &pipeline.name, pipeline_path)?;
 
-    // Track each stage's SLURM job_id, or None when the stage was a
-    // cache-hit (no SLURM job submitted). Downstream stages must filter
-    // out cache-hit parents when building their afterok dependency list,
-    // otherwise `--dependency=afterok:` would reference a non-existent
-    // job and SLURM would refuse to schedule.
-    let mut stage_job_ids: BTreeMap<String, Option<String>> = BTreeMap::new();
+    // Stages whose outputs are materialised _right now_. Roots that get
+    // cache-hit during this call land here; non-cache-hit roots and any
+    // deferred stage stay out. Used to decide whether a downstream stage
+    // can also be submitted synchronously (a fully-cached pipeline still
+    // completes in one call) or must be deferred to the agent cascade.
+    let mut materialised: BTreeSet<String> = BTreeSet::new();
     let mut submitted_stages = Vec::with_capacity(pipeline.topo_order.len());
 
     for stage_name in &pipeline.topo_order {
         let loaded = &pipeline.stages[stage_name];
-        let parent_job_ids: Vec<String> = loaded
-            .parents
-            .iter()
-            .map(|p| {
-                stage_job_ids
-                    .get(p)
-                    .with_context(|| format!("missing parent stage {p:?}"))
-                    .map(|jid| jid.clone())
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            // Cache-hit parents have already produced their outputs on
-            // disk; downstream stages can read them immediately, no
-            // afterok required.
-            .flatten()
-            .collect();
-
-        let stage_ctx = StageContext {
-            stage_name,
-            stage_run_ids: &stage_run_ids,
-            stages: &pipeline.stages,
-            pinned_outputs: &pinned_outputs,
-        };
-
-        let preallocated = &stage_run_ids[stage_name];
-        let submitted = submit_recipe_inner(
-            cluster,
-            store,
-            &loaded.recipe,
-            None,
-            Some(&stage_ctx),
-            &parent_job_ids,
-            Some(preallocated.as_str()),
-            submitted_by,
-            None,
-        )?;
 
         let dependency_on = json!({
             "afterok": loaded
                 .parents
                 .iter()
-                .map(|p| {
-                    json!({
-                        "stage": p,
-                        "run_id": stage_run_ids[p],
-                        "job_id": stage_job_ids[p].clone(),
-                    })
-                })
+                .map(|p| json!({
+                    "stage": p,
+                    "run_id": stage_run_ids[p],
+                }))
                 .collect::<Vec<_>>()
         });
-        store.set_pipeline_membership(
-            &submitted.run_id,
-            &pipeline_id,
-            stage_name,
-            &dependency_on,
-        )?;
-        // Cache-hit stages don't get a SLURM job; track None so downstream
-        // afterok filtering works correctly.
-        let recorded_job_id = if submitted.cache_hit {
-            None
+
+        let parents_ready = loaded
+            .parents
+            .iter()
+            .all(|p| materialised.contains(p));
+        let preallocated = &stage_run_ids[stage_name];
+
+        if parents_ready {
+            // Submit now. agent-driven means afterok is no longer used;
+            // by construction parents either don't exist (root) or are
+            // already materialised (cache-hit chain).
+            let stage_ctx = StageContext {
+                stage_name,
+                stage_run_ids: &stage_run_ids,
+                stages: &pipeline.stages,
+                pinned_outputs: &pinned_outputs,
+            };
+            let submitted = submit_recipe_inner(
+                cluster,
+                store,
+                &loaded.recipe,
+                None,
+                Some(&stage_ctx),
+                &[],
+                Some(preallocated.as_str()),
+                submitted_by,
+                None,
+            )?;
+            store.set_pipeline_membership(
+                &submitted.run_id,
+                &pipeline_id,
+                stage_name,
+                &dependency_on,
+            )?;
+            if submitted.cache_hit {
+                materialised.insert(stage_name.clone());
+            }
+            submitted_stages.push(SubmittedStage {
+                stage_name: stage_name.clone(),
+                run_id: submitted.run_id,
+                job_id: submitted.job_id,
+                depends_on: Vec::new(),
+            });
         } else {
-            Some(submitted.job_id.clone())
-        };
-        stage_job_ids.insert(stage_name.clone(), recorded_job_id);
-        submitted_stages.push(SubmittedStage {
-            stage_name: stage_name.clone(),
-            run_id: submitted.run_id,
-            job_id: submitted.job_id,
-            depends_on: parent_job_ids,
-        });
+            // At least one parent is still pending or in-flight. Insert
+            // a placeholder; the agent's reconcile loop will pick it up
+            // after the last parent reaches terminal-succeeded.
+            let recipe_hash = util::sha256_bytes(&serde_json::to_vec(&loaded.recipe)?);
+            let run_dir = fs_layout::run_dir(
+                &cluster.filesystem.runs_base,
+                submitted_by,
+                preallocated,
+            );
+            let source_path = run_dir.join("source").join(&loaded.recipe.repo);
+            store.insert_pending_pipeline_stage(
+                preallocated,
+                &loaded.recipe,
+                &recipe_hash,
+                &run_dir,
+                &source_path,
+                submitted_by,
+                &pipeline_id,
+                stage_name,
+                &dependency_on,
+            )?;
+            submitted_stages.push(SubmittedStage {
+                stage_name: stage_name.clone(),
+                run_id: preallocated.clone(),
+                job_id: String::new(), // pending — no job_id yet
+                depends_on: loaded
+                    .parents
+                    .iter()
+                    .map(|p| stage_run_ids[p].clone())
+                    .collect(),
+            });
+        }
     }
 
     Ok(SubmittedPipeline {
@@ -877,6 +895,155 @@ pub fn submit_pipeline(
         name: pipeline.name.clone(),
         stages: submitted_stages,
     })
+}
+
+/// Attempt to advance pending dependent stages now that `parent_run_id`
+/// has reached a terminal state. Called from `reconcile_one` after a
+/// run's status flips to a terminal value.
+///
+/// Behaviour:
+///   - parent succeeded / cache_hit → for each pending child whose
+///     full parent set is now satisfied, complete the submission
+///     (resolve inputs, render submit.sh, sbatch, upsert PG row).
+///     If a child's parent set isn't yet complete (multiple parents),
+///     leave it pending.
+///   - parent in any non-success terminal (failed / cancelled / oom /
+///     timeout / unknown_terminal) → cascade-fail every pending child
+///     blocked on this parent. No SLURM activity; the children are
+///     marked terminal-failed in PG and downstream stages cascade in
+///     turn on the next reconcile pass.
+pub fn try_submit_pending_children(
+    cluster: &ClusterConfig,
+    store: &Store,
+    parent: &crate::store::RunRow,
+) -> Result<usize> {
+    if !crate::store::is_terminal(&parent.status) {
+        return Ok(0);
+    }
+    let cascade_failure = !matches!(parent.status.as_str(), "succeeded" | "cache_hit");
+    let candidates = store.pending_children_of(&parent.id)?;
+    let mut advanced = 0usize;
+    for child in candidates {
+        if cascade_failure {
+            store.update_status(&child.id, "failed", parent.finished_at)?;
+            advanced += 1;
+            continue;
+        }
+        // Multi-parent: check that every parent is terminal-succeeded.
+        let parent_ids = child
+            .dependency_on
+            .as_ref()
+            .and_then(|d| d.get("afterok"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("run_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut all_ok = true;
+        for pid in &parent_ids {
+            let p = store.get_run(pid)?;
+            if !matches!(p.status.as_str(), "succeeded" | "cache_hit") {
+                all_ok = false;
+                break;
+            }
+        }
+        if !all_ok {
+            continue;
+        }
+        match complete_pending_submission(cluster, store, &child) {
+            Ok(()) => advanced += 1,
+            Err(e) => {
+                eprintln!(
+                    "try_submit_pending_children: completing {} failed: {e:#}",
+                    child.id
+                );
+                let now = crate::util::now_ts();
+                let _ = store.update_status(&child.id, "failed", Some(now));
+            }
+        }
+    }
+    Ok(advanced)
+}
+
+/// Drive a pending PG row through normal submission: deserialise its
+/// recipe, reconstruct the pipeline-stage context from the recorded
+/// dependency_on, and call `submit_recipe_inner` with the existing
+/// run_id. The insert_run upsert path takes care of replacing the
+/// placeholder.
+fn complete_pending_submission(
+    cluster: &ClusterConfig,
+    store: &Store,
+    child: &crate::store::RunRow,
+) -> Result<()> {
+    let recipe: Recipe = serde_json::from_value(child.recipe_json.clone())
+        .with_context(|| format!("pending run {} has unparseable recipe_json", child.id))?;
+    let submitted_by = child
+        .submitted_by
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Rebuild the stage_run_ids map from the pipeline siblings so
+    // template tokens like {inputs.X.path} that reference upstream
+    // outputs resolve. Pinned `from` outputs aren't available here —
+    // the agent-driven path uses concrete artifact paths via PG, so
+    // pinned_outputs can be empty.
+    let pipeline_id = child
+        .pipeline_id
+        .as_deref()
+        .with_context(|| format!("pending run {} has no pipeline_id", child.id))?;
+    let stage_name = child
+        .stage_name
+        .as_deref()
+        .with_context(|| format!("pending run {} has no stage_name", child.id))?;
+    let siblings = store.list_pipeline_runs(pipeline_id)?;
+    let stage_run_ids: BTreeMap<String, String> = siblings
+        .iter()
+        .filter_map(|r| r.stage_name.clone().map(|s| (s, r.id.clone())))
+        .collect();
+    // Stages map: minimal — only stage_name → LoadedStage is needed for
+    // resolve_inputs's chain-input lookup. We reconstruct from sibling
+    // recipes. If a sibling can't be re-parsed, skip it (it won't be
+    // referenced as a parent of this child).
+    let mut stages: BTreeMap<String, crate::config::LoadedStage> = BTreeMap::new();
+    for s in &siblings {
+        let Some(name) = s.stage_name.clone() else { continue };
+        let Ok(sr): std::result::Result<Recipe, _> = serde_json::from_value(s.recipe_json.clone())
+        else {
+            continue;
+        };
+        // parents list is unused inside resolve_inputs for the present
+        // child; we leave it empty.
+        stages.insert(
+            name,
+            crate::config::LoadedStage {
+                recipe_path: PathBuf::new(),
+                recipe: sr,
+                parents: Vec::new(),
+            },
+        );
+    }
+    let pinned_outputs: BTreeMap<String, ArtifactRow> = BTreeMap::new();
+    let stage_ctx = StageContext {
+        stage_name,
+        stage_run_ids: &stage_run_ids,
+        stages: &stages,
+        pinned_outputs: &pinned_outputs,
+    };
+
+    submit_recipe_inner(
+        cluster,
+        store,
+        &recipe,
+        None,
+        Some(&stage_ctx),
+        &[],
+        Some(child.id.as_str()),
+        &submitted_by,
+        None,
+    )?;
+    Ok(())
 }
 
 /// Per-run reconcile step. Pulled out so the in-process dispatch loop
@@ -909,6 +1076,12 @@ pub fn reconcile_one(
     let current = store.get_run(&run.id)?;
     step.artifacts_registered += register_outputs(store, &current)?;
     let _ = crate::tracking::try_populate_from_log(store, &current);
+    // Agent-driven cascade: if this run just reached a terminal state,
+    // sweep its pending dependent stages and either advance (succeeded /
+    // cache_hit) or cascade-fail them.
+    if step.status_changed && crate::store::is_terminal(&current.status) {
+        let _ = try_submit_pending_children(cluster, store, &current);
+    }
     Ok(step)
 }
 
@@ -1383,14 +1556,13 @@ fn render_script(
                 .replace("{n}", &recipe.resources.gpus.to_string());
             script.push_str(&format!("#SBATCH --gres={syntax}\n"));
         }
-        if !parent_job_ids.is_empty() {
-            script.push_str(&format!(
-                "#SBATCH --dependency=afterok:{}\n",
-                parent_job_ids.join(":")
-            ));
-            // If a parent fails, drop the queued child instead of leaving it pending forever.
-            script.push_str("#SBATCH --kill-on-invalid-dep=yes\n");
-        }
+        // No afterok in agent-driven submission: by the time we render
+        // a stage's script, all upstream parents are terminal-succeeded
+        // (or cache-hit), so SLURM has no dependency to wait on. The
+        // coalesce-follower trampoline still uses afterok for its peer
+        // job (render_follower_script); pipeline-stage dependencies do
+        // not.
+        let _ = parent_job_ids;
         script.push_str(&format!(
             "#SBATCH --cpus-per-task={}\n",
             recipe.resources.cpus
