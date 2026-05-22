@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -92,12 +92,18 @@ pub fn run_once(
             EvalRequestSlot::Fresh | EvalRequestSlot::Retry { .. } => {}
         }
 
+        // Capture the prior eval_run_id under the same snapshot so the
+        // Retry-path UPDATE has its optimistic-concurrency witness. For
+        // the Fresh path there is no prior id.
+        let prior_run_id = match &slot {
+            EvalRequestSlot::Retry { .. } => store.eval_request_run_id(&eval_key)?,
+            _ => None,
+        };
+
         let mut overrides = SubmitOverrides::default();
         overrides
             .input_artifacts
             .insert("checkpoint".to_string(), checkpoint.id.clone());
-        // Mark the submitter so the UI's user filter chip can distinguish
-        // dispatcher-fired evals from human-submitted runs.
         let submitted = runner::submit_recipe(
             cluster,
             store,
@@ -105,25 +111,51 @@ pub fn run_once(
             Some(overrides),
             &submitted_by,
         )?;
-        match slot {
-            EvalRequestSlot::Fresh => {
-                store.insert_eval_request(
-                    &eval_key,
-                    &checkpoint.id,
-                    &recipe_hash,
-                    &policy.name,
-                    &submitted.run_id,
-                )?;
-                report.submitted += 1;
-            }
+        let claimed = match &slot {
+            EvalRequestSlot::Fresh => store.claim_eval_slot_fresh(
+                &eval_key,
+                &checkpoint.id,
+                &recipe_hash,
+                &policy.name,
+                &submitted.run_id,
+            )?,
             EvalRequestSlot::Retry { previous_attempts } => {
-                store.retry_eval_request(
+                let prior = prior_run_id.as_deref().with_context(|| {
+                    format!(
+                        "[evald] internal: eval_key {eval_key} reported Retry \
+                         but eval_request_run_id was NULL; \
+                         eval_request_status / eval_request_run_id disagree"
+                    )
+                })?;
+                store.claim_eval_slot_retry(
                     &eval_key,
+                    prior,
+                    *previous_attempts,
                     &submitted.run_id,
-                    previous_attempts + 1,
-                )?;
-                report.retried += 1;
+                )?
             }
+            EvalRequestSlot::Active | EvalRequestSlot::Exhausted { .. } => unreachable!(),
+        };
+        if !claimed {
+            // Atomic claim lost the race against another dispatcher.
+            // The SLURM job we just submitted is now an orphan — log
+            // loudly so the operator can scancel it. With one daemon
+            // per user this is a developer-error path, not a normal
+            // production occurrence.
+            anyhow::bail!(
+                "[evald] policy={} checkpoint={} lost the atomic eval-slot claim \
+                 after submitting run {} — that SLURM job is now orphan, \
+                 please scancel it. This means another writer raced us on \
+                 eval_key={}; check for a stray second agent.",
+                policy.name,
+                checkpoint.id,
+                submitted.run_id,
+                eval_key,
+            );
+        }
+        match slot {
+            EvalRequestSlot::Fresh => report.submitted += 1,
+            EvalRequestSlot::Retry { .. } => report.retried += 1,
             EvalRequestSlot::Active | EvalRequestSlot::Exhausted { .. } => unreachable!(),
         }
     }

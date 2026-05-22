@@ -1,10 +1,10 @@
 //! HTTP API + embedded SPA. Behind the `ui` feature.
 //!
-//! Read-only window onto the filesystem-truth registry. The CLI is the
-//! only writer in the new model — every `labctl run` / `labctl
-//! run-pipeline` writes sidecars directly under its own uid, never
-//! through here. This server's job is to surface the in-memory cache
-//! (built by the indexer at startup) over HTTP for the SPA. Bind to
+//! Read-only window onto the Postgres registry. The CLI / agent / evald
+//! are the only writers; this process never mutates state. Handlers
+//! talk to `PgStore` directly via async sqlx — no `block_in_place` on
+//! the HTTP path. The SSE tailer subscribes to `LISTEN labctl_events`
+//! so live deltas land in subscriber browsers without polling. Bind to
 //! 127.0.0.1 on a login node and reach it over an SSH tunnel; access
 //! control is "who can SSH in."
 

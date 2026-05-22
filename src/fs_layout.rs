@@ -1,24 +1,27 @@
-//! On-disk schema for the labctl registry.
+//! On-disk filesystem layout for the labctl run/artifact tree.
 //!
-//! The filesystem is the source of truth. Every fact about a run, artifact,
-//! alias, eval request, pipeline, or event lives as a JSON sidecar at a
-//! well-known path under `<runs_base>`, `<artifact_roots[kind]>`, or
-//! `<output_roots[kind]>`. The in-memory SQLite cache (see `fs_store`) is
-//! a derived index, rebuildable from this tree at any time.
+//! Postgres is the source of truth for runs, artifacts, aliases, eval
+//! requests, pipelines, and events; this module owns the FS bits that
+//! still have to live on shared storage:
+//!   - Artifact bytes under `<artifact_roots[kind]>/_objects/<prefix>/<hash>/`,
+//!     plus the per-user `aliases/<user>/<alias>` symlink overlay.
+//!   - The slurm-compute → login bridge: `<run_dir>/.lab/context.json`
+//!     and `<run_dir>/.lab/output_hashes.json`, written by the compute
+//!     job because compute nodes can't reach PG.
+//!   - The `_objects/<prefix>/<hash>/.meta.json` sidecar, a human-readable
+//!     projection of the corresponding `artifacts` row.
 //!
 //! Atomicity rules:
-//!   - Sidecars are written tmp + rename(2) (atomic on Lustre/GPFS within
-//!     the same directory).
-//!   - Namespace claims (alias names, eval_request keys) use mkdir(2) as
-//!     the "first writer wins" primitive — also atomic on parallel FS.
+//!   - FS writes go tmp + rename(2) (atomic on Lustre/GPFS within the
+//!     same directory).
+//!   - Cross-host claims (coalesce slot, eval slot) are owned by PG, not
+//!     the filesystem — `INSERT ... ON CONFLICT` is the atomic primitive.
 //!
 //! Identity rules:
-//!   - Every path that records a user's intent has the user as a path
-//!     segment (`runs/<user>/...`, `eval_state/<user>/...`, `<kind>/<user>/...`).
-//!     The directory's owner uid is the canonical submitter; the
-//!     `submitted_by` field in the JSON sidecar is a convenience copy.
-//!   - The shared `aliases/` namespace has no user prefix because alias
-//!     uniqueness is global by design.
+//!   - Every per-user path has the user as a segment (`runs/<user>/...`,
+//!     `<kind>/<user>/...`). The directory's owner uid is the canonical
+//!     submitter; `submitted_by` / `"user"` columns in PG are the
+//!     authoritative copy.
 
 use std::{
     fs,
