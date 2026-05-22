@@ -106,7 +106,6 @@ fn create_user_dirs(cluster: &ClusterConfig, name: &str) -> Result<Vec<PathBuf>>
         vec![fs_layout::user_runs_dir(&cluster.filesystem.runs_base, name)];
     for root in cluster.filesystem.artifact_roots.values() {
         targets.push(root.join(name));
-        targets.push(root.join(fs_layout::ALIASES_USER_DIR).join(name));
     }
     targets.dedup();
 

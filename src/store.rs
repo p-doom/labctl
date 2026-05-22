@@ -15,17 +15,16 @@
 //! for sync test code and CLI commands like `labctl status` / `labctl
 //! show`.
 //!
-//! `insert_artifact` and the private `add_user_alias` are the only
-//! methods that still do FS work alongside the PG insert (moving bytes
-//! into `_objects/<prefix>/<hash>/`, creating the per-user alias
-//! symlinks, writing the `.meta.json` projection). Everything else is
-//! a pure PG operation.
+//! `insert_artifact` is the one method that still writes to the FS
+//! alongside the PG insert (the per-artifact `.meta.json` projection
+//! at the artifact's on-disk location). Everything else (run rows, run
+//! inputs/outputs, pipelines, eval requests, tracking, events) is a
+//! pure PG operation.
 //!
 //! Tests live in `pg_store::tests` (live PG smoke tests with `#[ignore]`).
 
 use std::{
     collections::BTreeMap,
-    fs,
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
@@ -353,12 +352,29 @@ impl Store {
 
     // ---------- artifacts ----------
 
-    /// Register an artifact under content-addressed storage. Bridges the
-    /// legacy `(kind, staging_path, content_hash, producer_run_id, metadata)`
-    /// shape onto the DB-only `PgStore::insert_artifact` (which takes
-    /// pre-decomposed args) by doing all the FS work in the wrapper:
-    /// dedup-or-rename of the staging dir into `_objects/<prefix>/<hash>/`,
-    /// sidecar write, and per-user alias symlink creation.
+    /// Register an artifact at the staging path written by the producer.
+    /// Bridges the legacy `(kind, staging_path, content_hash,
+    /// producer_run_id, metadata)` shape onto the DB-only
+    /// `PgStore::insert_artifact` (which takes pre-decomposed args) by
+    /// writing the sidecar in place and inserting the row.
+    ///
+    /// The producer writes to `<root>/<user>/<alias>/` (the staging path)
+    /// and the artifact stays there permanently — there is no
+    /// content-addressed relocation. This avoids two pre-migration
+    /// hazards: (1) `fs::rename` from staging into `_objects/<hash>/`
+    /// silently invalidated any absolute self-references baked into
+    /// the artifact body (e.g. `build_sft_chunk_index.py` stores its
+    /// payload_path as an absolute path; renaming the artifact moved
+    /// the bytes out from under it). (2) producers had to honour an
+    /// undocumented "no absolute self-references" contract that was
+    /// easy to violate as new artifact kinds were added.
+    ///
+    /// `content_hash` is retained in the PG row solely as a stored
+    /// property of the artifact — useful for diagnostics, dedup queries,
+    /// or future cross-cluster import. It plays no role in path
+    /// placement and is not consulted on the `insert_artifact` happy
+    /// path (no on-write dedup; cache hits are driven by
+    /// `compute_cache_key`, which has never depended on output bytes).
     pub fn insert_artifact(
         &self,
         kind: &str,
@@ -378,51 +394,6 @@ impl Store {
         let (user, alias_segment) = decompose_artifact_path(staging_path, &root)
             .unwrap_or_else(|_| ("unknown".into(), id.clone()));
 
-        // Dedup: if some prior artifact has the same content_hash for
-        // this kind, drop our staging copy, register a per-user alias
-        // overlay pointing at the existing artifact, and rehydrate any
-        // run_inputs waiting on the canonical path.
-        if let Some(existing) = self.find_artifact_by_hash(kind, content_hash)? {
-            if staging_path != existing.path && staging_path.exists() {
-                fs::remove_dir_all(staging_path).with_context(|| {
-                    format!(
-                        "failed to remove redundant staging dir {} after \
-                         content-hash dedup matched existing {}",
-                        staging_path.display(),
-                        existing.path.display()
-                    )
-                })?;
-            }
-            self.add_user_alias(kind, &user, &alias_segment, &existing.id, &existing.path)?;
-            self.block_on_pg(
-                self.pg
-                    .rehydrate_inputs_by_path(&existing.path.display().to_string(), &existing.id),
-            )?;
-            return Ok(existing);
-        }
-
-        // Fresh artifact: move bytes into the by-hash slot, write the
-        // sidecar, insert the row, register the alias overlay, fan out
-        // path-based rehydration, and emit an `artifact_registered`
-        // event if a producer is known.
-        let canonical = fs_layout::content_addressed_dir(&root, content_hash);
-        if !canonical.exists() {
-            if let Some(parent) = canonical.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-            }
-            fs::rename(staging_path, &canonical).with_context(|| {
-                format!(
-                    "failed to move staging dir {} -> {} (must be same filesystem)",
-                    staging_path.display(),
-                    canonical.display(),
-                )
-            })?;
-        } else if staging_path != canonical && staging_path.exists() {
-            // Race: another process moved bytes here first. Drop ours.
-            fs::remove_dir_all(staging_path).ok();
-        }
-
         let now = util::now_ts();
         let sidecar = ArtifactSidecar {
             id: id.clone(),
@@ -434,12 +405,12 @@ impl Store {
             metadata: metadata.clone(),
             created_at: now,
         };
-        fs_layout::atomic_write_json(&canonical.join(fs_layout::ARTIFACT_META), &sidecar)?;
+        fs_layout::atomic_write_json(&staging_path.join(fs_layout::ARTIFACT_META), &sidecar)?;
 
         self.block_on_pg(self.pg.insert_artifact(
             &id,
             kind,
-            &canonical,
+            staging_path,
             content_hash,
             producer_run_id,
             metadata,
@@ -447,16 +418,15 @@ impl Store {
             &alias_segment,
             now,
         ))?;
-        self.add_user_alias(kind, &user, &alias_segment, &id, &canonical)?;
         self.block_on_pg(
             self.pg
-                .rehydrate_inputs_by_path(&canonical.display().to_string(), &id),
+                .rehydrate_inputs_by_path(&staging_path.display().to_string(), &id),
         )?;
         if let Some(run_id) = producer_run_id {
             let payload = serde_json::json!({
                 "artifact_id": id,
                 "kind": kind,
-                "path": canonical,
+                "path": staging_path,
             });
             self.block_on_pg(self.pg.append_event(
                 Some(run_id),
@@ -466,41 +436,6 @@ impl Store {
             ))?;
         }
         self.get_artifact(&id)
-    }
-
-    /// Write a per-user alias overlay: a symlink at
-    /// `<artifact_root>/aliases/<user>/<alias>` pointing at the
-    /// artifact's canonical `_objects/<prefix>/<hash>/` dir, plus an
-    /// `artifact_user_aliases` row. Idempotent.
-    fn add_user_alias(
-        &self,
-        kind: &str,
-        user: &str,
-        alias: &str,
-        artifact_id: &str,
-        target: &Path,
-    ) -> Result<()> {
-        let root = self.artifact_roots.get(kind).with_context(|| {
-            format!("kind {kind:?} not in cluster.filesystem.artifact_roots")
-        })?;
-        let link = fs_layout::alias_symlink_path(root, user, alias);
-        fs_layout::create_alias_symlink(&link, target)?;
-        self.block_on_pg(self.pg.add_user_alias(
-            user,
-            alias,
-            kind,
-            artifact_id,
-            util::now_ts(),
-        ))?;
-        Ok(())
-    }
-
-    pub fn find_artifact_by_hash(
-        &self,
-        kind: &str,
-        content_hash: &str,
-    ) -> Result<Option<ArtifactRow>> {
-        self.block_on_pg(self.pg.find_artifact_by_hash(kind, content_hash))
     }
 
     /// Look up an artifact by `(kind, path)`. The PG `find_artifact_by_path`
