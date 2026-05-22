@@ -79,6 +79,7 @@ def json_field(v: Any) -> str:
 
 @dataclass
 class Counts:
+    users: int = 0
     runs: int = 0
     pipelines: int = 0
     artifacts: int = 0
@@ -89,6 +90,22 @@ class Counts:
     eval_requests: int = 0
     tracking: int = 0
     events: int = 0
+    # name -> earliest created_at observed. Populated by every emit_*
+    # that touches a user-bearing sidecar. Written out as users.tsv
+    # before the COPY phase so the FKs added in 0003 resolve.
+    user_first_seen: dict[str, int] = field(default_factory=dict)
+
+
+def observe_user(counts: Counts, name: str | None, ts: int | None) -> None:
+    if not name:
+        return
+    cur = counts.user_first_seen.get(name)
+    if ts is None:
+        # Anchor to a sentinel that loses every MIN; gets clobbered by
+        # any real timestamp on a subsequent observation.
+        ts = 1 << 62
+    if cur is None or ts < cur:
+        counts.user_first_seen[name] = ts
 
 
 def load_cluster(path: Path) -> dict:
@@ -151,6 +168,7 @@ def emit_runs_and_associated(
                 tsv_escape(sidecar.get("coalesced_peer_run_id")),
             ])
             counts.runs += 1
+            observe_user(counts, sidecar.get("submitted_by"), sidecar.get("created_at"))
 
             # inputs.json
             inputs = read_json_optional(lab / INPUTS_JSON) or []
@@ -208,6 +226,7 @@ def emit_pipelines(runs_base: Path, w_pipelines, counts: Counts):
                 tsv_escape(sidecar["user"]),
                 tsv_escape(sidecar["created_at"]),
             ])
+            observe_user(counts, sidecar.get("user"), sidecar.get("created_at"))
             counts.pipelines += 1
 
 
@@ -243,6 +262,7 @@ def emit_artifacts_and_user_aliases(
                         tsv_escape(sidecar["alias"]),
                     ])
                     counts.artifacts += 1
+                    observe_user(counts, sidecar.get("user"), sidecar.get("created_at"))
 
         # Per-user alias overlay symlinks.
         aliases_root = root / ALIASES_USER_DIR
@@ -268,6 +288,7 @@ def emit_artifacts_and_user_aliases(
                         tsv_escape(sidecar["created_at"]),
                     ])
                     counts.artifact_user_aliases += 1
+                    observe_user(counts, user_dir.name, sidecar.get("created_at"))
 
 
 def emit_global_aliases(runs_base: Path, w_aliases, counts: Counts):
@@ -314,6 +335,7 @@ def emit_eval_requests(runs_base: Path, w_eval, counts: Counts):
                 tsv_escape(sidecar["updated_at"]),
             ])
             counts.eval_requests += 1
+            observe_user(counts, user_dir.name, sidecar.get("created_at"))
 
 
 def emit_events(runs_base: Path, w_events, counts: Counts):
@@ -354,6 +376,12 @@ class TableSpec:
 
 
 TABLES = [
+    # Users must be loaded FIRST: migration 0003 added FKs from
+    # runs.submitted_by, pipelines."user", artifacts."user",
+    # artifact_user_aliases."user", and eval_requests."user" to
+    # users.name. Every downstream COPY validates against rows already
+    # present here.
+    TableSpec("users", ["name", "created_at", "pg_role"]),
     TableSpec(
         "runs",
         [
@@ -467,11 +495,26 @@ def main() -> int:
         emit_global_aliases(runs_base, writers["artifact_aliases"], counts)
         emit_eval_requests(runs_base, writers["eval_requests"], counts)
         emit_events(runs_base, writers["events"], counts)
+        # Users get written last in code but COPYed first at load time;
+        # they're derived from the unions of `submitted_by` / `"user"`
+        # observed during the emits above.
+        for name, first_seen in sorted(counts.user_first_seen.items()):
+            # The sentinel (1<<62) only survives if we never saw a real
+            # timestamp for this user — fall back to 0 so the row still
+            # loads. (PG stores BIGINT; 0 == 1970-01-01 is fine for the
+            # informational column.)
+            ts = 0 if first_seen >= (1 << 60) else first_seen
+            writers["users"].writerow([
+                tsv_escape(name),
+                tsv_escape(ts),
+                tsv_escape(name),  # pg_role mirrors name on import.
+            ])
+            counts.users += 1
     finally:
         for h in handles.values():
             h.close()
 
-    print(f"emitted: runs={counts.runs} pipelines={counts.pipelines} "
+    print(f"emitted: users={counts.users} runs={counts.runs} pipelines={counts.pipelines} "
           f"artifacts={counts.artifacts} artifact_aliases={counts.artifact_aliases} "
           f"artifact_user_aliases={counts.artifact_user_aliases} "
           f"run_inputs={counts.run_inputs} run_outputs={counts.run_outputs} "

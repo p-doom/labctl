@@ -584,9 +584,14 @@ impl PgStore {
             Some(r) => {
                 let status: String = r.try_get("status")?;
                 let attempts: i64 = r.try_get("attempts")?;
+                // Retry-eligible iff the prior run ended in a non-success
+                // terminal state. Must cover EVERY terminal failure
+                // sacct can surface — previously omitted `oom` and
+                // `unknown_terminal`, which would lock the slot in
+                // Active forever and silently block retries.
                 let stale = matches!(
                     status.as_str(),
-                    "cancelled" | "failed" | "timeout"
+                    "cancelled" | "failed" | "timeout" | "oom" | "unknown_terminal"
                 );
                 if !stale {
                     Ok(EvalRequestSlot::Active)
@@ -602,11 +607,17 @@ impl PgStore {
     }
 
     /// Enriched per-eval rows for a single parent run: each eval_request
-    /// joined with its checkpoint artifact's metadata (for `step`) and
-    /// the first `eval_result` artifact's metadata (for the headline
-    /// metric). One PG round-trip — the previous shape required N+1 by
-    /// looping `get_artifact_optional` + `run_outputs` per eval in the
-    /// HTTP handler.
+    /// joined with its checkpoint artifact's metadata (for `step`), the
+    /// first `eval_result` artifact's metadata (for the headline
+    /// metric), and the eval-run's current `runs.status` (surfaced as
+    /// `state`). One PG round-trip — the previous shape required N+1
+    /// by looping `get_artifact_optional` + `run_outputs` per eval.
+    ///
+    /// `state` derives from the joined `runs.status` (the slurm-tracked
+    /// lifecycle) rather than the static `eval_requests.state` column
+    /// (which only ever holds 'submitted'). Falls back to 'pending'
+    /// when the eval_run row is absent (eval_run_id NULL or stale
+    /// reference).
     pub async fn eval_series_rows(&self, run_id: &str) -> Result<Vec<EvalSeriesRow>> {
         let rows = sqlx::query(
             "SELECT
@@ -615,7 +626,7 @@ impl PgStore {
                  er.eval_recipe_hash,
                  er.policy_id,
                  er.eval_run_id,
-                 er.state,
+                 COALESCE(er_run.status, 'pending') AS state,
                  cp.metadata_json AS checkpoint_metadata,
                  (
                      SELECT a.metadata_json
@@ -627,6 +638,7 @@ impl PgStore {
                  ) AS eval_result_metadata
              FROM eval_requests er
              LEFT JOIN artifacts cp ON cp.id = er.checkpoint_artifact_id
+             LEFT JOIN runs er_run ON er_run.id = er.eval_run_id
              WHERE cp.producer_run_id = $1 OR er.eval_run_id = $1
              ORDER BY er.created_at",
         )
@@ -655,11 +667,18 @@ impl PgStore {
     }
 
     pub async fn eval_requests_for_run(&self, run_id: &str) -> Result<Vec<Value>> {
+        // `state` surfaces the eval_run's *current* lifecycle status
+        // (the joined runs.status). The static `er.state` column is
+        // never inspected — it only ever holds 'submitted', the row
+        // creation marker — and would otherwise leak that as the
+        // outward-facing answer.
         let rows = sqlx::query(
             "SELECT er.eval_key, er.checkpoint_artifact_id, er.eval_recipe_hash,
-                    er.policy_id, er.eval_run_id, er.state
+                    er.policy_id, er.eval_run_id,
+                    COALESCE(er_run.status, 'pending') AS state
              FROM eval_requests er
              LEFT JOIN artifacts a ON a.id = er.checkpoint_artifact_id
+             LEFT JOIN runs er_run ON er_run.id = er.eval_run_id
              WHERE a.producer_run_id = $1 OR er.eval_run_id = $1
              ORDER BY er.created_at",
         )
@@ -682,10 +701,16 @@ impl PgStore {
     }
 
     pub async fn list_eval_requests(&self) -> Result<Vec<Value>> {
+        // See `eval_requests_for_run` for the `state` derivation
+        // rationale.
         let rows = sqlx::query(
-            "SELECT eval_key, checkpoint_artifact_id, eval_recipe_hash, policy_id,
-                    eval_run_id, state, created_at, updated_at
-             FROM eval_requests ORDER BY updated_at DESC",
+            "SELECT er.eval_key, er.checkpoint_artifact_id, er.eval_recipe_hash,
+                    er.policy_id, er.eval_run_id,
+                    COALESCE(er_run.status, 'pending') AS state,
+                    er.created_at, er.updated_at
+             FROM eval_requests er
+             LEFT JOIN runs er_run ON er_run.id = er.eval_run_id
+             ORDER BY er.updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -711,9 +736,14 @@ impl PgStore {
         policy_id: &str,
     ) -> Result<Vec<Value>> {
         let rows = sqlx::query(
-            "SELECT eval_key, checkpoint_artifact_id, eval_recipe_hash, policy_id,
-                    eval_run_id, state, created_at, updated_at
-             FROM eval_requests WHERE policy_id = $1 ORDER BY updated_at DESC",
+            "SELECT er.eval_key, er.checkpoint_artifact_id, er.eval_recipe_hash,
+                    er.policy_id, er.eval_run_id,
+                    COALESCE(er_run.status, 'pending') AS state,
+                    er.created_at, er.updated_at
+             FROM eval_requests er
+             LEFT JOIN runs er_run ON er_run.id = er.eval_run_id
+             WHERE er.policy_id = $1
+             ORDER BY er.updated_at DESC",
         )
         .bind(policy_id)
         .fetch_all(&self.pool)
@@ -736,13 +766,25 @@ impl PgStore {
     }
 
     pub async fn policy_summaries(&self) -> Result<Vec<PolicySummaryRow>> {
+        // `failed` / `running` are computed against the joined
+        // runs.status, not the static eval_requests.state column.
+        // `failed` covers the full terminal-failure set (matches
+        // `eval_request_status`'s stale predicate). `running` covers
+        // every still-active lifecycle status.
         let rows = sqlx::query(
-            "SELECT policy_id,
+            "SELECT er.policy_id,
                     COUNT(*)::BIGINT AS total,
-                    SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END)::BIGINT AS failed,
-                    SUM(CASE WHEN state IN ('running','submitted') THEN 1 ELSE 0 END)::BIGINT AS running,
-                    MAX(updated_at) AS last_fired
-             FROM eval_requests GROUP BY policy_id ORDER BY last_fired DESC",
+                    SUM(CASE WHEN COALESCE(er_run.status, '') IN
+                        ('failed','cancelled','timeout','oom','unknown_terminal')
+                        THEN 1 ELSE 0 END)::BIGINT AS failed,
+                    SUM(CASE WHEN COALESCE(er_run.status, 'pending') IN
+                        ('created','submitted','running','awaiting_peer','pending')
+                        THEN 1 ELSE 0 END)::BIGINT AS running,
+                    MAX(er.updated_at) AS last_fired
+             FROM eval_requests er
+             LEFT JOIN runs er_run ON er_run.id = er.eval_run_id
+             GROUP BY er.policy_id
+             ORDER BY last_fired DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -1408,6 +1450,76 @@ impl PgStore {
         .context("set_awaiting_peer: event insert")?;
         tx.commit().await.context("set_awaiting_peer: commit")?;
         Ok(())
+    }
+
+    // ---------- users / admin ----------
+
+    /// Register a new labctl-side user row. Returns true iff a new
+    /// row was inserted (false on ON CONFLICT — caller may treat that
+    /// as already-registered).
+    pub async fn insert_user(&self, name: &str, created_at: i64) -> Result<bool> {
+        let row = sqlx::query(
+            "INSERT INTO users (name, created_at, pg_role)
+             VALUES ($1, $2, $1)
+             ON CONFLICT (name) DO NOTHING
+             RETURNING name",
+        )
+        .bind(name)
+        .bind(created_at)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("insert_user({name})"))?;
+        Ok(row.is_some())
+    }
+
+    /// Create the PG role + GRANTs to mirror the labctl-side user row.
+    /// Idempotent: if the role already exists the CREATE step is
+    /// skipped but the GRANTs re-apply (a no-op when already granted).
+    /// Returns true iff this call actually created the role.
+    ///
+    /// The connecting user needs `CREATEROLE` and ownership of the
+    /// schema/tables being granted — on the standard single-host lab
+    /// deployment that's the user who ran `initdb`.
+    ///
+    /// Identifier safety: callers in `admin.rs` constrain `name` to
+    /// `[A-Za-z0-9._-]+` before reaching here, so direct interpolation
+    /// into `"<name>"` is sound. We still double-quote the identifier
+    /// rather than relying on PG's `format('%I', ...)` because the
+    /// individual statements aren't wrapped in a DO block (each one
+    /// runs through the sqlx prepared-statement path with no embedded
+    /// `EXECUTE format(...)` machinery).
+    pub async fn ensure_pg_role(&self, name: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await.context("ensure_pg_role: begin")?;
+        let already = sqlx::query("SELECT 1 FROM pg_roles WHERE rolname = $1")
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await
+            .with_context(|| format!("ensure_pg_role({name}): pre-check"))?
+            .is_some();
+        if !already {
+            sqlx::query(&format!(r#"CREATE ROLE "{name}" WITH LOGIN"#))
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("ensure_pg_role({name}): CREATE ROLE"))?;
+        }
+        for stmt in [
+            format!(r#"GRANT ALL ON SCHEMA public TO "{name}""#),
+            format!(r#"GRANT ALL ON ALL TABLES IN SCHEMA public TO "{name}""#),
+            format!(r#"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO "{name}""#),
+            format!(
+                r#"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO "{name}""#
+            ),
+            format!(
+                r#"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO "{name}""#
+            ),
+        ] {
+            sqlx::query(&stmt)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("ensure_pg_role({name}): {stmt}"))?;
+        }
+        tx.commit().await.context("ensure_pg_role: commit")?;
+        Ok(!already)
     }
 
     pub async fn insert_pipeline(

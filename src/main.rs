@@ -1,3 +1,4 @@
+mod admin;
 mod agent;
 mod artifacts;
 mod config;
@@ -171,6 +172,14 @@ enum Command {
     ///                    paths interactively.
     ///   --join <path>    join a colleague's shared registry on this
     ///                    cluster. Paths kept verbatim.
+    /// Administrative subcommands (`add-user`, future role/key
+    /// management). Run by whoever owns the labctl PG database — i.e.
+    /// the connection user needs CREATEROLE/GRANT privileges. On the
+    /// single-host lab deployment that's the user who ran `initdb`.
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
     Init {
         /// Adopt an existing cluster.toml as-is. Symlinks it into
         /// the default config location so plain `labctl <cmd>` works.
@@ -265,6 +274,31 @@ fn parse_kv_pathbuf(s: &str) -> Result<(String, PathBuf), String> {
 #[derive(Subcommand)]
 enum EvaldCommand {
     Once { policy: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Register a new collaborator with the labctl instance. Inserts
+    /// the row in the `users` table, creates the matching PG role with
+    /// LOGIN + the full GRANT set on the `public` schema, and creates
+    /// the per-user FS dirs under `runs_base` and each artifact root
+    /// (honouring `[filesystem].shared_group` perms if configured).
+    /// All three steps run as one transaction's worth of bookkeeping —
+    /// a failure rolls back the PG-side inserts; FS dirs created
+    /// before the failure are left in place (idempotent on rerun).
+    AddUser {
+        /// Unix username. Must match `^[A-Za-z0-9._-]+$` and not be a
+        /// reserved path segment.
+        name: String,
+        /// Skip creating the PG role + GRANTs. Use when the role
+        /// already exists (e.g. provisioned by site infra) and you
+        /// only want to register the labctl-side row.
+        #[arg(long)]
+        no_pg_role: bool,
+        /// Skip creating per-user FS dirs.
+        #[arg(long)]
+        no_create_dirs: bool,
+    },
 }
 
 /// Which labctl unit a service subcommand is acting on. The CLI surfaces
@@ -563,6 +597,18 @@ fn main() -> Result<()> {
             let report = runner::repair_finish_times(&cluster, &store)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::Admin { command } => match command {
+            AdminCommand::AddUser { name, no_pg_role, no_create_dirs } => {
+                let report = admin::add_user(
+                    &cluster,
+                    &store,
+                    &name,
+                    !no_pg_role,
+                    !no_create_dirs,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        },
         Command::Evald { command } => match command {
             EvaldCommand::Once { policy } => {
                 let policy = config::EvalPolicy::load(&policy)?;
