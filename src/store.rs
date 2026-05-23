@@ -332,12 +332,22 @@ impl Store {
         };
         let path_hash = util::sha256_bytes(canonical.display().to_string().as_bytes());
         let id = format!("artifact_{}", &path_hash[..16]);
-        // The staging path is <root>/<user>/<alias>/. Falls back to
-        // placeholders for ad-hoc registrations not under a user dir.
-        let (user, alias) = decompose_artifact_path(staging_path, &root)
-            .unwrap_or_else(|_| ("unknown".into(), id.clone()));
+        // The staging path must be `<root>/<user>/<alias>/` — the
+        // schema FK from artifacts."user" → users(name) requires a
+        // real user, and a placeholder would FK-violate at INSERT.
+        // Fail loudly at the boundary instead of writing junk.
+        let (user, _alias) = decompose_artifact_path(staging_path, &root).with_context(|| {
+            format!(
+                "insert_artifact: staging path {} not under <root>/<user>/<alias>/ \
+                     (root={}); the writer is producing artifacts outside the canonical \
+                     per-user layout",
+                staging_path.display(),
+                root.display(),
+            )
+        })?;
 
         let now = util::now_ts();
+        let alias = _alias;
         let sidecar = ArtifactSidecar {
             id: id.clone(),
             kind: kind.to_string(),
@@ -357,7 +367,15 @@ impl Store {
         }
 
         self.pg
-            .insert_artifact(&id, kind, staging_path, producer_run_id, metadata, &user, now)
+            .insert_artifact(
+                &id,
+                kind,
+                staging_path,
+                producer_run_id,
+                metadata,
+                &user,
+                now,
+            )
             .await?;
         self.pg
             .rehydrate_inputs_by_path(&staging_path.display().to_string(), &id)
@@ -414,7 +432,9 @@ impl Store {
         kind: &str,
         user: &str,
     ) -> Result<Vec<ArtifactRow>> {
-        self.pg.artifacts_by_kind_for_producer_user(kind, user).await
+        self.pg
+            .artifacts_by_kind_for_producer_user(kind, user)
+            .await
     }
 
     pub async fn list_artifacts(&self) -> Result<Vec<ArtifactRow>> {
@@ -477,11 +497,7 @@ impl Store {
         self.pg.run_output_links(run_id).await
     }
 
-    pub async fn run_output_artifact_id(
-        &self,
-        run_id: &str,
-        role: &str,
-    ) -> Result<Option<String>> {
+    pub async fn run_output_artifact_id(&self, run_id: &str, role: &str) -> Result<Option<String>> {
         self.pg.run_output_artifact_id(run_id, role).await
     }
 
@@ -491,7 +507,9 @@ impl Store {
         role: &str,
         artifact_id: &str,
     ) -> Result<bool> {
-        self.pg.set_run_input_artifact(run_id, role, artifact_id).await
+        self.pg
+            .set_run_input_artifact(run_id, role, artifact_id)
+            .await
     }
 
     pub async fn backfill_stage_consumers(
@@ -527,7 +545,9 @@ impl Store {
         pipeline_path: Option<&Path>,
     ) -> Result<()> {
         let user = current_user()?;
-        self.pg.insert_pipeline(id, name, pipeline_path, &user).await
+        self.pg
+            .insert_pipeline(id, name, pipeline_path, &user)
+            .await
     }
 
     pub async fn set_pipeline_membership(
@@ -641,7 +661,11 @@ impl Store {
 
     // ---------- recipe history ----------
 
-    pub async fn recipe_history(&self, recipe_name: &str, limit: usize) -> Result<Vec<(String, i64)>> {
+    pub async fn recipe_history(
+        &self,
+        recipe_name: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, i64)>> {
         self.pg.recipe_history(recipe_name, limit as i64).await
     }
 
@@ -689,8 +713,11 @@ impl Store {
 pub(crate) fn current_user() -> Result<String> {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
-        .ok()
-        .unwrap_or_else(|| "unknown".to_string());
+        .context(
+            "USER (or USERNAME) is unset; refuse to fall back to a placeholder because \
+             every labctl write attributes ownership and PG enforces submitted_by, \
+             pipelines.\"user\", artifacts.\"user\", eval_requests.\"user\" against users(name)",
+        )?;
     fs_layout::validate_user(&user)?;
     Ok(user)
 }

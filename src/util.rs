@@ -87,8 +87,14 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
 
     let mut cmd = Command::new("git");
-    cmd.args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
-        .current_dir(src);
+    cmd.args([
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ])
+    .current_dir(src);
     let output = cmd
         .output()
         .with_context(|| format!("failed to run git ls-files in {}", src.display()))?;
@@ -104,8 +110,9 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
         if raw.is_empty() {
             continue;
         }
-        let rel_str = std::str::from_utf8(raw)
-            .with_context(|| format!("git ls-files returned non-UTF-8 path in {}", src.display()))?;
+        let rel_str = std::str::from_utf8(raw).with_context(|| {
+            format!("git ls-files returned non-UTF-8 path in {}", src.display())
+        })?;
         let rel = Path::new(rel_str);
 
         let src_path = src.join(rel);
@@ -140,7 +147,7 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
             })?;
         } else if ft.is_file() {
             if meta.len() > LARGE_FILE_WARN {
-                eprintln!(
+                tracing::info!(
                     "labctl: warning: copying {} MiB file into snapshot: {}",
                     meta.len() >> 20,
                     rel.display()
@@ -167,4 +174,3 @@ pub fn shell_quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', "'\"'\"'"))
     }
 }
-

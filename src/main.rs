@@ -24,12 +24,7 @@ use clap::{Parser, Subcommand};
 
 /// Compile-time version stamp. Crate version + short git SHA captured by
 /// build.rs so `labctl --version` identifies the exact build.
-const BUILD_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (",
-    env!("LABCTL_GIT_SHA"),
-    ")"
-);
+const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("LABCTL_GIT_SHA"), ")");
 
 #[derive(Parser)]
 #[command(name = "labctl")]
@@ -49,20 +44,20 @@ fn resolve_cluster_path(arg: Option<PathBuf>) -> PathBuf {
     if let Some(p) = arg {
         return p;
     }
-    if let Ok(env) = std::env::var("LABCTL_CLUSTER") {
-        if !env.is_empty() {
-            return PathBuf::from(env);
-        }
+    if let Ok(env) = std::env::var("LABCTL_CLUSTER")
+        && !env.is_empty()
+    {
+        return PathBuf::from(env);
     }
-    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
-        if !x.is_empty() {
-            return PathBuf::from(x).join("labctl").join("cluster.toml");
-        }
+    if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
+        && !x.is_empty()
+    {
+        return PathBuf::from(x).join("labctl").join("cluster.toml");
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home).join(".config/labctl/cluster.toml");
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return PathBuf::from(home).join(".config/labctl/cluster.toml");
     }
     PathBuf::from("labctl.toml")
 }
@@ -302,9 +297,7 @@ fn pick_unit_kind(agent: bool, ui: bool) -> Result<UnitKind> {
         (true, false) => Ok(UnitKind::Agent),
         (false, true) => Ok(UnitKind::Ui),
         (true, true) => unreachable!("clap's ArgGroup prevents both"),
-        (false, false) => anyhow::bail!(
-            "specify which unit to target: --agent or --ui"
-        ),
+        (false, false) => anyhow::bail!("specify which unit to target: --agent or --ui"),
     }
 }
 
@@ -357,6 +350,7 @@ enum ServiceCommand {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     let cluster_path = resolve_cluster_path(cli.cluster.clone());
 
@@ -372,12 +366,11 @@ async fn main() -> Result<()> {
     // any cluster.toml necessarily exists, so we skip it here and apply
     // perms explicitly in init::create_user_dirs. Validate also bypasses
     // (handled above).
-    if !matches!(cli.command, Command::Init { .. }) {
-        if let Ok(cfg) = config::ClusterConfig::load(&cluster_path) {
-            if cfg.filesystem.shared_group.is_some() {
-                set_shared_umask();
-            }
-        }
+    if !matches!(cli.command, Command::Init { .. })
+        && let Ok(cfg) = config::ClusterConfig::load(&cluster_path)
+        && cfg.filesystem.shared_group.is_some()
+    {
+        set_shared_umask();
     }
 
     if let Command::Init {
@@ -437,7 +430,12 @@ async fn main() -> Result<()> {
     }
     if let Command::Service { command } = cli.command {
         return match command {
-            ServiceCommand::Install { agent, ui, bind, force } => {
+            ServiceCommand::Install {
+                agent,
+                ui,
+                bind,
+                force,
+            } => {
                 let mode = pick_unit_kind(agent, ui)?;
                 let mode = match mode {
                     UnitKind::Agent => service::UnitMode::Agent,
@@ -559,15 +557,13 @@ async fn main() -> Result<()> {
             println!("alias: {alias}");
         }
         Command::Admin { command } => match command {
-            AdminCommand::AddUser { name, no_pg_role, no_create_dirs } => {
-                let report = admin::add_user(
-                    &cluster,
-                    &store,
-                    &name,
-                    !no_pg_role,
-                    !no_create_dirs,
-                )
-                .await?;
+            AdminCommand::AddUser {
+                name,
+                no_pg_role,
+                no_create_dirs,
+            } => {
+                let report =
+                    admin::add_user(&cluster, &store, &name, !no_pg_role, !no_create_dirs).await?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
         },
@@ -605,8 +601,8 @@ async fn main() -> Result<()> {
 /// Self-check intended for first-time setup and bug reports. Never bails:
 /// every failure becomes a "FAIL" line so the user sees the whole picture.
 /// Exits with code 1 if any check failed, 0 otherwise.
-async fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
-    use std::process::Command as Cmd;
+async fn run_doctor(cluster_path: &std::path::Path) -> Result<()> {
+    use tokio::process::Command as Cmd;
     let mut failed = 0usize;
     let mut emit = |label: &str, ok: bool, detail: &str| {
         let mark = if ok { "OK  " } else { "FAIL" };
@@ -622,7 +618,11 @@ async fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
 
     let cluster = match config::ClusterConfig::load(cluster_path) {
         Ok(c) => {
-            emit("cluster config", true, &format!("loaded ({} repos)", c.repos.len()));
+            emit(
+                "cluster config",
+                true,
+                &format!("loaded ({} repos)", c.repos.len()),
+            );
             Some(c)
         }
         Err(e) => {
@@ -711,8 +711,7 @@ async fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
         // single-user setups (parent not group-readable → reports
         // "single-user setup" without failing), so it's safe to run
         // unconditionally; the repos check below is stricter and gated.
-        let mut probed: std::collections::BTreeSet<PathBuf> =
-            std::collections::BTreeSet::new();
+        let mut probed: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
         let mut probe_targets: Vec<(String, &PathBuf)> = Vec::new();
         probe_targets.push(("runs_base".to_string(), &cluster.filesystem.runs_base));
         for (k, p) in &cluster.filesystem.artifact_roots {
@@ -779,7 +778,6 @@ async fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
                 "absent ([dispatch] not set; agent is a no-op)",
             ),
         }
-
     }
 
     let systemd_ok = service::systemd_available();
@@ -812,27 +810,32 @@ async fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
             );
         } else {
             for unit in installed {
-                let active = Cmd::new("systemctl")
+                let active = match Cmd::new("systemctl")
                     .args(["--user", "is-active", unit])
                     .output()
-                    .ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                emit(&format!("{unit} unit"), true, &format!("installed ({active})"));
-                if active == "failed" || active == "inactive" {
-                    if let Ok(out) = Cmd::new("journalctl")
+                    .await
+                {
+                    Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                    Err(_) => "unknown".to_string(),
+                };
+                emit(
+                    &format!("{unit} unit"),
+                    true,
+                    &format!("installed ({active})"),
+                );
+                if (active == "failed" || active == "inactive")
+                    && let Ok(out) = Cmd::new("journalctl")
                         .args(["--user", "-u", unit, "-n", "20", "--no-pager"])
                         .output()
-                    {
-                        if out.status.success() {
-                            let tail = String::from_utf8_lossy(&out.stdout);
-                            let trimmed = tail.trim();
-                            if !trimmed.is_empty() {
-                                println!("       last 20 lines of `journalctl --user -u {unit}`:");
-                                for line in trimmed.lines() {
-                                    println!("         {line}");
-                                }
-                            }
+                        .await
+                    && out.status.success()
+                {
+                    let tail = String::from_utf8_lossy(&out.stdout);
+                    let trimmed = tail.trim();
+                    if !trimmed.is_empty() {
+                        println!("       last 20 lines of `journalctl --user -u {unit}`:");
+                        for line in trimmed.lines() {
+                            println!("         {line}");
                         }
                     }
                 }
@@ -889,9 +892,7 @@ fn group_propagation_probe(parent: &std::path::Path) -> (bool, String) {
         return (false, format!("mkdir probe in {}: {e}", parent.display()));
     }
     let outcome: Result<String, String> = (|| {
-        let pm = probe
-            .metadata()
-            .map_err(|e| format!("stat probe: {e}"))?;
+        let pm = probe.metadata().map_err(|e| format!("stat probe: {e}"))?;
         let probe_gid = pm.gid();
         let probe_mode = pm.mode();
         if probe_gid != parent_gid {
@@ -960,7 +961,10 @@ fn group_traversable(path: &std::path::Path) -> Result<(), String> {
 /// script, and shells out to `sbatch` under its own uid. SLURM job
 /// ownership therefore matches the OS user, and `submitted_by` in the
 /// row is path-canonical.
-async fn run_recipe_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()> {
+async fn run_recipe_command(
+    cluster_path: &std::path::Path,
+    recipe_path: &std::path::Path,
+) -> Result<()> {
     let cluster = config::ClusterConfig::load(cluster_path)?;
     let recipe = config::Recipe::load(recipe_path)?;
     let submitted_by = current_user()?;
@@ -972,7 +976,10 @@ async fn run_recipe_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Re
     Ok(())
 }
 
-async fn run_sweep_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()> {
+async fn run_sweep_command(
+    cluster_path: &std::path::Path,
+    recipe_path: &std::path::Path,
+) -> Result<()> {
     let cluster = config::ClusterConfig::load(cluster_path)?;
     let recipe = config::Recipe::load(recipe_path)?;
     if recipe.sweep.is_none() {
@@ -984,7 +991,7 @@ async fn run_sweep_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Res
     let sweep = recipe.sweep.as_ref().unwrap();
     let n = (sweep.end as usize).saturating_sub(sweep.start as usize) + 1;
     let throttle_str = sweep.throttle.map(|t| format!("%{t}")).unwrap_or_default();
-    eprintln!(
+    tracing::info!(
         "submitting sweep: recipe={:?} arg={} range={}..={}{} ({} tasks){}",
         recipe.name,
         sweep.arg,
@@ -992,7 +999,11 @@ async fn run_sweep_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Res
         sweep.end,
         throttle_str,
         n,
-        if sweep.aggregate.is_some() { " + aggregate" } else { "" },
+        if sweep.aggregate.is_some() {
+            " + aggregate"
+        } else {
+            ""
+        },
     );
     let submitted_by = current_user()?;
     let store = store::Store::connect(&cluster).await?;
@@ -1011,7 +1022,10 @@ async fn run_sweep_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Res
     Ok(())
 }
 
-async fn run_pipeline_command(cluster_path: &PathBuf, pipeline_path: &PathBuf) -> Result<()> {
+async fn run_pipeline_command(
+    cluster_path: &std::path::Path,
+    pipeline_path: &std::path::Path,
+) -> Result<()> {
     let cluster = config::ClusterConfig::load(cluster_path)?;
     let loaded = config::Pipeline::load(pipeline_path)?;
     let submitted_by = current_user()?;
@@ -1045,6 +1059,21 @@ fn set_shared_umask() {
 #[cfg(not(unix))]
 fn set_shared_umask() {}
 
+/// Init the structured-logging subscriber. Reads `RUST_LOG` for
+/// per-target filtering; defaults to `info` so the agent/server units
+/// produce useful output out of the box. Writes to stderr, where
+/// systemd-journal picks them up. Idempotent on re-entry (subsequent
+/// calls become no-ops via `try_init`).
+fn init_tracing() {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .try_init();
+}
+
 /// Resolve `$USER` once. Required everywhere the CLI writes — the path-
 /// canonical layout records the invoker as a load-bearing path segment.
 fn current_user() -> Result<String> {
@@ -1059,10 +1088,10 @@ fn validate_path(path: &PathBuf) -> Result<()> {
     // Heuristic: routes to the right loader by content. We try pipeline first
     // (it's the most structured); if that fails to parse as a pipeline, try
     // policy, then recipe.
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
-    let raw: toml::Value = toml::from_str(&text)
-        .with_context(|| format!("invalid TOML in {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let raw: toml::Value =
+        toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
     let raw = raw
         .as_table()
         .with_context(|| format!("{} is not a TOML table", path.display()))?;
@@ -1104,7 +1133,11 @@ fn validate_path(path: &PathBuf) -> Result<()> {
                 s.start,
                 s.end,
                 (s.end as usize).saturating_sub(s.start as usize) + 1,
-                if s.aggregate.is_some() { " + aggregate" } else { "" },
+                if s.aggregate.is_some() {
+                    " + aggregate"
+                } else {
+                    ""
+                },
             ),
             None => String::new(),
         };

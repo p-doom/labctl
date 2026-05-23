@@ -52,7 +52,6 @@ pub fn string(label: &str, default: Option<&str>, mode: Mode) -> Result<String> 
     }
 }
 
-
 pub fn path(label: &str, default: Option<&str>, mode: Mode) -> Result<PathBuf> {
     let s = string(label, default, mode)?;
     Ok(PathBuf::from(s))

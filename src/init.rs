@@ -9,9 +9,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     config::{ClusterConfig, FilesystemConfig, SchedulerConfig, SlurmConfig},
-    fs_layout,
-    prompt,
-    service,
+    fs_layout, prompt, service,
 };
 
 #[derive(Debug, Clone)]
@@ -65,8 +63,9 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
 
     let mut cfg = match &init_mode {
         InitMode::Greenfield => skeleton_config(opts.name.as_deref()),
-        InitMode::Use(p) | InitMode::MigrateFrom(p) | InitMode::Join(p) => load_lax(p)
-            .with_context(|| format!("failed to load source config {}", p.display()))?,
+        InitMode::Use(p) | InitMode::MigrateFrom(p) | InitMode::Join(p) => {
+            load_lax(p).with_context(|| format!("failed to load source config {}", p.display()))?
+        }
     };
 
     // Use/Join trust the source's SLURM block; don't clobber it with a local probe.
@@ -83,7 +82,9 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
         cfg.filesystem.runs_base = rb.clone();
     }
     for (kind, path) in &opts.artifact_roots {
-        cfg.filesystem.artifact_roots.insert(kind.clone(), path.clone());
+        cfg.filesystem
+            .artifact_roots
+            .insert(kind.clone(), path.clone());
     }
     if let Some(group) = &opts.shared_group {
         fs_layout::validate_group(group)
@@ -106,7 +107,8 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
     let dest = pick_destination(&opts, &cfg, pmode)?;
 
     if dest.exists() && !opts.force {
-        let same_target = matches!(&init_mode, InitMode::Use(p) | InitMode::Join(p) if same_file(p, &dest));
+        let same_target =
+            matches!(&init_mode, InitMode::Use(p) | InitMode::Join(p) if same_file(p, &dest));
         if !same_target {
             match handle_existing(&dest, pmode)? {
                 ExistingAction::Keep => {
@@ -119,7 +121,10 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
                 }
             }
         } else {
-            println!("→ {} already points at the source; skipping write.", dest.display());
+            println!(
+                "→ {} already points at the source; skipping write.",
+                dest.display()
+            );
         }
     } else {
         write_or_link(&cfg, &dest, &init_mode, &opts)?;
@@ -132,11 +137,8 @@ pub fn run(mut opts: InitOptions) -> Result<()> {
 
     if !opts.no_agent {
         if service::systemd_available() {
-            let do_install = prompt::confirm(
-                "Install per-user agent (systemd user unit)?",
-                true,
-                pmode,
-            )?;
+            let do_install =
+                prompt::confirm("Install per-user agent (systemd user unit)?", true, pmode)?;
             if do_install {
                 install_agent_unit(&dest, opts.force)?;
             }
@@ -176,12 +178,12 @@ fn print_mode_line(mode: &InitMode) {
         InitMode::Greenfield => println!("mode: greenfield (writing a fresh config)\n"),
         InitMode::Use(p) => println!("mode: use {} (adopting an existing config)\n", p.display()),
         InitMode::MigrateFrom(p) => {
-            println!("mode: migrate-from {} (adapting to a new cluster)\n", p.display())
+            println!(
+                "mode: migrate-from {} (adapting to a new cluster)\n",
+                p.display()
+            )
         }
-        InitMode::Join(p) => println!(
-            "mode: join {} (joining a shared registry)\n",
-            p.display()
-        ),
+        InitMode::Join(p) => println!("mode: join {} (joining a shared registry)\n", p.display()),
     }
 }
 
@@ -233,11 +235,15 @@ fn slurm_probe() -> SlurmProbe {
                 .filter(|s| !s.is_empty())
                 .collect();
             if !parts.is_empty() {
-                probe.notes.push(format!("sinfo partitions: {}", parts.join(", ")));
+                probe
+                    .notes
+                    .push(format!("sinfo partitions: {}", parts.join(", ")));
                 probe.partition = Some(parts[0].clone());
             }
         }
-        Ok(_) => probe.notes.push("sinfo exited non-zero — skipped".to_string()),
+        Ok(_) => probe
+            .notes
+            .push("sinfo exited non-zero — skipped".to_string()),
         Err(_) => probe.notes.push("sinfo not on $PATH — skipped".to_string()),
     }
 
@@ -252,12 +258,18 @@ fn slurm_probe() -> SlurmProbe {
                 .filter(|s| !s.is_empty() && s != "normal")
                 .collect();
             if !qoss.is_empty() {
-                probe.notes.push(format!("sacctmgr QoS: {}", qoss.join(", ")));
+                probe
+                    .notes
+                    .push(format!("sacctmgr QoS: {}", qoss.join(", ")));
                 probe.qos = Some(qoss[0].clone());
             }
         }
-        Ok(_) => probe.notes.push("sacctmgr exited non-zero — skipped".to_string()),
-        Err(_) => probe.notes.push("sacctmgr not on $PATH — skipped".to_string()),
+        Ok(_) => probe
+            .notes
+            .push("sacctmgr exited non-zero — skipped".to_string()),
+        Err(_) => probe
+            .notes
+            .push("sacctmgr not on $PATH — skipped".to_string()),
     }
 
     match Command::new("scontrol").args(["show", "config"]).output() {
@@ -279,8 +291,12 @@ fn slurm_probe() -> SlurmProbe {
                 }
             }
         }
-        Ok(_) => probe.notes.push("scontrol exited non-zero — skipped".to_string()),
-        Err(_) => probe.notes.push("scontrol not on $PATH — skipped".to_string()),
+        Ok(_) => probe
+            .notes
+            .push("scontrol exited non-zero — skipped".to_string()),
+        Err(_) => probe
+            .notes
+            .push("scontrol not on $PATH — skipped".to_string()),
     }
 
     probe
@@ -423,10 +439,10 @@ fn pick_destination(
 }
 
 fn xdg_default() -> PathBuf {
-    if let Ok(x) = env::var("XDG_CONFIG_HOME") {
-        if !x.is_empty() {
-            return PathBuf::from(x).join("labctl").join("cluster.toml");
-        }
+    if let Ok(x) = env::var("XDG_CONFIG_HOME")
+        && !x.is_empty()
+    {
+        return PathBuf::from(x).join("labctl").join("cluster.toml");
     }
     let home = env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".config/labctl/cluster.toml")
@@ -441,7 +457,11 @@ enum ExistingAction {
 
 fn handle_existing(dest: &Path, mode: prompt::Mode) -> Result<ExistingAction> {
     println!("→ {} already exists.", dest.display());
-    let options = ["keep existing (skip write, continue to dirs/agent/doctor)", "replace", "abort"];
+    let options = [
+        "keep existing (skip write, continue to dirs/agent/doctor)",
+        "replace",
+        "abort",
+    ];
     let idx = prompt::choice("what now?", &options, 0, mode)?;
     Ok(match idx {
         0 => ExistingAction::Keep,
@@ -491,8 +511,7 @@ fn write_or_link(
                 _ => None,
             };
             let body = serialize_config(cfg, copied_from)?;
-            std::fs::write(dest, body)
-                .with_context(|| format!("write {}", dest.display()))?;
+            std::fs::write(dest, body).with_context(|| format!("write {}", dest.display()))?;
             println!("→ wrote {}", dest.display());
         }
     }
@@ -507,11 +526,10 @@ fn create_user_dirs(cfg: &ClusterConfig) -> Result<()> {
     // subdirs are created and rely on setgid for group inheritance.
     let mut roots: Vec<PathBuf> = Vec::new();
     roots.push(cfg.filesystem.runs_base.join("runs"));
-    for (_kind, root) in &cfg.filesystem.artifact_roots {
+    for root in cfg.filesystem.artifact_roots.values() {
         roots.push(root.clone());
     }
-    let mut user_subdirs: Vec<PathBuf> =
-        roots.iter().map(|r| r.join(&user)).collect();
+    let mut user_subdirs: Vec<PathBuf> = roots.iter().map(|r| r.join(&user)).collect();
     // Also create runs_base itself so the indexer doesn't have to deal
     // with first-run-nothing-exists. The roots loop covers
     // runs_base/runs but not runs_base, and runs_base needs the perms
@@ -523,12 +541,12 @@ fn create_user_dirs(cfg: &ClusterConfig) -> Result<()> {
     for root in &roots {
         match std::fs::create_dir_all(root) {
             Ok(()) => {
-                if let Some(group) = &cfg.filesystem.shared_group {
-                    if let Err(e) = fs_layout::apply_shared_perms(root, group) {
-                        println!("  ✗ {}: chmod/chgrp: {e:#}", root.display());
-                        failed.push((root.clone(), format!("{e:#}")));
-                        continue;
-                    }
+                if let Some(group) = &cfg.filesystem.shared_group
+                    && let Err(e) = fs_layout::apply_shared_perms(root, group)
+                {
+                    println!("  ✗ {}: chmod/chgrp: {e:#}", root.display());
+                    failed.push((root.clone(), format!("{e:#}")));
+                    continue;
                 }
                 println!("  ✓ {}", root.display());
                 created += 1;
@@ -591,7 +609,10 @@ fn reject_placeholders(cfg: &ClusterConfig) -> Result<()> {
     let mut issues: Vec<String> = Vec::new();
     let is_placeholder = |p: &Path| p.to_string_lossy().starts_with("/path/to/");
     if is_placeholder(&cfg.filesystem.runs_base) {
-        issues.push(format!("runs_base = {}", cfg.filesystem.runs_base.display()));
+        issues.push(format!(
+            "runs_base = {}",
+            cfg.filesystem.runs_base.display()
+        ));
     }
     for (kind, path) in &cfg.filesystem.artifact_roots {
         if is_placeholder(path) {
@@ -624,8 +645,8 @@ fn same_file(a: &Path, b: &Path) -> bool {
 fn load_lax(path: &Path) -> Result<ClusterConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let cfg: ClusterConfig = toml::from_str(&text)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let cfg: ClusterConfig =
+        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(cfg)
 }
 
@@ -634,8 +655,14 @@ fn skeleton_config(name: Option<&str>) -> ClusterConfig {
     // ClusterConfig::load (which bails on empty artifact_roots).
     let mut artifact_roots = BTreeMap::new();
     artifact_roots.insert("dataset".to_string(), PathBuf::from("/path/to/datasets"));
-    artifact_roots.insert("checkpoint".to_string(), PathBuf::from("/path/to/checkpoints"));
-    artifact_roots.insert("eval_result".to_string(), PathBuf::from("/path/to/eval_logs"));
+    artifact_roots.insert(
+        "checkpoint".to_string(),
+        PathBuf::from("/path/to/checkpoints"),
+    );
+    artifact_roots.insert(
+        "eval_result".to_string(),
+        PathBuf::from("/path/to/eval_logs"),
+    );
     ClusterConfig {
         name: name.unwrap_or("untitled").to_string(),
         filesystem: FilesystemConfig {
@@ -656,7 +683,10 @@ fn skeleton_config(name: Option<&str>) -> ClusterConfig {
 
 fn serialize_config(cfg: &ClusterConfig, copied_from: Option<&Path>) -> Result<String> {
     let header = match copied_from {
-        Some(p) => format!("# Adapted by `labctl init --migrate-from {}`.\n\n", p.display()),
+        Some(p) => format!(
+            "# Adapted by `labctl init --migrate-from {}`.\n\n",
+            p.display()
+        ),
         None => "# Generated by `labctl init`.\n\n".to_string(),
     };
     let body = toml::to_string_pretty(cfg).context("serialize cluster config")?;

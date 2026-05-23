@@ -67,7 +67,18 @@ pub async fn submit_recipe(
     submitted_by: &str,
 ) -> Result<SubmittedRun> {
     fs_layout::validate_user(submitted_by)?;
-    submit_recipe_inner(cluster, store, recipe, overrides, None, &[], None, submitted_by, None).await
+    submit_recipe_inner(
+        cluster,
+        store,
+        recipe,
+        overrides,
+        None,
+        &[],
+        None,
+        submitted_by,
+        None,
+    )
+    .await
 }
 
 #[derive(Debug, Clone)]
@@ -158,10 +169,10 @@ fn cache_hit_outputs_valid(
         if !art.path.exists() {
             return false;
         }
-        if let Some(m) = marker {
-            if !art.path.join(m).exists() {
-                return false;
-            }
+        if let Some(m) = marker
+            && !art.path.join(m).exists()
+        {
+            return false;
         }
     }
     !prior_outputs.is_empty()
@@ -169,7 +180,7 @@ fn cache_hit_outputs_valid(
 
 #[allow(clippy::too_many_arguments)]
 async fn register_cache_hit(
-    cluster: &ClusterConfig,
+    _cluster: &ClusterConfig,
     store: &Store,
     recipe: &Recipe,
     run_id: &str,
@@ -241,11 +252,6 @@ async fn register_cache_hit(
         .update_status(run_id, "cache_hit", Some(util::now_ts()))
         .await?;
 
-    // Optional: silence the unused-param warning when cluster isn't needed
-    // for cache-hit. Keeping the arg in the signature mirrors the regular
-    // path and leaves room for future per-cluster cache policies.
-    let _ = cluster;
-
     Ok(SubmittedRun {
         run_id: run_id.to_string(),
         job_id: String::new(),
@@ -300,6 +306,7 @@ fn key_outputs_by_role(
     Ok(by_role)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_recipe_inner(
     cluster: &ClusterConfig,
     store: &Store,
@@ -323,7 +330,8 @@ async fn submit_recipe_inner(
     fs::create_dir_all(&lab_dir)?;
 
     // Inputs first: alias templates may reference {inputs.X.path}.
-    let inputs = resolve_inputs(cluster, store, recipe, &overrides, stage_ctx, submitted_by).await?;
+    let inputs =
+        resolve_inputs(cluster, store, recipe, &overrides, stage_ctx, submitted_by).await?;
 
     // Render output aliases against a partial context (no outputs yet — they
     // are what we are computing). An alias that references {outputs.*} would
@@ -389,21 +397,21 @@ async fn submit_recipe_inner(
     // outputs, the marker lives one step deeper (under <stream>/<step>/<marker>),
     // so the top-level directory existing means nothing — let it through.
     for resolution in outputs.values() {
-        if resolution.kind != "checkpoint_stream" {
-            if let Some(m) = &resolution.marker {
-                let marker_path = resolution.path.join(m);
-                if marker_path.exists() {
-                    bail!(
-                        "output marker already present: {} (role={:?}, alias={:?}, kind={:?}) and \
+        if resolution.kind != "checkpoint_stream"
+            && let Some(m) = &resolution.marker
+        {
+            let marker_path = resolution.path.join(m);
+            if marker_path.exists() {
+                bail!(
+                    "output marker already present: {} (role={:?}, alias={:?}, kind={:?}) and \
                          no matching cache_key in registry. The path holds a stale artifact from a \
                          different recipe/input combination. Delete the path explicitly or template \
                          the alias with {{run.id}} for per-submission uniqueness.",
-                        marker_path.display(),
-                        resolution.role,
-                        resolution.alias,
-                        resolution.kind,
-                    );
-                }
+                    marker_path.display(),
+                    resolution.role,
+                    resolution.alias,
+                    resolution.kind,
+                );
             }
         }
         fs::create_dir_all(&resolution.path).with_context(|| {
@@ -487,7 +495,10 @@ async fn submit_recipe_inner(
     // Tracker row written at submission time. URL is fully derivable here
     // because we've forced WANDB_RUN_ID = labctl run id in the sbatch env.
     if let Some(wandb) = &recipe.tracking.wandb {
-        let url = format!("https://wandb.ai/{}/{}/runs/{}", wandb.entity, wandb.project, run_id);
+        let url = format!(
+            "https://wandb.ai/{}/{}/runs/{}",
+            wandb.entity, wandb.project, run_id
+        );
         store
             .set_tracking(
                 &run_id,
@@ -606,7 +617,7 @@ pub async fn submit_sweep(
             &agg_recipe,
             None,
             None,
-            &[array_run.job_id.clone()],
+            std::slice::from_ref(&array_run.job_id),
             None,
             submitted_by,
             None,
@@ -676,10 +687,7 @@ pub async fn submit_pipeline(
                 .collect::<Vec<_>>()
         });
 
-        let parents_ready = loaded
-            .parents
-            .iter()
-            .all(|p| materialised.contains(p));
+        let parents_ready = loaded.parents.iter().all(|p| materialised.contains(p));
         let preallocated = &stage_run_ids[stage_name];
 
         if parents_ready {
@@ -726,11 +734,8 @@ pub async fn submit_pipeline(
             // a placeholder; the agent's reconcile loop will pick it up
             // after the last parent reaches terminal-succeeded.
             let recipe_hash = util::sha256_bytes(&serde_json::to_vec(&loaded.recipe)?);
-            let run_dir = fs_layout::run_dir(
-                &cluster.filesystem.runs_base,
-                submitted_by,
-                preallocated,
-            );
+            let run_dir =
+                fs_layout::run_dir(&cluster.filesystem.runs_base, submitted_by, preallocated);
             let source_path = run_dir.join("source").join(&loaded.recipe.repo);
             store
                 .insert_pending_pipeline_stage(
@@ -793,7 +798,9 @@ pub async fn try_submit_pending_children(
     let mut advanced = 0usize;
     for child in candidates {
         if cascade_failure {
-            store.update_status(&child.id, "failed", parent.finished_at).await?;
+            store
+                .update_status(&child.id, "failed", parent.finished_at)
+                .await?;
             advanced += 1;
             continue;
         }
@@ -805,7 +812,11 @@ pub async fn try_submit_pending_children(
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|e| e.get("run_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .filter_map(|e| {
+                        e.get("run_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -823,12 +834,17 @@ pub async fn try_submit_pending_children(
         match complete_pending_submission(cluster, store, &child).await {
             Ok(()) => advanced += 1,
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "try_submit_pending_children: completing {} failed: {e:#}",
                     child.id
                 );
                 let now = crate::util::now_ts();
-                let _ = store.update_status(&child.id, "failed", Some(now)).await;
+                if let Err(e2) = store.update_status(&child.id, "failed", Some(now)).await {
+                    tracing::error!(
+                        "try_submit_pending_children: also failed to mark {} as failed: {e2:#}",
+                        child.id
+                    );
+                }
             }
         }
     }
@@ -876,7 +892,9 @@ async fn complete_pending_submission(
     // referenced as a parent of this child).
     let mut stages: BTreeMap<String, crate::config::LoadedStage> = BTreeMap::new();
     for s in &siblings {
-        let Some(name) = s.stage_name.clone() else { continue };
+        let Some(name) = s.stage_name.clone() else {
+            continue;
+        };
         let Ok(sr): std::result::Result<Recipe, _> = serde_json::from_value(s.recipe_json.clone())
         else {
             continue;
@@ -938,12 +956,25 @@ pub async fn reconcile_one(
     }
     let current = store.get_run(&run.id).await?;
     step.artifacts_registered += register_outputs(store, &current).await?;
-    let _ = crate::tracking::try_populate_from_log(store, &current).await;
+    // Best-effort: a broken log parser or missing log file shouldn't
+    // fail reconcile, but the error should surface so we can fix it.
+    if let Err(e) = crate::tracking::try_populate_from_log(store, &current).await {
+        tracing::warn!(
+            run_id = %current.id,
+            "tracking: try_populate_from_log failed: {e:#}",
+        );
+    }
     // Agent-driven cascade: if this run just reached a terminal state,
     // sweep its pending dependent stages and either advance (succeeded /
     // cache_hit) or cascade-fail them.
-    if step.status_changed && crate::store::is_terminal(&current.status) {
-        let _ = try_submit_pending_children(cluster, store, &current).await;
+    if step.status_changed
+        && crate::store::is_terminal(&current.status)
+        && let Err(e) = try_submit_pending_children(cluster, store, &current).await
+    {
+        tracing::error!(
+            parent_run_id = %current.id,
+            "reconcile cascade: try_submit_pending_children failed: {e:#}",
+        );
     }
     Ok(step)
 }
@@ -977,7 +1008,7 @@ pub async fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<Reconci
         .await?
     {
         if let Err(e) = try_submit_pending_children(cluster, store, &parent).await {
-            eprintln!("reconcile: orphan sweep for {} failed: {e:#}", parent.id);
+            tracing::error!("reconcile: orphan sweep for {} failed: {e:#}", parent.id);
         }
     }
     Ok(ReconcileReport {
@@ -985,7 +1016,6 @@ pub async fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<Reconci
         artifacts_registered,
     })
 }
-
 
 pub async fn gc(
     _cluster: &ClusterConfig,
@@ -1022,9 +1052,10 @@ pub async fn gc_orphan_run_dirs(
         // Missing dir on a fresh deployment is fine; no orphans by
         // definition.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e).with_context(|| {
-            format!("gc_orphan_run_dirs: read_dir {}", user_root.display())
-        }),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("gc_orphan_run_dirs: read_dir {}", user_root.display()));
+        }
     };
 
     let now_sys = std::time::SystemTime::now();
@@ -1038,7 +1069,11 @@ pub async fn gc_orphan_run_dirs(
         }
         // The run-id is the directory name; if the name isn't UTF-8
         // it can't be a labctl-created run-dir, leave alone.
-        let Some(run_id) = path.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+        let Some(run_id) = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         if store.get_run_optional(&run_id).await?.is_some() {
@@ -1054,9 +1089,9 @@ pub async fn gc_orphan_run_dirs(
         if age < min_age {
             continue;
         }
-        tokio::fs::remove_dir_all(&path).await.with_context(|| {
-            format!("gc_orphan_run_dirs: remove_dir_all {}", path.display())
-        })?;
+        tokio::fs::remove_dir_all(&path)
+            .await
+            .with_context(|| format!("gc_orphan_run_dirs: remove_dir_all {}", path.display()))?;
         removed += 1;
     }
     Ok(removed)
@@ -1168,23 +1203,24 @@ async fn resolve_inputs(
                     format!("input {role:?} references stage {stage:?} not in pipeline")
                 })?;
                 let parent_spec =
-                    parent_loaded.recipe.outputs.get(parent_role).with_context(|| {
-                        format!(
-                            "input {role:?} references {stage:?}.{parent_role:?}, but \
+                    parent_loaded
+                        .recipe
+                        .outputs
+                        .get(parent_role)
+                        .with_context(|| {
+                            format!(
+                                "input {role:?} references {stage:?}.{parent_role:?}, but \
                              stage {stage:?} declares no such output"
-                        )
-                    })?;
+                            )
+                        })?;
                 // Render the parent's alias against a partial context bound to
                 // the parent's run_id and params. Aliases must not reference
                 // {inputs.*}/{outputs.*} — render_value will bail if they do.
                 // The parent stage is owned by the same submitter (one CLI
                 // invocation submits the whole pipeline), so its run dir
                 // and artifacts live under the same per-user prefix.
-                let parent_run_dir = fs_layout::run_dir(
-                    &cluster.filesystem.runs_base,
-                    submitted_by,
-                    parent_run_id,
-                );
+                let parent_run_dir =
+                    fs_layout::run_dir(&cluster.filesystem.runs_base, submitted_by, parent_run_id);
                 let empty_inputs: Vec<InputResolution> = Vec::new();
                 let empty_outputs: BTreeMap<String, PathBuf> = BTreeMap::new();
                 let parent_ctx = RenderContext {
@@ -1195,16 +1231,17 @@ async fn resolve_inputs(
                     outputs: &empty_outputs,
                 };
                 let parent_alias = render_value(&parent_spec.alias, &parent_ctx)?;
-                let parent_root =
-                    cluster.filesystem.output_roots.get(&parent_spec.kind).with_context(
-                        || {
-                            format!(
-                                "stage {stage:?}.{parent_role:?} has kind {:?} which is \
+                let parent_root = cluster
+                    .filesystem
+                    .output_roots
+                    .get(&parent_spec.kind)
+                    .with_context(|| {
+                        format!(
+                            "stage {stage:?}.{parent_role:?} has kind {:?} which is \
                                  not configured in [filesystem.output_roots]",
-                                parent_spec.kind,
-                            )
-                        },
-                    )?;
+                            parent_spec.kind,
+                        )
+                    })?;
                 // If the upstream stage has already linked its output for
                 // `parent_role` (cache-hit / cache-hit-by-coalesce satisfied
                 // during the same submit_pipeline topo walk), wire the
@@ -1217,8 +1254,9 @@ async fn resolve_inputs(
                 // Store::insert_artifact at normal completion, or
                 // Store::copy_run_outputs → backfill_stage_consumers on
                 // cache-hit / coalesced-follower).
-                let artifact_id =
-                    store.run_output_artifact_id(parent_run_id, parent_role).await?;
+                let artifact_id = store
+                    .run_output_artifact_id(parent_run_id, parent_role)
+                    .await?;
                 let resolved_path = match &artifact_id {
                     Some(aid) => store.get_artifact(aid).await?.path,
                     None => fs_layout::artifact_dir(parent_root, submitted_by, &parent_alias),
@@ -1275,6 +1313,7 @@ fn output_paths(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_script(
     cluster: &ClusterConfig,
     recipe: &Recipe,
@@ -1474,9 +1513,7 @@ fn render_script(
         util::shell_quote(&source_path.display().to_string())
     ));
     script.push_str(&rendered_command);
-    script.push_str(
-        "\nrc=$?\n",
-    );
+    script.push_str("\nrc=$?\n");
     script.push_str("exit \"$rc\"\n");
     // sacct is the sole source of truth for job state; bash wrapper exits
     // with the user command's rc and SLURM/sacct records the outcome.
@@ -1566,7 +1603,9 @@ async fn scheduler_outcome(
     let mut latest_end: Option<i64> = None;
     for line in stdout.lines() {
         let mut parts = line.split('|');
-        let Some(state_field) = parts.next() else { continue };
+        let Some(state_field) = parts.next() else {
+            continue;
+        };
         let state = state_field.split_whitespace().next().unwrap_or("").trim();
         let end_field = parts.next().unwrap_or("").trim();
         let status = map_slurm_state(state);
@@ -1576,7 +1615,10 @@ async fn scheduler_outcome(
         best = Some(match (best.as_deref(), status.as_str()) {
             // Failure is terminal — short-circuit once seen.
             (_, "failed" | "timeout" | "oom" | "cancelled" | "unknown_terminal") => {
-                return Some(SchedulerOutcome { status, finished_at: latest_end });
+                return Some(SchedulerOutcome {
+                    status,
+                    finished_at: latest_end,
+                });
             }
             (None, _) => status,
             (Some("running"), _) => "running".to_string(),
@@ -1588,7 +1630,10 @@ async fn scheduler_outcome(
         });
     }
     let status = best?;
-    Some(SchedulerOutcome { status, finished_at: latest_end })
+    Some(SchedulerOutcome {
+        status,
+        finished_at: latest_end,
+    })
 }
 
 fn parse_sacct_end_utc(s: &str) -> Option<i64> {
@@ -1666,9 +1711,10 @@ async fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<u
                     Some(n) => n,
                     None => continue,
                 };
-                let marker = resolution.marker.as_deref().expect(
-                    "checkpoint_stream marker is validated in OutputSpec",
-                );
+                let marker = resolution
+                    .marker
+                    .as_deref()
+                    .expect("checkpoint_stream marker is validated in OutputSpec");
                 if !step_dir.join(marker).exists() {
                     continue;
                 }
@@ -1680,7 +1726,8 @@ async fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<u
                 // canonically — so an existing row at this path would
                 // satisfy a fresh insert too, but skipping avoids the
                 // PG round-trip.
-                if let Some(existing) = store.find_artifact_by_path("checkpoint", &step_dir).await? {
+                if let Some(existing) = store.find_artifact_by_path("checkpoint", &step_dir).await?
+                {
                     store.link_run_output(&run.id, role, &existing.id).await?;
                     continue;
                 }
@@ -1715,21 +1762,15 @@ async fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<u
             });
             if let Some(m) = &resolution.marker {
                 metadata["marker"] = json!(m);
-                if resolution.kind == "eval_result" {
-                    if let Ok(text) = fs::read_to_string(resolution.path.join(m)) {
-                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            metadata["result"] = value;
-                        }
-                    }
+                if resolution.kind == "eval_result"
+                    && let Ok(text) = fs::read_to_string(resolution.path.join(m))
+                    && let Ok(value) = serde_json::from_str::<Value>(&text)
+                {
+                    metadata["result"] = value;
                 }
             }
             let artifact = store
-                .insert_artifact(
-                    &resolution.kind,
-                    &resolution.path,
-                    Some(&run.id),
-                    &metadata,
-                )
+                .insert_artifact(&resolution.kind, &resolution.path, Some(&run.id), &metadata)
                 .await?;
             store.link_run_output(&run.id, role, &artifact.id).await?;
             store.set_alias(&resolution.alias, &artifact.id).await?;
@@ -1749,7 +1790,11 @@ async fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<u
 /// parse it as a u64. Returns None when the name has no trailing digits.
 /// See the call site in `register_outputs` for accepted naming conventions.
 fn parse_trailing_step(name: &str) -> Option<u64> {
-    let suffix_len = name.bytes().rev().take_while(|b| b.is_ascii_digit()).count();
+    let suffix_len = name
+        .bytes()
+        .rev()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
     if suffix_len == 0 {
         return None;
     }

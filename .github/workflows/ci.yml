@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  # rustflags pin used by sqlx (cache-friendly).
+  CARGO_TERM_COLOR: always
+  # Speed: drop incremental + debuginfo we don't need on CI.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-test:
+    name: cargo build + test + clippy + fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel; rustup honours it.
+      - name: rustc version
+        run: rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build both feature sets so the UI bundle's RustEmbed macro is
+      # exercised (with a stub ui/dist/ so the macro is satisfied; the
+      # real bundle is built only in release jobs).
+      - name: stub ui/dist
+        run: mkdir -p ui/dist && touch ui/dist/.placeholder
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (default)
+        run: cargo clippy --no-deps -- -D warnings
+
+      - name: cargo clippy (ui)
+        run: cargo clippy --no-deps --features ui -- -D warnings
+
+      - name: cargo build (default)
+        run: cargo build --locked
+
+      - name: cargo build (ui)
+        run: cargo build --locked --features ui
+
+      - name: cargo test (offline)
+        run: cargo test --locked

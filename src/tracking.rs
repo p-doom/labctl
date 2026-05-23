@@ -81,7 +81,7 @@ fn scan_log_for_wandb_url(log_path: &Path) -> Option<String> {
         let end = after
             .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '<'))
             .unwrap_or(after.len());
-        let url = after[..end].trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | ']'));
+        let url = after[..end].trim_end_matches(['.', ',', ';', ':', ']']);
         if url.contains("/runs/") {
             return Some(url.to_string());
         }
@@ -121,7 +121,8 @@ mod tests {
 
     #[test]
     fn extracts_url_from_banner() {
-        let log = "wandb: \u{1f680} View run at https://wandb.ai/foo/bar/runs/xyz789\nrest of log\n";
+        let log =
+            "wandb: \u{1f680} View run at https://wandb.ai/foo/bar/runs/xyz789\nrest of log\n";
         // round-trip via a temp file
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), log).unwrap();

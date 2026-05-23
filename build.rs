@@ -7,9 +7,9 @@ fn main() {
         .output()
         .ok()
         .and_then(|o| {
-            o.status.success().then(|| {
-                String::from_utf8_lossy(&o.stdout).trim().to_string()
-            })
+            o.status
+                .success()
+                .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());

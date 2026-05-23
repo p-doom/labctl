@@ -120,21 +120,24 @@ pub fn install(opts: InstallOptions) -> Result<()> {
     }
     std::fs::write(&unit_path, unit)
         .with_context(|| format!("failed to write {}", unit_path.display()))?;
-    eprintln!("wrote {}", unit_path.display());
+    tracing::info!("wrote {}", unit_path.display());
 
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&["enable", "--now", unit_name])?;
 
     if !linger_enabled() {
-        eprintln!(
+        tracing::info!(
             "warning: linger is not enabled for $USER. The unit will stop when you log out.\n\
              Run `loginctl enable-linger $USER` (may require sudo on some sites) to keep it alive across sessions."
         );
     }
 
-    eprintln!(
+    tracing::info!(
         "\nlabctl service installed and started.\n  status:  systemctl --user status {unit_name}\n  logs:    journalctl --user -u {unit_name} -f\n  stop:    systemctl --user stop {unit_name}\n  remove:  labctl service uninstall {flag}",
-        flag = match opts.mode { UnitMode::Agent => "--agent", UnitMode::Ui { .. } => "--ui" },
+        flag = match opts.mode {
+            UnitMode::Agent => "--agent",
+            UnitMode::Ui { .. } => "--ui",
+        },
     );
     Ok(())
 }
@@ -149,9 +152,9 @@ pub fn uninstall(unit_name: &str) -> Result<()> {
     if unit_path.exists() {
         std::fs::remove_file(&unit_path)
             .with_context(|| format!("failed to remove {}", unit_path.display()))?;
-        eprintln!("removed {}", unit_path.display());
+        tracing::info!("removed {}", unit_path.display());
     } else {
-        eprintln!("no unit file at {} (already removed)", unit_path.display());
+        tracing::warn!("no unit file at {} (already removed)", unit_path.display());
     }
     let _ = run_systemctl(&["daemon-reload"]);
     Ok(())
@@ -170,7 +173,7 @@ pub fn restart(unit_names: &[&str]) -> Result<()> {
     let mut args: Vec<&str> = vec!["restart"];
     args.extend_from_slice(unit_names);
     run_systemctl(&args)?;
-    eprintln!("restarted: {}", unit_names.join(", "));
+    tracing::info!("restarted: {}", unit_names.join(", "));
     Ok(())
 }
 
@@ -255,9 +258,7 @@ fn linger_enabled() -> bool {
         .args(["show-user", &user, "-p", "Linger", "--value"])
         .output();
     match out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim() == "yes"
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "yes",
         _ => false,
     }
 }
@@ -310,9 +311,11 @@ mod tests {
             &PathBuf::from("/etc/labctl/cluster.toml"),
             &UnitMode::Agent,
         );
-        assert!(unit.contains(
-            "ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml agent"
-        ));
+        assert!(
+            unit.contains(
+                "ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml agent"
+            )
+        );
         assert!(!unit.contains("--bind"));
         assert!(!unit.contains("serve"));
         assert!(unit.contains("labctl (labctl-agent)"));
@@ -324,7 +327,9 @@ mod tests {
         let unit = render_unit(
             &PathBuf::from("/usr/local/bin/labctl"),
             &PathBuf::from("/etc/labctl/cluster.toml"),
-            &UnitMode::Ui { bind: "127.0.0.1:8765".to_string() },
+            &UnitMode::Ui {
+                bind: "127.0.0.1:8765".to_string(),
+            },
         );
         assert!(unit.contains(
             "ExecStart=/usr/local/bin/labctl --cluster /etc/labctl/cluster.toml serve --bind 127.0.0.1:8765"

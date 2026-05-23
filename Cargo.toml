@@ -39,7 +39,13 @@ sha2 = "0.10"
 # tokio is the runtime for the agent loops (reconcile/evald/throttle)
 # and for the optional UI server. Always built — the size penalty is
 # trivial relative to the rest, and gating it makes feature math messy.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "fs"] }
+# Structured logging. `tracing` for the call sites; `tracing-subscriber`'s
+# `EnvFilter` lets operators tune verbosity via `RUST_LOG` at unit-file
+# scope without recompiling. `fmt` is the systemd-journal-friendly text
+# emitter (one line per record, level + target + message + fields).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 toml = "0.8"
 uuid = { version = "1.11", features = ["v7", "serde"] }
 walkdir = "2.5"

@@ -67,7 +67,11 @@ fn run_init_in_tempdir(args: &[&str]) -> (tempfile::TempDir, PathBuf) {
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr),
     );
-    assert!(out.exists() || out.is_symlink(), "init didn't create {}", out.display());
+    assert!(
+        out.exists() || out.is_symlink(),
+        "init didn't create {}",
+        out.display()
+    );
     (tmp, out)
 }
 
@@ -77,8 +81,10 @@ fn run_init_in_tempdir(args: &[&str]) -> (tempfile::TempDir, PathBuf) {
 fn write_fixture_cluster(tmp: &tempfile::TempDir) -> PathBuf {
     let path = tmp.path().join("source-cluster.toml");
     let root = tmp.path().display();
-    std::fs::write(&path, format!(
-        r#"name = "fixture"
+    std::fs::write(
+        &path,
+        format!(
+            r#"name = "fixture"
 
 [filesystem]
 runs_base = "{root}/runs"
@@ -91,7 +97,9 @@ eval_result = "{root}/eval_logs"
 [scheduler]
 kind = "slurm"
 "#
-    )).unwrap();
+        ),
+    )
+    .unwrap();
     path
 }
 
@@ -197,7 +205,10 @@ fn labctl_init_use_copy_config_creates_regular_file() {
         ])
         .output()
         .expect("invoke labctl init --use --copy-config");
-    assert!(result.status.success(), "labctl init --use --copy-config failed");
+    assert!(
+        result.status.success(),
+        "labctl init --use --copy-config failed"
+    );
     let meta = std::fs::symlink_metadata(&out).expect("symlink_metadata");
     assert!(
         meta.file_type().is_file() && !meta.file_type().is_symlink(),

@@ -4,7 +4,6 @@ use serde_json::Value;
 
 use crate::{
     config::{ClusterConfig, EvalPolicy, Recipe},
-    fs_layout,
     runner::{self, SubmitOverrides},
     store::{ArtifactRow, EvalRequestSlot, Store},
     util,
@@ -40,13 +39,11 @@ pub async fn run_once(
 ) -> Result<EvaldReport> {
     let recipe = Recipe::load(&policy.recipe)?;
     let recipe_hash = util::sha256_bytes(&serde_json::to_vec(&recipe)?);
-    // Eval submissions are owned by the OS user the agent runs as. The
-    // path-canonical layout requires a real `$USER`; a sentinel like
-    // "evald" would not validate.
-    let submitted_by = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .map_err(|_| anyhow::anyhow!("USER not set; cannot run evald"))?;
-    fs_layout::validate_user(&submitted_by)?;
+    // Eval submissions are owned by the OS user the agent runs as.
+    // `current_user()` enforces a real validated $USER — every PG
+    // write attributes ownership and there are no acceptable
+    // fallbacks.
+    let submitted_by = crate::store::current_user()?;
     // Scope candidates to checkpoints produced by this daemon's own
     // user. In a multi-tenant deployment (one daemon per user, shared
     // filesystem-truth registry) each evald must only dispatch evals
@@ -75,17 +72,22 @@ pub async fn run_once(
         let eval_key = util::sha256_bytes(
             format!("{}:{}:{}", checkpoint.id, recipe_hash, policy.name).as_bytes(),
         );
-        let slot = store.eval_request_status(&eval_key, MAX_EVAL_ATTEMPTS).await?;
+        let slot = store
+            .eval_request_status(&eval_key, MAX_EVAL_ATTEMPTS)
+            .await?;
         match slot {
             EvalRequestSlot::Active => {
                 report.skipped_existing += 1;
                 continue;
             }
             EvalRequestSlot::Exhausted { attempts } => {
-                eprintln!(
+                tracing::warn!(
                     "[evald] policy={} checkpoint={} retries exhausted ({}/{}), \
                      skipping. Clear the eval_request row to retry manually.",
-                    policy.name, checkpoint.id, attempts, MAX_EVAL_ATTEMPTS,
+                    policy.name,
+                    checkpoint.id,
+                    attempts,
+                    MAX_EVAL_ATTEMPTS,
                 );
                 report.skipped_exhausted += 1;
                 continue;
@@ -105,14 +107,8 @@ pub async fn run_once(
         overrides
             .input_artifacts
             .insert("checkpoint".to_string(), checkpoint.id.clone());
-        let submitted = runner::submit_recipe(
-            cluster,
-            store,
-            &recipe,
-            Some(overrides),
-            &submitted_by,
-        )
-        .await?;
+        let submitted =
+            runner::submit_recipe(cluster, store, &recipe, Some(overrides), &submitted_by).await?;
         let claimed = match &slot {
             EvalRequestSlot::Fresh => {
                 store
@@ -134,12 +130,7 @@ pub async fn run_once(
                     )
                 })?;
                 store
-                    .claim_eval_slot_retry(
-                        &eval_key,
-                        prior,
-                        *previous_attempts,
-                        &submitted.run_id,
-                    )
+                    .claim_eval_slot_retry(&eval_key, prior, *previous_attempts, &submitted.run_id)
                     .await?
             }
             EvalRequestSlot::Active | EvalRequestSlot::Exhausted { .. } => unreachable!(),

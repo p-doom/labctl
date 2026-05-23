@@ -374,13 +374,12 @@ impl Recipe {
         let mut recipe: Self = toml::from_str(&text)
             .with_context(|| format!("failed to parse recipe {}", path.display()))?;
         // Resolve sweep.aggregate relative to the recipe file's parent dir.
-        if let Some(sweep) = recipe.sweep.as_mut() {
-            if let Some(agg) = sweep.aggregate.as_mut() {
-                if agg.is_relative() {
-                    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-                    *agg = parent.join(&*agg);
-                }
-            }
+        if let Some(sweep) = recipe.sweep.as_mut()
+            && let Some(agg) = sweep.aggregate.as_mut()
+            && agg.is_relative()
+        {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            *agg = parent.join(&*agg);
         }
         recipe.validate()?;
         Ok(recipe)
@@ -403,7 +402,9 @@ impl Recipe {
             if sweep.end < sweep.start {
                 bail!(
                     "recipe {:?}: [sweep].end ({}) must be >= start ({})",
-                    self.name, sweep.end, sweep.start,
+                    self.name,
+                    sweep.end,
+                    sweep.start,
                 );
             }
         }
@@ -413,10 +414,16 @@ impl Recipe {
             }
             match &spec.marker {
                 Some(m) if m.trim().is_empty() => {
-                    bail!("recipe {:?}: output {role:?} has empty marker (omit the field to gate on job success)", self.name);
+                    bail!(
+                        "recipe {:?}: output {role:?} has empty marker (omit the field to gate on job success)",
+                        self.name
+                    );
                 }
                 None if spec.kind == "checkpoint_stream" => {
-                    bail!("recipe {:?}: output {role:?} (kind=checkpoint_stream) requires a marker", self.name);
+                    bail!(
+                        "recipe {:?}: output {role:?} (kind=checkpoint_stream) requires a marker",
+                        self.name
+                    );
                 }
                 _ => {}
             }
@@ -424,16 +431,23 @@ impl Recipe {
                 bail!(
                     "recipe {:?}: output {role:?} requires a non-empty alias \
                      (path resolves to output_roots[{:?}] / <alias>)",
-                    self.name, spec.kind,
+                    self.name,
+                    spec.kind,
                 );
             }
         }
         if let Some(w) = &self.tracking.wandb {
             if w.entity.trim().is_empty() {
-                bail!("recipe {:?}: tracking.wandb.entity must not be empty", self.name);
+                bail!(
+                    "recipe {:?}: tracking.wandb.entity must not be empty",
+                    self.name
+                );
             }
             if w.project.trim().is_empty() {
-                bail!("recipe {:?}: tracking.wandb.project must not be empty", self.name);
+                bail!(
+                    "recipe {:?}: tracking.wandb.project must not be empty",
+                    self.name
+                );
             }
         }
         Ok(())
@@ -485,16 +499,25 @@ impl Default for Resources {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputSpec {
-    Artifact { artifact: String },
-    External { path: PathBuf },
+    Artifact {
+        artifact: String,
+    },
+    External {
+        path: PathBuf,
+    },
     Checkpoint,
-    Stage { stage: String, role: String },
+    Stage {
+        stage: String,
+        role: String,
+    },
     /// Resolved against the pipeline's ``from`` historical pin. The role
     /// names an output that the pinned run produced. Validation that the
     /// role actually exists in the pinned run happens at submit time
     /// (needs the registry); load-time validation only checks that the
     /// containing pipeline declares a ``from`` field at all.
-    From { role: String },
+    From {
+        role: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -573,7 +596,10 @@ impl Pipeline {
                 parent_dir.join(&stage.recipe)
             };
             let recipe = Recipe::load(&recipe_path).with_context(|| {
-                format!("pipeline.stages.{stage_name} failed to load {}", recipe_path.display())
+                format!(
+                    "pipeline.stages.{stage_name} failed to load {}",
+                    recipe_path.display()
+                )
             })?;
             stages.insert(
                 stage_name.clone(),
@@ -592,7 +618,10 @@ impl Pipeline {
         for (stage_name, loaded) in stages.clone() {
             for (role, spec) in &loaded.recipe.inputs {
                 match spec {
-                    InputSpec::Stage { stage: parent, role: parent_role } => {
+                    InputSpec::Stage {
+                        stage: parent,
+                        role: parent_role,
+                    } => {
                         if !stages.contains_key(parent) {
                             bail!(
                                 "pipeline.stages.{stage_name}.inputs.{role} references \
@@ -608,7 +637,11 @@ impl Pipeline {
                                 parent_stage.recipe.name
                             );
                         }
-                        stages.get_mut(&stage_name).unwrap().parents.push(parent.clone());
+                        stages
+                            .get_mut(&stage_name)
+                            .unwrap()
+                            .parents
+                            .push(parent.clone());
                     }
                     InputSpec::From { .. } => {
                         if pipeline.from.is_none() {
@@ -637,8 +670,7 @@ impl Pipeline {
 }
 
 fn topo_sort(stages: &BTreeMap<String, LoadedStage>) -> Result<Vec<String>> {
-    let mut indegree: BTreeMap<String, usize> =
-        stages.keys().map(|k| (k.clone(), 0)).collect();
+    let mut indegree: BTreeMap<String, usize> = stages.keys().map(|k| (k.clone(), 0)).collect();
     let mut adj: BTreeMap<String, Vec<String>> =
         stages.keys().map(|k| (k.clone(), Vec::new())).collect();
     for (name, stage) in stages {
@@ -651,7 +683,8 @@ fn topo_sort(stages: &BTreeMap<String, LoadedStage>) -> Result<Vec<String>> {
     // BTreeSet for deterministic ordering: ties broken by stage name.
     let mut frontier: std::collections::BTreeSet<String> = indegree
         .iter()
-        .filter_map(|(k, &d)| (d == 0).then(|| k.clone()))
+        .filter(|&(_, &d)| d == 0)
+        .map(|(k, _)| k.clone())
         .collect();
     while let Some(node) = frontier.iter().next().cloned() {
         frontier.remove(&node);

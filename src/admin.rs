@@ -21,12 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::{
-    config::ClusterConfig,
-    fs_layout,
-    store::Store,
-    util,
-};
+use crate::{config::ClusterConfig, fs_layout, store::Store, util};
 
 #[derive(Debug, Serialize)]
 pub struct AddUserReport {
@@ -104,8 +99,10 @@ fn validate_admin_name(name: &str) -> Result<()> {
 /// perms (from `[filesystem].shared_group`) are applied to any newly-
 /// created leaf so peer users can read across the tree.
 fn create_user_dirs(cluster: &ClusterConfig, name: &str) -> Result<Vec<PathBuf>> {
-    let mut targets: Vec<PathBuf> =
-        vec![fs_layout::user_runs_dir(&cluster.filesystem.runs_base, name)];
+    let mut targets: Vec<PathBuf> = vec![fs_layout::user_runs_dir(
+        &cluster.filesystem.runs_base,
+        name,
+    )];
     for root in cluster.filesystem.artifact_roots.values() {
         targets.push(root.join(name));
     }
@@ -121,12 +118,10 @@ fn create_user_dirs(cluster: &ClusterConfig, name: &str) -> Result<Vec<PathBuf>>
 }
 
 fn ensure_dir(path: &Path, shared_group: Option<&str>) -> Result<()> {
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("create_dir_all {}", path.display()))?;
+    std::fs::create_dir_all(path).with_context(|| format!("create_dir_all {}", path.display()))?;
     if let Some(group) = shared_group {
-        fs_layout::apply_shared_perms(path, group).with_context(|| {
-            format!("apply shared-group perms ({group}) to {}", path.display())
-        })?;
+        fs_layout::apply_shared_perms(path, group)
+            .with_context(|| format!("apply shared-group perms ({group}) to {}", path.display()))?;
     }
     Ok(())
 }

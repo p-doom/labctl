@@ -63,8 +63,13 @@ struct AppState {
     /// frame_index → absolute_path so the frame endpoint can serve from
     /// that path without re-parsing chat_line.json per request. Key
     /// shape: "<artifact_id>::<split>::<seg>".
-    segment_frames_cache: Arc<Mutex<HashMap<String, Arc<HashMap<u32, PathBuf>>>>>,
+    segment_frames_cache: SegmentFramesCache,
 }
+
+/// `"<artifact_id>::<split>::<seg>"` → `frame_index → absolute_path`.
+/// Pulled into a type alias so clippy stops complaining about the
+/// nested generics on `AppState`.
+type SegmentFramesCache = Arc<Mutex<HashMap<String, Arc<HashMap<u32, PathBuf>>>>>;
 
 /// Outbound SSE message. Kept tiny — just enough for the client cache to
 /// know which entry to invalidate. Detail comes from a follow-up REST call,
@@ -128,16 +133,17 @@ pub async fn serve(cluster: ClusterConfig, pg: Arc<PgStore>, addr: SocketAddr) -
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    // SSE tailer subscribes to LISTEN labctl_events (the trigger on
-    // `events` in migration 0001 fires pg_notify per insert). On
-    // listener-connection error the supervisor reconnects after a
-    // brief backoff — there is no silent fall-through to polling.
+    // SSE tailer subscribes to LISTEN labctl_events (the trigger
+    // declared in migrations/0001_initial_schema.sql fires pg_notify
+    // per insert). On listener-connection error the supervisor
+    // reconnects after a brief backoff — there is no silent
+    // fall-through to polling.
     tokio::spawn(events_tailer(tail_pg, events_tx));
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
-    eprintln!("labctl listening on http://{addr}");
+    tracing::info!("labctl listening on http://{addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -161,7 +167,7 @@ async fn events_tailer(pg: Arc<PgStore>, tx: broadcast::Sender<StreamEvent>) {
                 return;
             }
             Err(e) => {
-                eprintln!(
+                tracing::info!(
                     "events_tailer: listener disconnected: {e:#}; \
                      reconnecting in 2s"
                 );
@@ -171,10 +177,7 @@ async fn events_tailer(pg: Arc<PgStore>, tx: broadcast::Sender<StreamEvent>) {
     }
 }
 
-async fn run_events_listener(
-    pg: &PgStore,
-    tx: &broadcast::Sender<StreamEvent>,
-) -> Result<()> {
+async fn run_events_listener(pg: &PgStore, tx: &broadcast::Sender<StreamEvent>) -> Result<()> {
     let mut listener = PgListener::connect_with(pg.pool())
         .await
         .context("PgListener::connect_with failed")?;
@@ -221,13 +224,22 @@ async fn run_events_listener(
 /// internal `event_type` strings drift.
 fn translate_event(ev: &crate::store::EventRow) -> Option<StreamEvent> {
     match ev.event_type.as_str() {
-        "run_created" => ev.run_id.clone().map(|id| StreamEvent { kind: "run.created", id }),
+        "run_created" => ev.run_id.clone().map(|id| StreamEvent {
+            kind: "run.created",
+            id,
+        }),
         "run_submitted" | "run_status" | "stage_cache_hit" => {
-            ev.run_id.clone().map(|id| StreamEvent { kind: "run.updated", id })
+            ev.run_id.clone().map(|id| StreamEvent {
+                kind: "run.updated",
+                id,
+            })
         }
         "artifact_registered" => {
             let artifact_id = ev.payload.get("artifact_id")?.as_str()?.to_string();
-            Some(StreamEvent { kind: "artifact.created", id: artifact_id })
+            Some(StreamEvent {
+                kind: "artifact.created",
+                id: artifact_id,
+            })
         }
         _ => None,
     }
@@ -238,9 +250,17 @@ async fn stream_handler(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.events_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|res| async move {
-        // Lagged subscribers get a Lagged error from the broadcast stream.
-        // Clients should resync on next focus — we just drop the lag here.
-        let ev = res.ok()?;
+        // Lagged subscribers receive a `Lagged(n)` error from the
+        // broadcast stream when they fall behind the channel's capacity.
+        // Surface it at warn so an overwhelmed listener is visible in
+        // the logs; clients resync via REST on next focus.
+        let ev = match res {
+            Ok(e) => e,
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                tracing::warn!(dropped = n, "SSE subscriber lagged; events dropped");
+                return None;
+            }
+        };
         let payload = serde_json::to_string(&json!({ "id": ev.id })).ok()?;
         Some(Ok(Event::default().event(ev.kind).data(payload)))
     });
@@ -251,7 +271,7 @@ async fn stream_handler(
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    eprintln!("\nshutting down");
+    tracing::info!("\nshutting down");
 }
 
 // ---------- error helpers ----------
@@ -337,7 +357,10 @@ async fn get_run(
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
     let pg = &state.pg;
-    let view = pg.run_view(&id).await.map_err(|_| not_found(format!("run not found: {id}")))?;
+    let view = pg
+        .run_view(&id)
+        .await
+        .map_err(|_| not_found(format!("run not found: {id}")))?;
     let inputs: Vec<Value> = view
         .inputs
         .iter()
@@ -365,10 +388,10 @@ async fn get_run(
             // Inline `metadata.result` for eval_result outputs so the run
             // panel can render it without a follow-up artifact fetch.
             // Heavier metadata stays out of the summary path.
-            if a.kind == "eval_result" {
-                if let Some(result) = a.metadata_json.get("result") {
-                    obj.insert("result".into(), result.clone());
-                }
+            if a.kind == "eval_result"
+                && let Some(result) = a.metadata_json.get("result")
+            {
+                obj.insert("result".into(), result.clone());
             }
             s
         })
@@ -434,14 +457,17 @@ fn build_eval_series(rows: &[crate::store::EvalSeriesRow]) -> Vec<Value> {
             .map(|(n, v)| (Some(n), Some(v)))
             .unwrap_or((None, None));
 
-        by_policy.entry(ev.policy_id.clone()).or_default().push(Point {
-            step,
-            value,
-            metric_name,
-            eval_run_id: ev.eval_run_id.clone(),
-            checkpoint_artifact_id: ev.checkpoint_artifact_id.clone(),
-            state: ev.state.clone(),
-        });
+        by_policy
+            .entry(ev.policy_id.clone())
+            .or_default()
+            .push(Point {
+                step,
+                value,
+                metric_name,
+                eval_run_id: ev.eval_run_id.clone(),
+                checkpoint_artifact_id: ev.checkpoint_artifact_id.clone(),
+                state: ev.state.clone(),
+            });
     }
 
     by_policy
@@ -630,7 +656,7 @@ async fn build_metric_pivot(pg: &PgStore, runs: &[crate::store::RunRow]) -> Valu
                         "run_created_at": created,
                         "count": count,
                         "latest_value": latest.as_ref().map(|p| p.1.clone()).unwrap_or(Value::Null),
-                        "latest_step": latest.as_ref().and_then(|p| p.0).map(|x| Value::from(x)).unwrap_or(Value::Null),
+                        "latest_step": latest.as_ref().and_then(|p| p.0).map(Value::from).unwrap_or(Value::Null),
                         "previous_value": prev.as_ref().map(|p| p.1.clone()).unwrap_or(Value::Null),
                         "points": pts.into_iter().map(|(step, value, eval_run_id, state, ckpt_id)| json!({
                             "step": step,
@@ -671,7 +697,7 @@ async fn build_metric_pivot(pg: &PgStore, runs: &[crate::store::RunRow]) -> Valu
         .iter()
         .filter_map(|s| s.get("metric_name").cloned())
         .collect();
-    let runs_summary: Vec<Value> = runs.iter().map(|r| run_summary(r)).collect();
+    let runs_summary: Vec<Value> = runs.iter().map(run_summary).collect();
 
     json!({
         "runs": runs_summary,
@@ -688,18 +714,18 @@ fn first_metric(result: &Value) -> Option<(String, Value)> {
     let obj = result.as_object()?;
 
     // Explicit primary pin (the original convention — still honored).
-    if let (Some(Value::String(primary)), Some(tasks)) = (obj.get("primary"), obj.get("tasks")) {
-        if let Some(value) = metric_value_at(tasks, primary) {
-            return Some((primary.clone(), value));
-        }
+    if let (Some(Value::String(primary)), Some(tasks)) = (obj.get("primary"), obj.get("tasks"))
+        && let Some(value) = metric_value_at(tasks, primary)
+    {
+        return Some((primary.clone(), value));
     }
 
     // Look inside known container fields.
     for key in ["tasks", "scores", "metrics", "results"] {
-        if let Some(inner) = obj.get(key) {
-            if let Some(pair) = first_flat_metric(inner) {
-                return Some(pair);
-            }
+        if let Some(inner) = obj.get(key)
+            && let Some(pair) = first_flat_metric(inner)
+        {
+            return Some(pair);
         }
     }
 
@@ -714,7 +740,11 @@ fn metric_value_at(dict: &Value, key: &str) -> Option<Value> {
     if entry.is_number() {
         return Some(entry.clone());
     }
-    entry.as_object()?.get("value").filter(|v| v.is_number()).cloned()
+    entry
+        .as_object()?
+        .get("value")
+        .filter(|v| v.is_number())
+        .cloned()
 }
 
 /// Take the headline metric from a flat dict. A "flat metric dict" is an
@@ -784,17 +814,17 @@ fn extract_all_metrics(result: &Value) -> Vec<(String, Value)> {
     };
 
     // 1. Honor `{tasks, primary?}` first.
-    if let Some(tasks) = obj.get("tasks") {
-        if flat_dict_metrics(tasks, &mut out) {
-            return out;
-        }
+    if let Some(tasks) = obj.get("tasks")
+        && flat_dict_metrics(tasks, &mut out)
+    {
+        return out;
     }
     // 2. Then common container fields, in order. First hit wins.
     for key in ["scores", "metrics", "results"] {
-        if let Some(inner) = obj.get(key) {
-            if flat_dict_metrics(inner, &mut out) {
-                return out;
-            }
+        if let Some(inner) = obj.get(key)
+            && flat_dict_metrics(inner, &mut out)
+        {
+            return out;
         }
     }
     // 3. Or the top-level dict itself.
@@ -883,17 +913,31 @@ fn read_tail_log(run_dir: &std::path::Path, tail: usize) -> LogTail {
         }
     }
     let Some((_, path)) = newest else {
-        return LogTail { lines: vec![], path: None, truncated: false };
+        return LogTail {
+            lines: vec![],
+            path: None,
+            truncated: false,
+        };
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return LogTail { lines: vec![], path: Some(path), truncated: false },
+        Err(_) => {
+            return LogTail {
+                lines: vec![],
+                path: Some(path),
+                truncated: false,
+            };
+        }
     };
     let lines: Vec<&str> = content.lines().collect();
     let truncated = lines.len() > tail;
     let start = lines.len().saturating_sub(tail);
     let lines = lines[start..].iter().map(|s| s.to_string()).collect();
-    LogTail { lines, path: Some(path), truncated }
+    LogTail {
+        lines,
+        path: Some(path),
+        truncated,
+    }
 }
 
 async fn get_run_events(
@@ -924,7 +968,9 @@ async fn get_recipe_history(
         .into_iter()
         .map(|(status, ts)| json!({ "status": status, "created_at": ts }))
         .collect();
-    Ok(axum::Json(json!({ "recipe_name": name, "history": history })))
+    Ok(axum::Json(
+        json!({ "recipe_name": name, "history": history }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1005,7 +1051,10 @@ fn aggregate_pipeline_status(runs: &[RunRow]) -> &'static str {
     if runs.is_empty() {
         return "unknown";
     }
-    if runs.iter().any(|r| r.status == "failed" || r.status == "oom" || r.status == "timeout") {
+    if runs
+        .iter()
+        .any(|r| r.status == "failed" || r.status == "oom" || r.status == "timeout")
+    {
         return "failed";
     }
     if runs.iter().any(|r| !is_terminal(&r.status)) {
@@ -1058,7 +1107,9 @@ async fn list_artifacts(State(state): State<AppState>) -> Result<axum::Json<Valu
     for a in artifacts {
         let aliases = pg.aliases_for_artifact(&a.id).await?;
         let mut s = artifact_summary(&a);
-        s.as_object_mut().unwrap().insert("aliases".into(), json!(aliases));
+        s.as_object_mut()
+            .unwrap()
+            .insert("aliases".into(), json!(aliases));
         out.push(s);
     }
     Ok(axum::Json(json!({ "artifacts": out })))
@@ -1086,7 +1137,12 @@ async fn get_artifact(
         }
     }
     let producer = match artifact.producer_run_id.as_deref() {
-        Some(rid) => pg.get_run(rid).await.ok().flatten().map(|r| run_summary(&r)),
+        Some(rid) => pg
+            .get_run(rid)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| run_summary(&r)),
         None => None,
     };
     let mut s = artifact_summary(&artifact);
@@ -1125,8 +1181,12 @@ async fn get_artifact_lineage(
     ) {
         let aliases = pg.aliases_for_artifact(&a.id).await.unwrap_or_default();
         let mut s = artifact_summary(a);
-        s.as_object_mut().unwrap().insert("aliases".into(), json!(aliases));
-        s.as_object_mut().unwrap().insert("is_root".into(), json!(is_root));
+        s.as_object_mut()
+            .unwrap()
+            .insert("aliases".into(), json!(aliases));
+        s.as_object_mut()
+            .unwrap()
+            .insert("is_root".into(), json!(is_root));
         nodes.insert(a.id.clone(), s);
     }
     fn push_run(r: &RunRow, nodes: &mut std::collections::BTreeMap<String, Value>) {
@@ -1141,26 +1201,34 @@ async fn get_artifact_lineage(
         if depth >= max_hops {
             continue;
         }
-        let Ok(Some(a)) = pg.get_artifact_optional(&aid).await else { continue };
-        let Some(prid) = a.producer_run_id else { continue };
-        let Ok(Some(prun)) = pg.get_run(&prid).await else { continue };
+        let Ok(Some(a)) = pg.get_artifact_optional(&aid).await else {
+            continue;
+        };
+        let Some(prid) = a.producer_run_id else {
+            continue;
+        };
+        let Ok(Some(prun)) = pg.get_run(&prid).await else {
+            continue;
+        };
         push_run(&prun, &mut run_nodes);
         edges.push(json!({ "from": prun.id, "to": a.id, "kind": "produces" }));
-        let Ok(inputs) = pg.run_inputs(&prun.id).await else { continue };
+        let Ok(inputs) = pg.run_inputs(&prun.id).await else {
+            continue;
+        };
         for input in inputs {
-            if let Some(input_aid) = input.artifact_id {
-                if let Ok(Some(input_a)) = pg.get_artifact_optional(&input_aid).await {
-                    let new = !artifact_nodes.contains_key(&input_a.id);
-                    push_artifact(pg, &input_a, &mut artifact_nodes, false).await;
-                    edges.push(json!({
-                        "from": input_a.id,
-                        "to": prun.id,
-                        "kind": "consumed_by",
-                        "role": input.role,
-                    }));
-                    if new {
-                        frontier.push((input_a.id, depth + 1));
-                    }
+            if let Some(input_aid) = input.artifact_id
+                && let Ok(Some(input_a)) = pg.get_artifact_optional(&input_aid).await
+            {
+                let new = !artifact_nodes.contains_key(&input_a.id);
+                push_artifact(pg, &input_a, &mut artifact_nodes, false).await;
+                edges.push(json!({
+                    "from": input_a.id,
+                    "to": prun.id,
+                    "kind": "consumed_by",
+                    "role": input.role,
+                }));
+                if new {
+                    frontier.push((input_a.id, depth + 1));
                 }
             }
         }
@@ -1174,7 +1242,9 @@ async fn get_artifact_lineage(
         }
         let consumers = pg.artifact_consumers(&aid).await.unwrap_or_default();
         for (run_id, role) in consumers {
-            let Ok(Some(crun)) = pg.get_run(&run_id).await else { continue };
+            let Ok(Some(crun)) = pg.get_run(&run_id).await else {
+                continue;
+            };
             let new_run = !run_nodes.contains_key(&crun.id);
             push_run(&crun, &mut run_nodes);
             edges.push(json!({
@@ -1186,7 +1256,9 @@ async fn get_artifact_lineage(
             if !new_run {
                 continue;
             }
-            let Ok(outputs) = pg.run_outputs(&crun.id).await else { continue };
+            let Ok(outputs) = pg.run_outputs(&crun.id).await else {
+                continue;
+            };
             for out in outputs {
                 let new = !artifact_nodes.contains_key(&out.id);
                 push_artifact(pg, &out, &mut artifact_nodes, false).await;
@@ -1337,9 +1409,8 @@ async fn build_policy_card(
             .get("series_by_metric")
             .and_then(|v| v.as_array())
             .and_then(|arr| {
-                arr.iter().find(|s| {
-                    s.get("metric_name").and_then(|m| m.as_str()) == Some(metric)
-                })
+                arr.iter()
+                    .find(|s| s.get("metric_name").and_then(|m| m.as_str()) == Some(metric))
             })
             .cloned()
             .unwrap_or(Value::Null),
@@ -1542,7 +1613,12 @@ async fn get_artifact_rollout(
         Ok::<_, ApiError>((steps, frame_count))
     })
     .await
-    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("rollout task: {e}")))??;
+    .map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("rollout task: {e}"),
+        )
+    })??;
 
     Ok(axum::Json(json!({
         "steps": steps,
@@ -1656,18 +1732,9 @@ fn parse_segment_meta(split: &str, meta_path: &std::path::Path) -> Option<Datase
         .to_string();
     let n_frames = v.get("n_frames").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let n_no_op = v.get("n_no_op").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    let frame_width = v
-        .get("frame_width")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
-    let frame_height = v
-        .get("frame_height")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
-    let target_fps = v
-        .get("target_fps")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
+    let frame_width = v.get("frame_width").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let frame_height = v.get("frame_height").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let target_fps = v.get("target_fps").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let creation_time = v
         .get("creation_time")
         .and_then(|x| x.as_str())
@@ -1806,7 +1873,12 @@ async fn dataset_summary_for(
     let walk_path = artifact.path.clone();
     let summary = tokio::task::spawn_blocking(move || walk_dataset(&walk_path))
         .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("dataset walk: {e}")))?;
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("dataset walk: {e}"),
+            )
+        })?;
     let entry = Arc::new(summary);
     {
         let mut cache = state.dataset_cache.lock().unwrap();
@@ -1819,7 +1891,8 @@ async fn get_artifact_dataset(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let (_, entry) = dataset_summary_for(&state, &id).await?
+    let (_, entry) = dataset_summary_for(&state, &id)
+        .await?
         .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
     match entry.as_ref() {
         Some(summary) => Ok(axum::Json(serde_json::to_value(summary).unwrap())),
@@ -1833,7 +1906,8 @@ async fn get_artifact_dataset_segment(
     State(state): State<AppState>,
     Path((id, split, seg)): Path<(String, String, String)>,
 ) -> Result<axum::Json<Value>, ApiError> {
-    let (root, _) = dataset_summary_for(&state, &id).await?
+    let (root, _) = dataset_summary_for(&state, &id)
+        .await?
         .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
     let seg_dir = root.join(&split).join(&seg);
     let meta_path = seg_dir.join("meta.json");
@@ -1845,8 +1919,12 @@ async fn get_artifact_dataset_segment(
             meta_path.display()
         ))
     })?;
-    let meta: Value = serde_json::from_slice(&meta_bytes)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("invalid meta.json: {e}")))?;
+    let meta: Value = serde_json::from_slice(&meta_bytes).map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("invalid meta.json: {e}"),
+        )
+    })?;
 
     // Walk chat_line.json. Stage A writes alternating user/assistant
     // pairs; the user message carries a {"type":"image","image":"<...
@@ -1862,36 +1940,35 @@ async fn get_artifact_dataset_segment(
     // show the right frame.
     let mut actions: Vec<String> = Vec::new();
     let mut frame_indices: Vec<u32> = Vec::new();
-    if let Ok(bytes) = tokio::fs::read(&chat_path).await {
-        if let Ok(chat) = serde_json::from_slice::<Value>(&bytes) {
-            if let Some(msgs) = chat.get("messages").and_then(|x| x.as_array()) {
-                // Walk in source order, pairing consecutive user→assistant
-                // pairs. The user turn precedes the assistant turn it
-                // describes; anything that isn't part of a pair (e.g. a
-                // leading system msg) is skipped.
-                let mut last_image_idx: Option<u32> = None;
-                for m in msgs {
-                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    if role == "user" {
-                        last_image_idx = extract_frame_index_from_user_msg(m);
-                        continue;
-                    }
-                    if role != "assistant" {
-                        continue;
-                    }
-                    // Pull the action text out of the assistant content.
-                    let action = extract_text_from_msg(m);
-                    // If the preceding user turn referenced a frame, use
-                    // that. Otherwise fall back to positional index — for
-                    // pipelines that don't carry per-message image refs,
-                    // this preserves the old (already-correct-for-
-                    // unfiltered-datasets) behavior.
-                    let idx = last_image_idx.unwrap_or(actions.len() as u32);
-                    actions.push(action);
-                    frame_indices.push(idx);
-                    last_image_idx = None;
-                }
+    if let Ok(bytes) = tokio::fs::read(&chat_path).await
+        && let Ok(chat) = serde_json::from_slice::<Value>(&bytes)
+        && let Some(msgs) = chat.get("messages").and_then(|x| x.as_array())
+    {
+        // Walk in source order, pairing consecutive user→assistant
+        // pairs. The user turn precedes the assistant turn it
+        // describes; anything that isn't part of a pair (e.g. a
+        // leading system msg) is skipped.
+        let mut last_image_idx: Option<u32> = None;
+        for m in msgs {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "user" {
+                last_image_idx = extract_frame_index_from_user_msg(m);
+                continue;
             }
+            if role != "assistant" {
+                continue;
+            }
+            // Pull the action text out of the assistant content.
+            let action = extract_text_from_msg(m);
+            // If the preceding user turn referenced a frame, use
+            // that. Otherwise fall back to positional index — for
+            // pipelines that don't carry per-message image refs,
+            // this preserves the old (already-correct-for-
+            // unfiltered-datasets) behavior.
+            let idx = last_image_idx.unwrap_or(actions.len() as u32);
+            actions.push(action);
+            frame_indices.push(idx);
+            last_image_idx = None;
         }
     }
 
@@ -1936,10 +2013,10 @@ fn extract_text_from_msg(m: &Value) -> String {
     }
     if let Some(blocks) = c.and_then(|x| x.as_array()) {
         for b in blocks {
-            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
-                    return t.to_string();
-                }
+            if b.get("type").and_then(|t| t.as_str()) == Some("text")
+                && let Some(t) = b.get("text").and_then(|x| x.as_str())
+            {
+                return t.to_string();
             }
         }
     }
@@ -1950,7 +2027,8 @@ async fn get_artifact_dataset_frame(
     State(state): State<AppState>,
     Path((id, split, seg, n)): Path<(String, String, String, u32)>,
 ) -> Result<Response, ApiError> {
-    let (root, _) = dataset_summary_for(&state, &id).await?
+    let (root, _) = dataset_summary_for(&state, &id)
+        .await?
         .ok_or_else(|| not_found(format!("artifact not found: {id}")))?;
 
     // Stage A writes a local `frames/` subdir; if it exists, use it
@@ -1962,7 +2040,11 @@ async fn get_artifact_dataset_frame(
         .join(&seg)
         .join("frames")
         .join(format!("frame_{n:06}.jpg"));
-    let frame_path = if tokio::fs::metadata(&local).await.map(|m| m.is_file()).unwrap_or(false) {
+    let frame_path = if tokio::fs::metadata(&local)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
         local
     } else {
         resolve_frame_via_chat_line(&state, &id, &root, &split, &seg, n)
@@ -2030,7 +2112,10 @@ async fn resolve_frame_via_chat_line(
                     Some(b) => b,
                     None => continue,
                 };
-                let stem = match base.strip_prefix("frame_").and_then(|s| s.strip_suffix(".jpg")) {
+                let stem = match base
+                    .strip_prefix("frame_")
+                    .and_then(|s| s.strip_suffix(".jpg"))
+                {
                     Some(s) => s,
                     None => continue,
                 };

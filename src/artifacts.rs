@@ -37,4 +37,3 @@ pub async fn register_external(
     store.set_alias(alias, &artifact.id).await?;
     Ok(artifact)
 }
-

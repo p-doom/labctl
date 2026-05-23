@@ -1,0 +1,6 @@
+[toolchain]
+# Pin so CI and operator boxes converge on the same compiler.
+# Bump along with any sqlx / tokio major. clippy + rustfmt are
+# always available with the standard rustup distribution.
+channel = "1.91.0"
+components = ["clippy", "rustfmt"]

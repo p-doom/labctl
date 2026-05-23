@@ -21,57 +21,55 @@
 //! flake doesn't kill the daemon. systemd's `Restart=on-failure` is the
 //! safety net for panics.
 
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use tokio::sync::Notify;
 
 use crate::{
     config::{ClusterConfig, DispatchConfig, ThrottleConfig},
-    evald,
-    runner,
+    evald, runner,
     store::Store,
     util,
 };
 
-/// Spawn reconcile + evald + gc tokio tasks. Returns immediately; the
-/// tasks live until `shutdown` fires. With no `[dispatch]` block
-/// configured, logs a notice and returns without spawning anything.
+/// Spawn reconcile + evald + gc tokio tasks. Returns their join
+/// handles so the caller can `.await` each on shutdown — without that
+/// the process exits before a mid-flight iteration finishes (in-flight
+/// sqlx queries are cancellation-safe at the DB level, but the agent
+/// state machine doesn't get its "final pass" before systemd reaps
+/// the process). With no `[dispatch]` block configured, returns an
+/// empty `Vec`.
 fn spawn(
     cluster: Arc<ClusterConfig>,
     store: Arc<Store>,
     shutdown: Arc<Notify>,
-) {
+) -> Vec<tokio::task::JoinHandle<()>> {
     let Some(dispatch) = cluster.dispatch.clone() else {
-        eprintln!(
-            "labctl: no [dispatch] block in cluster config; reconcile + evald disabled"
-        );
-        return;
+        tracing::info!("labctl: no [dispatch] block in cluster config; reconcile + evald disabled");
+        return Vec::new();
     };
-    eprintln!(
+    tracing::info!(
         "labctl: dispatch — reconcile every {}s, evald every {}s, policies={}",
         dispatch.reconcile_interval_secs,
         dispatch.evald_interval_secs,
         dispatch.policies_dir.display(),
     );
     if dispatch.gc.enabled {
-        eprintln!(
+        tracing::info!(
             "labctl: dispatch — gc every {}s (min_terminal_age={}s)",
-            dispatch.gc.interval_secs, dispatch.gc.min_terminal_age_secs,
+            dispatch.gc.interval_secs,
+            dispatch.gc.min_terminal_age_secs,
         );
     } else {
-        eprintln!("labctl: dispatch — gc disabled");
+        tracing::info!("labctl: dispatch — gc disabled");
     }
 
     let cluster_r = cluster.clone();
     let store_r = store.clone();
     let shutdown_r = shutdown.clone();
     let dispatch_r = dispatch.clone();
-    tokio::spawn(async move {
+    let reconcile_h = tokio::spawn(async move {
         reconcile_loop(cluster_r, store_r, dispatch_r, shutdown_r).await;
     });
 
@@ -79,16 +77,18 @@ fn spawn(
     let store_g = store.clone();
     let shutdown_g = shutdown.clone();
     let dispatch_g = dispatch.clone();
-    tokio::spawn(async move {
+    let gc_h = tokio::spawn(async move {
         gc_loop(cluster_g, store_g, dispatch_g, shutdown_g).await;
     });
 
     let cluster_e = cluster;
     let store_e = store;
     let shutdown_e = shutdown;
-    tokio::spawn(async move {
+    let evald_h = tokio::spawn(async move {
         evald_loop(cluster_e, store_e, dispatch, shutdown_e).await;
     });
+
+    vec![reconcile_h, gc_h, evald_h]
 }
 
 /// Standalone agent entrypoint: build a tokio runtime, spawn the
@@ -101,11 +101,21 @@ fn spawn(
 pub async fn run_standalone(cluster: ClusterConfig) -> Result<()> {
     let store = Arc::new(Store::connect(&cluster).await?);
     let shutdown = Arc::new(Notify::new());
-    spawn(Arc::new(cluster), store, shutdown.clone());
-    eprintln!("labctl agent running (no HTTP listener; ctrl-c to stop)");
+    let handles = spawn(Arc::new(cluster), store, shutdown.clone());
+    tracing::info!("labctl agent running (no HTTP listener; ctrl-c to stop)");
     let _ = tokio::signal::ctrl_c().await;
-    eprintln!("\nshutting down");
+    tracing::info!("shutting down — waiting for in-flight iterations to finish");
     shutdown.notify_waiters();
+    // Drain: each loop's `select!` exits on shutdown but only after the
+    // current iteration's body returns (sleep is the only race target).
+    // Awaiting the handles guarantees we don't return to systemd before
+    // every spawned task has observed the shutdown and exited cleanly.
+    for h in handles {
+        if let Err(e) = h.await {
+            tracing::error!("labctl agent: task panicked during drain: {e:#}");
+        }
+    }
+    tracing::info!("labctl agent: clean shutdown");
     Ok(())
 }
 
@@ -125,7 +135,7 @@ async fn reconcile_loop(
                 do_reconcile(&cluster, &store).await;
             }
             _ = shutdown.notified() => {
-                eprintln!("labctl dispatch: reconcile_loop shutdown");
+                tracing::info!("labctl dispatch: reconcile_loop shutdown");
                 return;
             }
         }
@@ -141,14 +151,14 @@ async fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
     let submitted_by = match crate::store::current_user() {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("labctl dispatch: cannot resolve current user: {e:#}");
+            tracing::error!("labctl dispatch: cannot resolve current user: {e:#}");
             return;
         }
     };
     let runs = match store.list_active_runs(&submitted_by).await {
         Ok(rs) => rs,
         Err(e) => {
-            eprintln!("labctl dispatch: list_active_runs failed: {e:#}");
+            tracing::error!("labctl dispatch: list_active_runs failed: {e:#}");
             return;
         }
     };
@@ -163,7 +173,7 @@ async fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
                 artifacts_registered += step.artifacts_registered;
             }
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "labctl dispatch: reconcile_one failed for {}: {e:#}",
                     run.id
                 );
@@ -180,10 +190,8 @@ async fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
     {
         Ok(parents) => {
             for parent in parents {
-                if let Err(e) =
-                    runner::try_submit_pending_children(cluster, store, &parent).await
-                {
-                    eprintln!(
+                if let Err(e) = runner::try_submit_pending_children(cluster, store, &parent).await {
+                    tracing::error!(
                         "labctl dispatch: orphan sweep for {} failed: {e:#}",
                         parent.id
                     );
@@ -191,11 +199,13 @@ async fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
             }
         }
         Err(e) => {
-            eprintln!("labctl dispatch: list_terminal_runs_with_pending_children failed: {e:#}");
+            tracing::error!(
+                "labctl dispatch: list_terminal_runs_with_pending_children failed: {e:#}"
+            );
         }
     }
     if runs_reconciled > 0 || artifacts_registered > 0 {
-        eprintln!(
+        tracing::info!(
             "labctl dispatch: reconciled {runs_reconciled} run(s), registered {artifacts_registered} artifact(s)"
         );
     }
@@ -217,7 +227,7 @@ async fn gc_loop(
         // Don't even tick — pin the task to shutdown so it parks
         // cleanly when the daemon stops.
         shutdown.notified().await;
-        eprintln!("labctl dispatch: gc_loop shutdown (was disabled)");
+        tracing::info!("labctl dispatch: gc_loop shutdown (was disabled)");
         return;
     }
     let interval = Duration::from_secs(dispatch.gc.interval_secs);
@@ -228,7 +238,7 @@ async fn gc_loop(
                 do_gc(&cluster, &store, min_age).await;
             }
             _ = shutdown.notified() => {
-                eprintln!("labctl dispatch: gc_loop shutdown");
+                tracing::info!("labctl dispatch: gc_loop shutdown");
                 return;
             }
         }
@@ -238,8 +248,8 @@ async fn gc_loop(
 async fn do_gc(cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u64) {
     match runner::gc_terminal_sources(store, min_terminal_age_secs).await {
         Ok(0) => {}
-        Ok(n) => eprintln!("labctl dispatch: gc reaped {n} source snapshot(s)"),
-        Err(e) => eprintln!("labctl dispatch: gc failed: {e:#}"),
+        Ok(n) => tracing::info!("labctl dispatch: gc reaped {n} source snapshot(s)"),
+        Err(e) => tracing::error!("labctl dispatch: gc failed: {e:#}"),
     }
     // Reap orphan run-dirs: <runs_base>/runs/<user>/<id>/ with no PG row.
     // Cushion the age so we don't race against an in-flight CLI submit
@@ -249,8 +259,8 @@ async fn do_gc(cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_sec
     let orphan_min_age = min_terminal_age_secs.max(3600);
     match runner::gc_orphan_run_dirs(cluster, store, orphan_min_age).await {
         Ok(0) => {}
-        Ok(n) => eprintln!("labctl dispatch: gc reaped {n} orphan run-dir(s)"),
-        Err(e) => eprintln!("labctl dispatch: orphan-dir gc failed: {e:#}"),
+        Ok(n) => tracing::warn!("labctl dispatch: gc reaped {n} orphan run-dir(s)"),
+        Err(e) => tracing::error!("labctl dispatch: orphan-dir gc failed: {e:#}"),
     }
 }
 
@@ -269,22 +279,18 @@ async fn evald_loop(
                 do_evald(&cluster, &store, &dispatch).await;
             }
             _ = shutdown.notified() => {
-                eprintln!("labctl dispatch: evald_loop shutdown");
+                tracing::info!("labctl dispatch: evald_loop shutdown");
                 return;
             }
         }
     }
 }
 
-async fn do_evald(
-    cluster: &ClusterConfig,
-    store: &Arc<Store>,
-    dispatch: &DispatchConfig,
-) {
+async fn do_evald(cluster: &ClusterConfig, store: &Arc<Store>, dispatch: &DispatchConfig) {
     let policies = match list_policies(&dispatch.policies_dir) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "labctl dispatch: failed to list policies in {}: {e:#}",
                 dispatch.policies_dir.display()
             );
@@ -296,7 +302,7 @@ async fn do_evald(
         let policy = match crate::config::EvalPolicy::load(&policy_path) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "labctl dispatch: skipping policy {} ({e:#})",
                     policy_path.display()
                 );
@@ -308,7 +314,7 @@ async fn do_evald(
                 total_submitted += report.submitted;
             }
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "labctl dispatch: evald failed for {}: {e:#}",
                     policy_path.display()
                 );
@@ -316,12 +322,12 @@ async fn do_evald(
         }
     }
     if total_submitted > 0 {
-        eprintln!("labctl dispatch: evald submitted {total_submitted} eval run(s)");
+        tracing::info!("labctl dispatch: evald submitted {total_submitted} eval run(s)");
     }
-    if let Some(throttle) = &dispatch.throttle {
-        if let Err(e) = enforce_throttle(cluster, throttle).await {
-            eprintln!("labctl dispatch: throttle failed: {e:#}");
-        }
+    if let Some(throttle) = &dispatch.throttle
+        && let Err(e) = enforce_throttle(cluster, throttle).await
+    {
+        tracing::error!("labctl dispatch: throttle failed: {e:#}");
     }
 }
 
@@ -411,7 +417,7 @@ pub fn parse_squeue_lines(out: &str) -> Vec<SqueueRow> {
 }
 
 async fn enforce_throttle(_cluster: &ClusterConfig, throttle: &ThrottleConfig) -> Result<()> {
-    let user = std::env::var("USER").unwrap_or_else(|_| "labctl".to_string());
+    let user = crate::store::current_user()?;
     let output = tokio::process::Command::new("squeue")
         .args([
             "-u",
@@ -446,19 +452,22 @@ async fn enforce_throttle(_cluster: &ClusterConfig, throttle: &ThrottleConfig) -
             ThrottleAction::Hold(id) => vec!["hold", id.as_str()],
             ThrottleAction::Release(id) => vec!["release", id.as_str()],
         };
-        let result = tokio::process::Command::new(scontrol).args(&arg).output().await;
+        let result = tokio::process::Command::new(scontrol)
+            .args(&arg)
+            .output()
+            .await;
         match result {
             Ok(o) if o.status.success() => {
-                eprintln!("labctl throttle: {verb} {job_id}");
+                tracing::info!("labctl throttle: {verb} {job_id}");
             }
             Ok(o) => {
-                eprintln!(
+                tracing::error!(
                     "labctl throttle: {verb} {job_id} failed: {}",
                     String::from_utf8_lossy(&o.stderr).trim()
                 );
             }
             Err(e) => {
-                eprintln!("labctl throttle: {verb} {job_id} failed: {e:#}");
+                tracing::error!("labctl throttle: {verb} {job_id} failed: {e:#}");
             }
         }
     }

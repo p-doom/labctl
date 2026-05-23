@@ -108,7 +108,6 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-
 /// Mode bits for the shared-multi-user setup: group rwx + setgid (so
 /// subdirs inherit the group), no permissions for other. Applied to
 /// `runs_base` and each artifact root by `labctl init` when
@@ -164,8 +163,13 @@ pub fn gid_for_group(_group: &str) -> Option<u32> {
 #[cfg(unix)]
 pub fn apply_shared_perms(path: &Path, group: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(SHARED_DIR_MODE))
-        .with_context(|| format!("failed to chmod {} to {:o}", path.display(), SHARED_DIR_MODE))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(SHARED_DIR_MODE)).with_context(|| {
+        format!(
+            "failed to chmod {} to {:o}",
+            path.display(),
+            SHARED_DIR_MODE
+        )
+    })?;
     let gid = gid_for_group(group).with_context(|| {
         format!(
             "shared_group {group:?} not found in /etc/group; \
@@ -180,7 +184,10 @@ pub fn apply_shared_perms(path: &Path, group: &str) -> Result<()> {
     let rc = unsafe { libc::chown(c.as_ptr(), u32::MAX, gid) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!("failed to chgrp {} to {group:?} (gid={gid})", path.display())
+            format!(
+                "failed to chgrp {} to {group:?} (gid={gid})",
+                path.display()
+            )
         });
     }
     Ok(())
@@ -230,5 +237,4 @@ mod tests {
         assert!(validate_user("runs").is_err());
         assert!(validate_user("alice").is_ok());
     }
-
 }

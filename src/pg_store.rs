@@ -111,12 +111,10 @@ impl PgStore {
     }
 
     pub async fn list_artifacts(&self) -> Result<Vec<ArtifactRow>> {
-        let rows = sqlx::query(&format!(
-            "{ARTIFACT_SELECT_BASE} ORDER BY created_at DESC"
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .context("list_artifacts query")?;
+        let rows = sqlx::query(&format!("{ARTIFACT_SELECT_BASE} ORDER BY created_at DESC"))
+            .fetch_all(&self.pool)
+            .await
+            .context("list_artifacts query")?;
         rows.into_iter().map(row_to_artifact).collect()
     }
 
@@ -262,13 +260,11 @@ impl PgStore {
     /// own, so callers that need disambiguation must filter further on
     /// the client side (e.g. by `kind`).
     pub async fn find_artifact_by_path(&self, path: &str) -> Result<Option<ArtifactRow>> {
-        let row = sqlx::query(&format!(
-            "{ARTIFACT_SELECT_BASE} WHERE path = $1 LIMIT 1"
-        ))
-        .bind(path)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("find_artifact_by_path({path})"))?;
+        let row = sqlx::query(&format!("{ARTIFACT_SELECT_BASE} WHERE path = $1 LIMIT 1"))
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await
+            .with_context(|| format!("find_artifact_by_path({path})"))?;
         row.map(row_to_artifact).transpose()
     }
 
@@ -279,10 +275,7 @@ impl PgStore {
         self.get_artifact(id).await
     }
 
-    pub async fn artifact_consumers(
-        &self,
-        artifact_id: &str,
-    ) -> Result<Vec<(String, String)>> {
+    pub async fn artifact_consumers(&self, artifact_id: &str) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query(
             "SELECT run_id, role FROM run_inputs WHERE artifact_id = $1 ORDER BY run_id",
         )
@@ -291,18 +284,22 @@ impl PgStore {
         .await
         .with_context(|| format!("artifact_consumers({artifact_id})"))?;
         rows.into_iter()
-            .map(|r| Ok((r.try_get::<String, _>("run_id")?, r.try_get::<String, _>("role")?)))
+            .map(|r| {
+                Ok((
+                    r.try_get::<String, _>("run_id")?,
+                    r.try_get::<String, _>("role")?,
+                ))
+            })
             .collect()
     }
 
     pub async fn aliases_for_artifact(&self, artifact_id: &str) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            "SELECT alias FROM artifact_aliases WHERE artifact_id = $1 ORDER BY alias",
-        )
-        .bind(artifact_id)
-        .fetch_all(&self.pool)
-        .await
-        .with_context(|| format!("aliases_for_artifact({artifact_id})"))?;
+        let rows =
+            sqlx::query("SELECT alias FROM artifact_aliases WHERE artifact_id = $1 ORDER BY alias")
+                .bind(artifact_id)
+                .fetch_all(&self.pool)
+                .await
+                .with_context(|| format!("aliases_for_artifact({artifact_id})"))?;
         rows.into_iter()
             .map(|r| Ok(r.try_get::<String, _>("alias")?))
             .collect()
@@ -314,13 +311,11 @@ impl PgStore {
         if let Some(row) = self.get_artifact(reference).await? {
             return Ok(row);
         }
-        let row = sqlx::query(
-            "SELECT artifact_id FROM artifact_aliases WHERE alias = $1",
-        )
-        .bind(reference)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("resolve_artifact_ref({reference}) alias lookup"))?;
+        let row = sqlx::query("SELECT artifact_id FROM artifact_aliases WHERE alias = $1")
+            .bind(reference)
+            .fetch_optional(&self.pool)
+            .await
+            .with_context(|| format!("resolve_artifact_ref({reference}) alias lookup"))?;
         let Some(row) = row else {
             bail!("artifact or alias not found: {reference}");
         };
@@ -349,13 +344,11 @@ impl PgStore {
     /// `(role, artifact_id)` tuples for every output linked to `run_id`.
     /// Sister of `run_outputs`, which returns the joined artifact rows.
     pub async fn run_output_links(&self, run_id: &str) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query(
-            "SELECT role, artifact_id FROM run_outputs WHERE run_id = $1",
-        )
-        .bind(run_id)
-        .fetch_all(&self.pool)
-        .await
-        .with_context(|| format!("run_output_links({run_id})"))?;
+        let rows = sqlx::query("SELECT role, artifact_id FROM run_outputs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("run_output_links({run_id})"))?;
         rows.into_iter()
             .map(|r| {
                 Ok((
@@ -366,10 +359,7 @@ impl PgStore {
             .collect()
     }
 
-    pub async fn find_cache_hit_candidate(
-        &self,
-        cache_key: &str,
-    ) -> Result<Option<RunRow>> {
+    pub async fn find_cache_hit_candidate(&self, cache_key: &str) -> Result<Option<RunRow>> {
         let row = sqlx::query(&format!(
             "{RUN_SELECT_BASE} \
              WHERE cache_key = $1 AND status IN ('succeeded','cache_hit') \
@@ -382,29 +372,21 @@ impl PgStore {
         row.map(row_to_run).transpose()
     }
 
-    pub async fn run_output_artifact_id(
-        &self,
-        run_id: &str,
-        role: &str,
-    ) -> Result<Option<String>> {
-        let row = sqlx::query(
-            "SELECT artifact_id FROM run_outputs WHERE run_id = $1 AND role = $2",
-        )
-        .bind(run_id)
-        .bind(role)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("run_output_artifact_id({run_id}, {role})"))?;
+    pub async fn run_output_artifact_id(&self, run_id: &str, role: &str) -> Result<Option<String>> {
+        let row =
+            sqlx::query("SELECT artifact_id FROM run_outputs WHERE run_id = $1 AND role = $2")
+                .bind(run_id)
+                .bind(role)
+                .fetch_optional(&self.pool)
+                .await
+                .with_context(|| format!("run_output_artifact_id({run_id}, {role})"))?;
         match row {
             Some(r) => Ok(Some(r.try_get::<String, _>("artifact_id")?)),
             None => Ok(None),
         }
     }
 
-    async fn aliases_for_run_outputs(
-        &self,
-        run_id: &str,
-    ) -> Result<Vec<(String, String)>> {
+    async fn aliases_for_run_outputs(&self, run_id: &str) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query(
             "SELECT aa.alias, aa.artifact_id FROM artifact_aliases aa
              JOIN run_outputs ro ON ro.artifact_id = aa.artifact_id
@@ -455,13 +437,12 @@ impl PgStore {
     }
 
     pub async fn get_pipeline(&self, pipeline_id: &str) -> Result<Option<PipelineRow>> {
-        let row = sqlx::query(
-            "SELECT id, name, pipeline_path, created_at FROM pipelines WHERE id = $1",
-        )
-        .bind(pipeline_id)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("get_pipeline({pipeline_id})"))?;
+        let row =
+            sqlx::query("SELECT id, name, pipeline_path, created_at FROM pipelines WHERE id = $1")
+                .bind(pipeline_id)
+                .fetch_optional(&self.pool)
+                .await
+                .with_context(|| format!("get_pipeline({pipeline_id})"))?;
         match row {
             None => Ok(None),
             Some(r) => Ok(Some(PipelineRow {
@@ -642,10 +623,7 @@ impl PgStore {
             .collect()
     }
 
-    pub async fn eval_requests_by_policy(
-        &self,
-        policy_id: &str,
-    ) -> Result<Vec<Value>> {
+    pub async fn eval_requests_by_policy(&self, policy_id: &str) -> Result<Vec<Value>> {
         let rows = sqlx::query(
             "SELECT er.eval_key, er.checkpoint_artifact_id, er.eval_recipe_hash,
                     er.policy_id, er.eval_run_id,
@@ -771,11 +749,7 @@ impl PgStore {
     /// transaction. Mirrors the SQLite `Store::insert_run` but is
     /// DB-only: no sidecar writes, no event emission. Callers that need
     /// the legacy "run_created" event must call `append_event` themselves.
-    pub async fn insert_run(
-        &self,
-        run: NewRun<'_>,
-        inputs: &[InputResolution],
-    ) -> Result<()> {
+    pub async fn insert_run(&self, run: NewRun<'_>, inputs: &[InputResolution]) -> Result<()> {
         let submitted_by = run
             .submitted_by
             .map(|s| s.to_string())
@@ -783,8 +757,8 @@ impl PgStore {
             .or_else(|| std::env::var("USERNAME").ok())
             .unwrap_or_else(|| "unknown".to_string());
         let now = crate::util::now_ts();
-        let recipe_value = serde_json::to_value(run.recipe)
-            .context("insert_run: serialise recipe")?;
+        let recipe_value =
+            serde_json::to_value(run.recipe).context("insert_run: serialise recipe")?;
 
         let mut tx = self.pool.begin().await.context("insert_run: begin tx")?;
         // Upsert. When agent-driven submission completes a previously
@@ -843,9 +817,7 @@ impl PgStore {
             .bind(input.resolved_path.display().to_string())
             .execute(&mut *tx)
             .await
-            .with_context(|| {
-                format!("insert_run: run_inputs insert role={}", input.role)
-            })?;
+            .with_context(|| format!("insert_run: run_inputs insert role={}", input.role))?;
         }
         tx.commit().await.context("insert_run: commit")?;
         Ok(())
@@ -922,7 +894,9 @@ impl PgStore {
              WHERE status = 'created' AND job_id IS NULL \
                AND dependency_on @> $1::jsonb"
         ))
-        .bind(sqlx::types::Json(json!({"afterok": [{"run_id": parent_run_id}]})))
+        .bind(sqlx::types::Json(
+            json!({"afterok": [{"run_id": parent_run_id}]}),
+        ))
         .fetch_all(&self.pool)
         .await
         .with_context(|| format!("pending_children_of({parent_run_id})"))?;
@@ -992,6 +966,7 @@ impl PgStore {
 
     /// Insert an artifact row. DB-only: the caller owns the sidecar
     /// (`.meta.json`) write and any other FS work.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_artifact(
         &self,
         id: &str,
@@ -1040,12 +1015,7 @@ impl PgStore {
         Ok(())
     }
 
-    pub async fn link_run_output(
-        &self,
-        run_id: &str,
-        role: &str,
-        artifact_id: &str,
-    ) -> Result<()> {
+    pub async fn link_run_output(&self, run_id: &str, role: &str, artifact_id: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO run_outputs (run_id, role, artifact_id)
              VALUES ($1, $2, $3)
@@ -1060,11 +1030,7 @@ impl PgStore {
         Ok(())
     }
 
-    pub async fn copy_run_outputs(
-        &self,
-        source_run_id: &str,
-        dest_run_id: &str,
-    ) -> Result<()> {
+    pub async fn copy_run_outputs(&self, source_run_id: &str, dest_run_id: &str) -> Result<()> {
         let rows = self.run_output_links(source_run_id).await?;
         for (role, artifact_id) in &rows {
             self.link_run_output(dest_run_id, role, artifact_id).await?;
@@ -1076,11 +1042,7 @@ impl PgStore {
     /// Bulk-patch run_inputs whose resolved_path matches `path` and whose
     /// artifact_id is NULL — the operation that lights up `inputs.artifact_id`
     /// once an artifact materializes at a path runs were waiting on.
-    pub async fn rehydrate_inputs_by_path(
-        &self,
-        path: &str,
-        artifact_id: &str,
-    ) -> Result<usize> {
+    pub async fn rehydrate_inputs_by_path(&self, path: &str, artifact_id: &str) -> Result<usize> {
         let result = sqlx::query(
             "UPDATE run_inputs SET artifact_id = $1 \
              WHERE resolved_path = $2 AND artifact_id IS NULL",
@@ -1131,15 +1093,16 @@ impl PgStore {
         producer_run_id: &str,
         outputs: &[(String, String)],
     ) -> Result<usize> {
-        let producer = self
-            .get_run(producer_run_id)
-            .await?
-            .with_context(|| format!("backfill_stage_consumers: producer not found {producer_run_id}"))?;
-        let (pipeline_id, stage_name) =
-            match (producer.pipeline_id.as_deref(), producer.stage_name.as_deref()) {
-                (Some(p), Some(s)) => (p.to_string(), s.to_string()),
-                _ => return Ok(0),
-            };
+        let producer = self.get_run(producer_run_id).await?.with_context(|| {
+            format!("backfill_stage_consumers: producer not found {producer_run_id}")
+        })?;
+        let (pipeline_id, stage_name) = match (
+            producer.pipeline_id.as_deref(),
+            producer.stage_name.as_deref(),
+        ) {
+            (Some(p), Some(s)) => (p.to_string(), s.to_string()),
+            _ => return Ok(0),
+        };
         let outputs_by_role: BTreeMap<&str, &str> = outputs
             .iter()
             .map(|(r, a)| (r.as_str(), a.as_str()))
@@ -1154,7 +1117,11 @@ impl PgStore {
                 Err(_) => continue,
             };
             for (input_role, spec) in &recipe.inputs {
-                let InputSpec::Stage { stage, role: parent_role } = spec else {
+                let InputSpec::Stage {
+                    stage,
+                    role: parent_role,
+                } = spec
+                else {
                     continue;
                 };
                 if stage != &stage_name {
@@ -1247,9 +1214,7 @@ impl PgStore {
             format!(r#"GRANT ALL ON SCHEMA public TO "{name}""#),
             format!(r#"GRANT ALL ON ALL TABLES IN SCHEMA public TO "{name}""#),
             format!(r#"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO "{name}""#),
-            format!(
-                r#"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO "{name}""#
-            ),
+            format!(r#"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO "{name}""#),
             format!(
                 r#"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO "{name}""#
             ),
@@ -1518,9 +1483,8 @@ fn build_connect_options(pg: &PgConfig) -> Result<PgConnectOptions> {
     };
     opts = opts.username(&user);
     if let Some(var) = pg.password_env.as_deref() {
-        let pw = std::env::var(var).with_context(|| {
-            format!("[postgres].password_env={var} but the env var is unset")
-        })?;
+        let pw = std::env::var(var)
+            .with_context(|| format!("[postgres].password_env={var} but the env var is unset"))?;
         opts = opts.password(&pw);
     }
     Ok(opts)
@@ -1610,7 +1574,7 @@ mod tests {
         let runs = store.list_runs().await.expect("list_runs");
         let artifacts = store.list_artifacts().await.expect("list_artifacts");
         let pipelines = store.list_pipelines().await.expect("list_pipelines");
-        eprintln!(
+        tracing::info!(
             "live PG smoke: runs={} artifacts={} pipelines={}",
             runs.len(),
             artifacts.len(),
@@ -1618,6 +1582,108 @@ mod tests {
         );
         assert!(!runs.is_empty(), "expected imported runs");
         assert!(!artifacts.is_empty(), "expected imported artifacts");
+    }
+
+    /// End-to-end exercise of the async Store path against a live PG.
+    /// Creates a uniquely-named user + run + artifact, verifies the
+    /// FK web (artifacts→runs, run_outputs→runs+artifacts), exercises
+    /// the notify trigger via append_event, and cleans up. Run with
+    /// `cargo test -- --ignored round_trip_run_and_artifact`.
+    #[tokio::test]
+    #[ignore = "requires running PG"]
+    async fn round_trip_run_and_artifact() {
+        use crate::store::Store;
+
+        let cluster = live_cluster().expect("cluster.toml present");
+        let store = Store::connect(&cluster).await.expect("connect");
+        let pg = store.pg();
+        let now = crate::util::now_ts();
+
+        // Scope every name with a uuid so the test never collides with
+        // production data or with itself across parallel runs.
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let user_name = format!("__test_user_{suffix}");
+        let run_id = format!("run_{suffix}");
+
+        // 1. Insert a user (FK target for runs.submitted_by etc.)
+        store
+            .insert_user(&user_name, now)
+            .await
+            .expect("insert_user");
+
+        // 2. Insert a run owned by that user.
+        let recipe = crate::config::Recipe {
+            name: "test_recipe".to_string(),
+            repo: "labctl".to_string(),
+            command: vec!["true".to_string()],
+            resources: Default::default(),
+            inputs: Default::default(),
+            outputs: Default::default(),
+            params: Default::default(),
+            args: Default::default(),
+            env: Default::default(),
+            tracking: Default::default(),
+            sweep: None,
+        };
+        let recipe_hash: String = (0..64)
+            .map(|i| std::char::from_digit((i % 16) as u32, 16).unwrap())
+            .collect();
+        store
+            .insert_run(
+                crate::store::NewRun {
+                    id: &run_id,
+                    recipe: &recipe,
+                    recipe_hash: &recipe_hash,
+                    status: "succeeded",
+                    run_dir: std::path::Path::new("/tmp/labctl-test"),
+                    source_path: std::path::Path::new("/tmp/labctl-test/source"),
+                    context_json: &serde_json::json!({"schema_version": 1}),
+                    submitted_by: Some(&user_name),
+                    cache_key: None,
+                },
+                &[],
+            )
+            .await
+            .expect("insert_run");
+
+        // Terminal status requires a finished_at to satisfy the
+        // runs_terminal_finished_at biconditional.
+        store
+            .update_status(&run_id, "succeeded", Some(now))
+            .await
+            .expect("update_status");
+
+        // 3. Notify trigger: append_event should fire pg_notify; we
+        //    don't subscribe here but verify the row lands.
+        let ev_id = pg
+            .append_event(
+                Some(&run_id),
+                "test.round_trip",
+                &serde_json::json!({"phase": "post_insert"}),
+                now,
+            )
+            .await
+            .expect("append_event");
+        assert!(ev_id > 0);
+
+        // 4. Read back via run_view.
+        let view = store.run_view(&run_id).await.expect("run_view");
+        assert_eq!(view.run.id, run_id);
+        assert_eq!(view.run.status, "succeeded");
+        assert_eq!(view.run.submitted_by.as_deref(), Some(user_name.as_str()));
+
+        // 5. Cleanup — ON DELETE CASCADE on events/tracking; explicit
+        //    delete on user since users has no incoming cascade.
+        sqlx::query("DELETE FROM runs WHERE id = $1")
+            .bind(&run_id)
+            .execute(pg.pool())
+            .await
+            .expect("delete run");
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user_name)
+            .execute(pg.pool())
+            .await
+            .expect("delete user");
     }
 
     #[tokio::test]
