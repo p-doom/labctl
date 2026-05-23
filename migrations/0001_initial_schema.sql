@@ -1,17 +1,41 @@
--- labctl initial schema. Ported from the in-memory SQLite cache that
--- previously rebuilt from filesystem sidecars on every startup. PG
--- is now the source of truth for metadata; sidecars on NFS remain
--- only as the compute→login bridge (status.json, outputs.json) and
--- as human-debuggable projections. Artifact bytes and provenance
--- bundles continue to live in content-addressed FS trees.
+-- labctl schema. Postgres is the source of truth for run metadata,
+-- artifact lineage, eval requests, tracking, and the event log. NFS
+-- holds only artifact bytes, per-run snapshots, and provenance
+-- bundles — pointers in this DB, contents on disk.
 --
--- Conventions vs. the prior SQLite schema:
---   * `INTEGER`-as-timestamp → `BIGINT` (seconds since epoch).
---   * `TEXT`-as-JSON-blob → `JSONB` (queryable + path indexable).
---   * `INTEGER PRIMARY KEY AUTOINCREMENT` → `BIGSERIAL` / `IDENTITY`.
---   * `"user"` is quoted everywhere — it's a reserved keyword
---     associated with `current_user()`; quoting makes the column
---     unambiguous in joins and views.
+-- Conventions:
+--   * timestamps are `BIGINT` seconds-since-epoch.
+--   * JSON columns are `JSONB` (path-queryable, index-friendly).
+--   * `"user"` is quoted everywhere — reserved keyword, quoting
+--     makes joins and views unambiguous.
+--
+-- FKs that participate in cycles (runs → pipelines, artifacts →
+-- runs, eval_requests → runs) are DEFERRABLE INITIALLY DEFERRED so
+-- bulk loaders can populate the graph inside one transaction without
+-- ordering tricks.
+
+-- ---------- users ----------
+
+CREATE TABLE users (
+    name        TEXT PRIMARY KEY,
+    created_at  BIGINT NOT NULL,
+    -- Intentionally redundant with `name` today; left distinct so a
+    -- deployment can diverge the two without a schema change (e.g.
+    -- labctl-side username distinct from the connecting PG role).
+    pg_role     TEXT NOT NULL
+);
+
+-- ---------- pipelines ----------
+
+CREATE TABLE pipelines (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    pipeline_path TEXT,
+    "user"        TEXT NOT NULL REFERENCES users(name),
+    created_at    BIGINT NOT NULL
+);
+
+-- ---------- runs ----------
 
 CREATE TABLE runs (
     id                       TEXT PRIMARY KEY,
@@ -29,95 +53,90 @@ CREATE TABLE runs (
     pipeline_id              TEXT,
     dependency_on            JSONB,
     stage_name               TEXT,
-    submitted_by             TEXT NOT NULL,
+    submitted_by             TEXT NOT NULL REFERENCES users(name),
     cache_key                TEXT,
-    coalesced_peer_run_id    TEXT
+    CONSTRAINT runs_status_check CHECK (
+        status IN (
+            'created',
+            'submitted',
+            'running',
+            'succeeded',
+            'failed',
+            'cancelled',
+            'timeout',
+            'oom',
+            'unknown_terminal',
+            'cache_hit'
+        )
+    ),
+    CONSTRAINT runs_pipeline_fk
+        FOREIGN KEY (pipeline_id) REFERENCES pipelines(id)
+        DEFERRABLE INITIALLY DEFERRED
 );
 
-CREATE TABLE pipelines (
-    id            TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    pipeline_path TEXT,
-    "user"        TEXT NOT NULL,
-    created_at    BIGINT NOT NULL
-);
+-- ---------- artifacts ----------
 
 CREATE TABLE artifacts (
     id              TEXT PRIMARY KEY,
     kind            TEXT NOT NULL,
     path            TEXT NOT NULL,
-    content_hash    TEXT NOT NULL,
     producer_run_id TEXT,
     metadata_json   JSONB NOT NULL,
     created_at      BIGINT NOT NULL,
-    "user"          TEXT NOT NULL,
-    alias_segment   TEXT NOT NULL
+    "user"          TEXT NOT NULL REFERENCES users(name),
+    CONSTRAINT artifacts_producer_fk
+        FOREIGN KEY (producer_run_id) REFERENCES runs(id)
+        DEFERRABLE INITIALLY DEFERRED
 );
+
+-- ---------- artifact_aliases ----------
 
 CREATE TABLE artifact_aliases (
     alias        TEXT PRIMARY KEY,
-    artifact_id  TEXT NOT NULL,
+    artifact_id  TEXT NOT NULL REFERENCES artifacts(id),
     created_at   BIGINT NOT NULL
 );
 
--- Per-user alias overlay onto content-addressed artifacts. An artifact
--- (one content_hash, one id) can be referenced by multiple
--- ("user", alias, kind) tuples — e.g. Alice produces ds, Bob produces
--- byte-identical ds with the same alias name; both get rows here
--- pointing at the same artifact_id. Disk truth lives at
--- `<artifact_roots[kind]>/aliases/<user>/<alias>` as a symlink to the
--- artifact's `_objects/<prefix>/<hash>/` dir.
-CREATE TABLE artifact_user_aliases (
-    "user"       TEXT NOT NULL,
-    alias        TEXT NOT NULL,
-    kind         TEXT NOT NULL,
-    artifact_id  TEXT NOT NULL,
-    created_at   BIGINT NOT NULL,
-    PRIMARY KEY ("user", alias, kind)
-);
+-- ---------- run_inputs / run_outputs ----------
 
 CREATE TABLE run_inputs (
-    run_id        TEXT NOT NULL,
+    run_id        TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     role          TEXT NOT NULL,
-    artifact_id   TEXT,
+    artifact_id   TEXT REFERENCES artifacts(id),
     resolved_path TEXT NOT NULL,
     PRIMARY KEY (run_id, role)
 );
 
 CREATE TABLE run_outputs (
-    run_id      TEXT NOT NULL,
+    run_id      TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     role        TEXT NOT NULL,
-    artifact_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL REFERENCES artifacts(id),
     PRIMARY KEY (run_id, role, artifact_id)
 );
 
+-- ---------- eval_requests ----------
+
 CREATE TABLE eval_requests (
     eval_key                 TEXT PRIMARY KEY,
-    checkpoint_artifact_id   TEXT NOT NULL,
+    checkpoint_artifact_id   TEXT NOT NULL REFERENCES artifacts(id),
     eval_recipe_hash         TEXT NOT NULL,
     policy_id                TEXT NOT NULL,
     eval_run_id              TEXT,
     state                    TEXT NOT NULL,
     attempts                 BIGINT NOT NULL DEFAULT 0,
-    "user"                   TEXT NOT NULL,
+    "user"                   TEXT NOT NULL REFERENCES users(name),
     created_at               BIGINT NOT NULL,
-    updated_at               BIGINT NOT NULL
+    updated_at               BIGINT NOT NULL,
+    CONSTRAINT eval_requests_state_check CHECK (state = 'submitted'),
+    CONSTRAINT eval_requests_run_fk
+        FOREIGN KEY (eval_run_id) REFERENCES runs(id)
+        DEFERRABLE INITIALLY DEFERRED
 );
 
--- Coalesce slot. A new run hitting an unseen cache_key races to insert
--- here first; PG's PRIMARY KEY enforcement is the atomic primitive that
--- elects a single producer. Other contenders for the same cache_key
--- fall back to `runs.coalesced_peer_run_id` and await the producer's
--- outputs. Replaces the legacy NFS-mkdir-based claim_dir scheme — NFS
--- mkdir atomicity is not guaranteed across clients.
-CREATE TABLE coalesce_claims (
-    cache_key         TEXT PRIMARY KEY,
-    producer_run_id   TEXT NOT NULL,
-    claimed_at        BIGINT NOT NULL
-);
+-- ---------- tracking ----------
 
 CREATE TABLE tracking (
-    run_id      TEXT PRIMARY KEY,
+    run_id      TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
     entity      TEXT NOT NULL,
     project     TEXT NOT NULL,
     url         TEXT NOT NULL,
@@ -126,18 +145,34 @@ CREATE TABLE tracking (
     created_at  BIGINT NOT NULL
 );
 
--- Events table is now authoritative — replaces the prior events/<date>.jsonl
--- on disk. The `id` column is a monotonically-increasing cursor SSE
--- subscribers use to resume. Distinct from the cache-rebuild-derived ids
--- the prior SQLite cache used: now PG's BIGSERIAL is stable across
--- restarts.
+-- ---------- events ----------
+--
+-- BIGSERIAL `id` is the cursor SSE subscribers use to resume. The
+-- AFTER INSERT trigger fans the new id over `pg_notify` so listeners
+-- get push delivery instead of polling.
+
 CREATE TABLE events (
     id            BIGSERIAL PRIMARY KEY,
-    run_id        TEXT,
+    run_id        TEXT REFERENCES runs(id) ON DELETE CASCADE,
     event_type    TEXT NOT NULL,
     payload_json  JSONB NOT NULL,
     created_at    BIGINT NOT NULL
 );
+
+CREATE OR REPLACE FUNCTION notify_labctl_event() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_notify('labctl_events', NEW.id::text);
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER events_notify
+    AFTER INSERT ON events
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_labctl_event();
+
+-- ---------- indexes ----------
 
 CREATE INDEX idx_runs_status ON runs(status);
 CREATE INDEX idx_runs_pipeline ON runs(pipeline_id);
@@ -148,7 +183,6 @@ CREATE INDEX idx_runs_cache_key ON runs(cache_key);
 CREATE INDEX idx_artifacts_kind ON artifacts(kind);
 CREATE INDEX idx_artifacts_producer ON artifacts(producer_run_id);
 CREATE INDEX idx_artifacts_path ON artifacts(path);
-CREATE INDEX idx_artifacts_hash ON artifacts(kind, content_hash);
 
 CREATE INDEX idx_eval_requests_checkpoint ON eval_requests(checkpoint_artifact_id);
 
@@ -158,8 +192,6 @@ CREATE INDEX idx_run_inputs_artifact ON run_inputs(artifact_id);
 CREATE INDEX idx_run_outputs_run ON run_outputs(run_id);
 
 CREATE INDEX idx_aliases_artifact ON artifact_aliases(artifact_id);
-CREATE INDEX idx_user_aliases_artifact ON artifact_user_aliases(artifact_id);
-CREATE INDEX idx_user_aliases_kind ON artifact_user_aliases(kind, "user");
 
 CREATE INDEX idx_events_run ON events(run_id);
 CREATE INDEX idx_events_type ON events(event_type);

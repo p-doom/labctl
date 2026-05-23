@@ -355,7 +355,8 @@ enum ServiceCommand {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cluster_path = resolve_cluster_path(cli.cluster.clone());
 
@@ -432,7 +433,7 @@ fn main() -> Result<()> {
     // Doctor must work even when the cluster config doesn't load — that's
     // exactly the situation it's here to diagnose.
     if let Command::Doctor = &cli.command {
-        return run_doctor(&cluster_path);
+        return run_doctor(&cluster_path).await;
     }
     if let Command::Service { command } = cli.command {
         return match command {
@@ -492,24 +493,25 @@ fn main() -> Result<()> {
     // would race on POSIX locks (broken on parallel filesystems) and
     // corrupt the DB.
     if let Command::Run { recipe } = &cli.command {
-        return run_recipe_command(&cluster_path, recipe);
+        return run_recipe_command(&cluster_path, recipe).await;
     }
     if let Command::RunSweep { recipe } = &cli.command {
-        return run_sweep_command(&cluster_path, recipe);
+        return run_sweep_command(&cluster_path, recipe).await;
     }
     if let Command::RunPipeline { pipeline } = &cli.command {
-        return run_pipeline_command(&cluster_path, pipeline);
+        return run_pipeline_command(&cluster_path, pipeline).await;
     }
 
     let cluster = config::ClusterConfig::load(&cluster_path)?;
-    let store = store::Store::open(&cluster)?;
+    let store = store::Store::connect(&cluster).await?;
 
     match cli.command {
         Command::PipelineShow { id } => {
             let pipeline = store
-                .get_pipeline(&id)?
+                .get_pipeline(&id)
+                .await?
                 .with_context(|| format!("pipeline not found: {id}"))?;
-            let runs = store.list_pipeline_runs(&id)?;
+            let runs = store.list_pipeline_runs(&id).await?;
             let view = serde_json::json!({
                 "pipeline": {
                     "id": pipeline.id,
@@ -529,11 +531,11 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Command::Reconcile => {
-            let report = runner::reconcile(&cluster, &store)?;
+            let report = runner::reconcile(&cluster, &store).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Status => {
-            for run in store.list_runs()? {
+            for run in store.list_runs().await? {
                 println!(
                     "{:<28} {:<12} {:<10} {}",
                     run.id,
@@ -544,15 +546,15 @@ fn main() -> Result<()> {
             }
         }
         Command::Show { id } => {
-            let view = store.run_view(&id)?;
+            let view = store.run_view(&id).await?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Command::Gc { terminal_snapshots } => {
-            let removed = runner::gc(&cluster, &store, terminal_snapshots)?;
+            let removed = runner::gc(&cluster, &store, terminal_snapshots).await?;
             println!("removed_snapshots: {removed}");
         }
         Command::RegisterExternal { alias, path, kind } => {
-            let artifact = artifacts::register_external(&store, &alias, &path, &kind)?;
+            let artifact = artifacts::register_external(&store, &alias, &path, &kind).await?;
             println!("artifact_id: {}", artifact.id);
             println!("alias: {alias}");
         }
@@ -564,14 +566,15 @@ fn main() -> Result<()> {
                     &name,
                     !no_pg_role,
                     !no_create_dirs,
-                )?;
+                )
+                .await?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
         },
         Command::Evald { command } => match command {
             EvaldCommand::Once { policy } => {
                 let policy = config::EvalPolicy::load(&policy)?;
-                let report = evald::run_once(&cluster, &store, &policy)?;
+                let report = evald::run_once(&cluster, &store, &policy).await?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
         },
@@ -580,10 +583,10 @@ fn main() -> Result<()> {
             let addr: std::net::SocketAddr = bind
                 .parse()
                 .with_context(|| format!("invalid --bind address {bind:?}"))?;
-            server::serve(cluster, store.pg(), addr)?;
+            server::serve(cluster, store.pg(), addr).await?;
         }
         Command::Agent => {
-            agent::run_standalone(cluster, store)?;
+            agent::run_standalone(cluster).await?;
         }
         Command::Validate { .. }
         | Command::Service { .. }
@@ -602,7 +605,7 @@ fn main() -> Result<()> {
 /// Self-check intended for first-time setup and bug reports. Never bails:
 /// every failure becomes a "FAIL" line so the user sees the whole picture.
 /// Exits with code 1 if any check failed, 0 otherwise.
-fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
+async fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
     use std::process::Command as Cmd;
     let mut failed = 0usize;
     let mut emit = |label: &str, ok: bool, detail: &str| {
@@ -644,12 +647,11 @@ fn run_doctor(cluster_path: &PathBuf) -> Result<()> {
             &runs_base.display().to_string(),
         );
 
-        // Filesystem-truth registry: the index is rebuilt in-memory on
-        // every open. We surface the indexer outcome so doctor can flag a
-        // partially-populated tree (typically permissions on a subdir).
-        match store::Store::open(cluster) {
-            Ok(_) => emit("registry index", true, "ok"),
-            Err(e) => emit("registry index", false, &format!("{e:#}")),
+        // Postgres-backed registry: connecting validates pool, migrations,
+        // and reachability in one shot.
+        match store::Store::connect(cluster).await {
+            Ok(_) => emit("registry connect", true, "ok"),
+            Err(e) => emit("registry connect", false, &format!("{e:#}")),
         }
 
         // Each user produces artifacts under `<root>/<user>/<alias>/`.
@@ -958,19 +960,19 @@ fn group_traversable(path: &std::path::Path) -> Result<(), String> {
 /// script, and shells out to `sbatch` under its own uid. SLURM job
 /// ownership therefore matches the OS user, and `submitted_by` in the
 /// row is path-canonical.
-fn run_recipe_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()> {
+async fn run_recipe_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()> {
     let cluster = config::ClusterConfig::load(cluster_path)?;
     let recipe = config::Recipe::load(recipe_path)?;
     let submitted_by = current_user()?;
-    let store = store::Store::open(&cluster)?;
-    let submitted = runner::submit_recipe(&cluster, &store, &recipe, None, &submitted_by)?;
+    let store = store::Store::connect(&cluster).await?;
+    let submitted = runner::submit_recipe(&cluster, &store, &recipe, None, &submitted_by).await?;
     println!("run_id: {}", submitted.run_id);
     println!("job_id: {}", submitted.job_id);
     println!("run_dir: {}", submitted.run_dir.display());
     Ok(())
 }
 
-fn run_sweep_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()> {
+async fn run_sweep_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()> {
     let cluster = config::ClusterConfig::load(cluster_path)?;
     let recipe = config::Recipe::load(recipe_path)?;
     if recipe.sweep.is_none() {
@@ -993,8 +995,8 @@ fn run_sweep_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()
         if sweep.aggregate.is_some() { " + aggregate" } else { "" },
     );
     let submitted_by = current_user()?;
-    let store = store::Store::open(&cluster)?;
-    let result = runner::submit_sweep(&cluster, &store, &recipe, &submitted_by)?;
+    let store = store::Store::connect(&cluster).await?;
+    let result = runner::submit_sweep(&cluster, &store, &recipe, &submitted_by).await?;
     println!(
         "array_run_id: {}\narray_job_id: {}\narray_run_dir: {}",
         result.array_run.run_id,
@@ -1009,18 +1011,19 @@ fn run_sweep_command(cluster_path: &PathBuf, recipe_path: &PathBuf) -> Result<()
     Ok(())
 }
 
-fn run_pipeline_command(cluster_path: &PathBuf, pipeline_path: &PathBuf) -> Result<()> {
+async fn run_pipeline_command(cluster_path: &PathBuf, pipeline_path: &PathBuf) -> Result<()> {
     let cluster = config::ClusterConfig::load(cluster_path)?;
     let loaded = config::Pipeline::load(pipeline_path)?;
     let submitted_by = current_user()?;
-    let store = store::Store::open(&cluster)?;
+    let store = store::Store::connect(&cluster).await?;
     let submitted = runner::submit_pipeline(
         &cluster,
         &store,
         &loaded,
         Some(pipeline_path),
         &submitted_by,
-    )?;
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&submitted)?);
     Ok(())
 }

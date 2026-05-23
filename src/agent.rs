@@ -98,20 +98,14 @@ fn spawn(
 /// Owns no HTTP listener; this process never accepts a network
 /// connection. Pair with `labctl serve` (HTTP-only) running on the same
 /// or another host for the UI.
-pub fn run_standalone(cluster: ClusterConfig, store: Store) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("failed to build tokio runtime: {e}"))?;
-    runtime.block_on(async move {
-        let store = Arc::new(store);
-        let shutdown = Arc::new(Notify::new());
-        spawn(Arc::new(cluster), store.clone(), shutdown.clone());
-        eprintln!("labctl agent running (no HTTP listener; ctrl-c to stop)");
-        let _ = tokio::signal::ctrl_c().await;
-        eprintln!("\nshutting down");
-        shutdown.notify_waiters();
-    });
+pub async fn run_standalone(cluster: ClusterConfig) -> Result<()> {
+    let store = Arc::new(Store::connect(&cluster).await?);
+    let shutdown = Arc::new(Notify::new());
+    spawn(Arc::new(cluster), store, shutdown.clone());
+    eprintln!("labctl agent running (no HTTP listener; ctrl-c to stop)");
+    let _ = tokio::signal::ctrl_c().await;
+    eprintln!("\nshutting down");
+    shutdown.notify_waiters();
     Ok(())
 }
 
@@ -124,11 +118,11 @@ async fn reconcile_loop(
     let interval = Duration::from_secs(dispatch.reconcile_interval_secs);
     // Run once immediately on boot so the registry isn't stale waiting
     // for the first tick.
-    do_reconcile(&cluster, &store);
+    do_reconcile(&cluster, &store).await;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
-                do_reconcile(&cluster, &store);
+                do_reconcile(&cluster, &store).await;
             }
             _ = shutdown.notified() => {
                 eprintln!("labctl dispatch: reconcile_loop shutdown");
@@ -138,10 +132,7 @@ async fn reconcile_loop(
     }
 }
 
-fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
-    // Snapshot the active-run list under one short lock, then iterate
-    // outside the lock — taking the mutex per run. UI requests can
-    // interleave between runs instead of waiting for the whole pass.
+async fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
     // Scope to runs this daemon's OS user submitted: in a multi-tenant
     // deployment each user runs their own daemon over a shared
     // filesystem-truth registry, and a daemon that reconciles another
@@ -154,10 +145,7 @@ fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
             return;
         }
     };
-    let runs = match {
-        let s = &store;
-        s.list_active_runs(&submitted_by)
-    } {
+    let runs = match store.list_active_runs(&submitted_by).await {
         Ok(rs) => rs,
         Err(e) => {
             eprintln!("labctl dispatch: list_active_runs failed: {e:#}");
@@ -167,11 +155,7 @@ fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
     let mut runs_reconciled = 0usize;
     let mut artifacts_registered = 0usize;
     for run in runs {
-        let result = {
-            let s = &store;
-            runner::reconcile_one(cluster, &s, &run)
-        };
-        match result {
+        match runner::reconcile_one(cluster, store, &run).await {
             Ok(step) => {
                 if step.status_changed {
                     runs_reconciled += 1;
@@ -190,14 +174,15 @@ fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
     // restarted between a parent's terminal transition and the in-pass
     // try_submit_pending_children call. Idempotent: already-advanced
     // children no longer appear in list_terminal_runs_with_pending_children.
-    let orphans = {
-        let s = &store;
-        s.list_terminal_runs_with_pending_children(&submitted_by)
-    };
-    match orphans {
+    match store
+        .list_terminal_runs_with_pending_children(&submitted_by)
+        .await
+    {
         Ok(parents) => {
             for parent in parents {
-                if let Err(e) = runner::try_submit_pending_children(cluster, &store, &parent) {
+                if let Err(e) =
+                    runner::try_submit_pending_children(cluster, store, &parent).await
+                {
                     eprintln!(
                         "labctl dispatch: orphan sweep for {} failed: {e:#}",
                         parent.id
@@ -240,7 +225,7 @@ async fn gc_loop(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
-                do_gc(&cluster, &store, min_age);
+                do_gc(&cluster, &store, min_age).await;
             }
             _ = shutdown.notified() => {
                 eprintln!("labctl dispatch: gc_loop shutdown");
@@ -250,12 +235,8 @@ async fn gc_loop(
     }
 }
 
-fn do_gc(cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u64) {
-    let removed = {
-        let s = &store;
-        runner::gc_terminal_sources(&s, min_terminal_age_secs)
-    };
-    match removed {
+async fn do_gc(cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u64) {
+    match runner::gc_terminal_sources(store, min_terminal_age_secs).await {
         Ok(0) => {}
         Ok(n) => eprintln!("labctl dispatch: gc reaped {n} source snapshot(s)"),
         Err(e) => eprintln!("labctl dispatch: gc failed: {e:#}"),
@@ -266,7 +247,7 @@ fn do_gc(cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u64
     // is a sensible minimum (it's already the agent operator's "this
     // run is settled" threshold).
     let orphan_min_age = min_terminal_age_secs.max(3600);
-    match runner::gc_orphan_run_dirs(cluster, store, orphan_min_age) {
+    match runner::gc_orphan_run_dirs(cluster, store, orphan_min_age).await {
         Ok(0) => {}
         Ok(n) => eprintln!("labctl dispatch: gc reaped {n} orphan run-dir(s)"),
         Err(e) => eprintln!("labctl dispatch: orphan-dir gc failed: {e:#}"),
@@ -285,7 +266,7 @@ async fn evald_loop(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
-                do_evald(&cluster, &store, &dispatch);
+                do_evald(&cluster, &store, &dispatch).await;
             }
             _ = shutdown.notified() => {
                 eprintln!("labctl dispatch: evald_loop shutdown");
@@ -295,7 +276,7 @@ async fn evald_loop(
     }
 }
 
-fn do_evald(
+async fn do_evald(
     cluster: &ClusterConfig,
     store: &Arc<Store>,
     dispatch: &DispatchConfig,
@@ -322,11 +303,7 @@ fn do_evald(
                 continue;
             }
         };
-        let result = {
-            let s = &store;
-            evald::run_once(cluster, &s, &policy)
-        };
-        match result {
+        match evald::run_once(cluster, store, &policy).await {
             Ok(report) => {
                 total_submitted += report.submitted;
             }
@@ -342,7 +319,7 @@ fn do_evald(
         eprintln!("labctl dispatch: evald submitted {total_submitted} eval run(s)");
     }
     if let Some(throttle) = &dispatch.throttle {
-        if let Err(e) = enforce_throttle(cluster, throttle) {
+        if let Err(e) = enforce_throttle(cluster, throttle).await {
             eprintln!("labctl dispatch: throttle failed: {e:#}");
         }
     }
@@ -433,9 +410,9 @@ pub fn parse_squeue_lines(out: &str) -> Vec<SqueueRow> {
         .collect()
 }
 
-fn enforce_throttle(_cluster: &ClusterConfig, throttle: &ThrottleConfig) -> Result<()> {
+async fn enforce_throttle(_cluster: &ClusterConfig, throttle: &ThrottleConfig) -> Result<()> {
     let user = std::env::var("USER").unwrap_or_else(|_| "labctl".to_string());
-    let output = std::process::Command::new("squeue")
+    let output = tokio::process::Command::new("squeue")
         .args([
             "-u",
             &user,
@@ -444,7 +421,8 @@ fn enforce_throttle(_cluster: &ClusterConfig, throttle: &ThrottleConfig) -> Resu
             "%i|%j|%T|%r",
             "--states=PENDING,RUNNING",
         ])
-        .output()?;
+        .output()
+        .await?;
     if !output.status.success() {
         anyhow::bail!(
             "squeue failed: {}",
@@ -468,7 +446,7 @@ fn enforce_throttle(_cluster: &ClusterConfig, throttle: &ThrottleConfig) -> Resu
             ThrottleAction::Hold(id) => vec!["hold", id.as_str()],
             ThrottleAction::Release(id) => vec!["release", id.as_str()],
         };
-        let result = std::process::Command::new(scontrol).args(&arg).output();
+        let result = tokio::process::Command::new(scontrol).args(&arg).output().await;
         match result {
             Ok(o) if o.status.success() => {
                 eprintln!("labctl throttle: {verb} {job_id}");

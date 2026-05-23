@@ -77,7 +77,7 @@ struct StreamEvent {
     id: String,
 }
 
-pub fn serve(cluster: ClusterConfig, pg: Arc<PgStore>, addr: SocketAddr) -> Result<()> {
+pub async fn serve(cluster: ClusterConfig, pg: Arc<PgStore>, addr: SocketAddr) -> Result<()> {
     // 256 is plenty — broadcast is for live deltas, not a queue. Slow
     // subscribers get lagged out and re-sync via REST on next focus.
     let (events_tx, _) = broadcast::channel::<StreamEvent>(256);
@@ -128,28 +128,20 @@ pub fn serve(cluster: ClusterConfig, pg: Arc<PgStore>, addr: SocketAddr) -> Resu
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build tokio runtime")?;
+    // SSE tailer subscribes to LISTEN labctl_events (the trigger on
+    // `events` in migration 0001 fires pg_notify per insert). On
+    // listener-connection error the supervisor reconnects after a
+    // brief backoff — there is no silent fall-through to polling.
+    tokio::spawn(events_tailer(tail_pg, events_tx));
 
-    runtime.block_on(async move {
-        // SSE tailer subscribes to LISTEN labctl_events (the trigger on
-        // `events` in migration 0002 fires pg_notify per insert). On
-        // listener-connection error the supervisor reconnects after a
-        // brief backoff — there is no silent fall-through to polling.
-        tokio::spawn(events_tailer(tail_pg, events_tx));
-
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("failed to bind {addr}"))?;
-        eprintln!("labctl listening on http://{addr}");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .context("server error")
-    })?;
-
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?;
+    eprintln!("labctl listening on http://{addr}");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
     Ok(())
 }
 

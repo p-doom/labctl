@@ -28,8 +28,8 @@ pub enum PopulateResult {
 /// without doing any I/O if a row exists. Suitable to call on every run
 /// from inside `reconcile` — the only cost when nothing changes is one
 /// indexed SQL lookup per run.
-pub fn try_populate_from_log(store: &Store, run: &RunRow) -> Result<PopulateResult> {
-    if store.get_tracking(&run.id)?.is_some() {
+pub async fn try_populate_from_log(store: &Store, run: &RunRow) -> Result<PopulateResult> {
+    if store.get_tracking(&run.id).await?.is_some() {
         return Ok(PopulateResult::AlreadyTracked);
     }
     let Some((log_path, _)) = newest_log(&run.run_dir) else {
@@ -41,7 +41,9 @@ pub fn try_populate_from_log(store: &Store, run: &RunRow) -> Result<PopulateResu
     let Some((entity, project)) = parse_wandb_url(&url) else {
         return Ok(PopulateResult::NoUrl);
     };
-    store.set_tracking(&run.id, &entity, &project, &url, None, "log")?;
+    store
+        .set_tracking(&run.id, &entity, &project, &url, None, "log")
+        .await?;
     Ok(PopulateResult::Matched)
 }
 

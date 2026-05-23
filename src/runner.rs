@@ -2,8 +2,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
+
+use tokio::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -58,7 +59,7 @@ struct SchedulerOutcome {
     finished_at: Option<i64>,
 }
 
-pub fn submit_recipe(
+pub async fn submit_recipe(
     cluster: &ClusterConfig,
     store: &Store,
     recipe: &Recipe,
@@ -66,7 +67,7 @@ pub fn submit_recipe(
     submitted_by: &str,
 ) -> Result<SubmittedRun> {
     fs_layout::validate_user(submitted_by)?;
-    submit_recipe_inner(cluster, store, recipe, overrides, None, &[], None, submitted_by, None)
+    submit_recipe_inner(cluster, store, recipe, overrides, None, &[], None, submitted_by, None).await
 }
 
 #[derive(Debug, Clone)]
@@ -167,7 +168,7 @@ fn cache_hit_outputs_valid(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn register_cache_hit(
+async fn register_cache_hit(
     cluster: &ClusterConfig,
     store: &Store,
     recipe: &Recipe,
@@ -210,29 +211,35 @@ fn register_cache_hit(
         &serde_json::to_vec_pretty(&ctx)?,
     )?;
 
-    store.insert_run(
-        crate::store::NewRun {
-            id: run_id,
-            recipe,
-            recipe_hash,
-            status: "created",
-            run_dir,
-            source_path: &source_path,
-            context_json: &ctx,
-            submitted_by: Some(submitted_by),
-            cache_key: Some(cache_key),
-        },
-        inputs,
-    )?;
+    store
+        .insert_run(
+            crate::store::NewRun {
+                id: run_id,
+                recipe,
+                recipe_hash,
+                status: "created",
+                run_dir,
+                source_path: &source_path,
+                context_json: &ctx,
+                submitted_by: Some(submitted_by),
+                cache_key: Some(cache_key),
+            },
+            inputs,
+        )
+        .await?;
 
     // Link the prior run's output artifacts into this new run's output set.
-    store.copy_run_outputs(prior_run_id, run_id)?;
+    store.copy_run_outputs(prior_run_id, run_id).await?;
 
     // Emit the explanatory event before flipping to the terminal state so
     // downstream tooling can distinguish "skipped due to cache hit" from
     // "completed normally".
-    store.append_stage_cache_hit_event(run_id, cache_key, prior_run_id)?;
-    store.update_status(run_id, "cache_hit", Some(util::now_ts()))?;
+    store
+        .append_stage_cache_hit_event(run_id, cache_key, prior_run_id)
+        .await?;
+    store
+        .update_status(run_id, "cache_hit", Some(util::now_ts()))
+        .await?;
 
     // Optional: silence the unused-param warning when cluster isn't needed
     // for cache-hit. Keeping the arg in the signature mirrors the regular
@@ -250,13 +257,14 @@ fn register_cache_hit(
 /// Resolve a pipeline's ``from`` historical pin to a role-keyed map of
 /// artifact rows. Rejects pinning to non-succeeded runs — pinning to
 /// in-flight or failed runs is almost always a mistake.
-fn resolve_from(
+async fn resolve_from(
     _cluster: &ClusterConfig,
     store: &Store,
     from_id: &str,
 ) -> Result<BTreeMap<String, ArtifactRow>> {
     let run = store
         .get_run(from_id)
+        .await
         .with_context(|| format!("from = {from_id:?}: no such run"))?;
     match run.status.as_str() {
         "succeeded" | "cache_hit" => {}
@@ -265,7 +273,7 @@ fn resolve_from(
              succeeded or cache-hit a prior succeeded run"
         ),
     }
-    let outputs = store.run_outputs(from_id)?;
+    let outputs = store.run_outputs(from_id).await?;
     key_outputs_by_role(from_id, outputs)
 }
 
@@ -292,7 +300,7 @@ fn key_outputs_by_role(
     Ok(by_role)
 }
 
-fn submit_recipe_inner(
+async fn submit_recipe_inner(
     cluster: &ClusterConfig,
     store: &Store,
     recipe: &Recipe,
@@ -315,7 +323,7 @@ fn submit_recipe_inner(
     fs::create_dir_all(&lab_dir)?;
 
     // Inputs first: alias templates may reference {inputs.X.path}.
-    let inputs = resolve_inputs(cluster, store, recipe, &overrides, stage_ctx, submitted_by)?;
+    let inputs = resolve_inputs(cluster, store, recipe, &overrides, stage_ctx, submitted_by).await?;
 
     // Render output aliases against a partial context (no outputs yet — they
     // are what we are computing). An alias that references {outputs.*} would
@@ -345,8 +353,8 @@ fn submit_recipe_inner(
     // Cache hit: a prior run with the same cache_key still has its outputs
     // on disk. Link them and skip the entire submit / source-copy / sbatch
     // path. The recipe is unchanged; the registry IS the cache.
-    if let Some(prior_run) = store.find_cache_hit_candidate(&cache_key)? {
-        let prior_outputs = store.run_outputs(&prior_run.id)?;
+    if let Some(prior_run) = store.find_cache_hit_candidate(&cache_key).await? {
+        let prior_outputs = store.run_outputs(&prior_run.id).await?;
         if cache_hit_outputs_valid(&prior_outputs, &outputs) {
             return register_cache_hit(
                 cluster,
@@ -364,7 +372,8 @@ fn submit_recipe_inner(
                 stage_ctx,
                 parent_job_ids,
                 submitted_by,
-            );
+            )
+            .await;
         }
     }
 
@@ -458,37 +467,41 @@ fn submit_recipe_inner(
     let script_path = lab_dir.join(fs_layout::SUBMIT_SH);
     util::atomic_write(&script_path, script.as_bytes())?;
 
-    store.insert_run(
-        NewRun {
-            id: &run_id,
-            recipe,
-            recipe_hash: &recipe_hash,
-            status: "created",
-            run_dir: &run_dir,
-            source_path: &source_path,
-            context_json: &ctx,
-            submitted_by: Some(submitted_by),
-            cache_key: Some(&cache_key),
-        },
-        &inputs,
-    )?;
+    store
+        .insert_run(
+            NewRun {
+                id: &run_id,
+                recipe,
+                recipe_hash: &recipe_hash,
+                status: "created",
+                run_dir: &run_dir,
+                source_path: &source_path,
+                context_json: &ctx,
+                submitted_by: Some(submitted_by),
+                cache_key: Some(&cache_key),
+            },
+            &inputs,
+        )
+        .await?;
 
     // Tracker row written at submission time. URL is fully derivable here
     // because we've forced WANDB_RUN_ID = labctl run id in the sbatch env.
     if let Some(wandb) = &recipe.tracking.wandb {
         let url = format!("https://wandb.ai/{}/{}/runs/{}", wandb.entity, wandb.project, run_id);
-        store.set_tracking(
-            &run_id,
-            &wandb.entity,
-            &wandb.project,
-            &url,
-            wandb.group.as_deref(),
-            "schema",
-        )?;
+        store
+            .set_tracking(
+                &run_id,
+                &wandb.entity,
+                &wandb.project,
+                &url,
+                wandb.group.as_deref(),
+                "schema",
+            )
+            .await?;
     }
 
-    let job_id = submit_script(cluster, &script_path, &run_id)?;
-    store.set_submitted(&run_id, &job_id)?;
+    let job_id = submit_script(cluster, &script_path, &run_id).await?;
+    store.set_submitted(&run_id, &job_id).await?;
 
     Ok(SubmittedRun {
         run_id,
@@ -543,7 +556,7 @@ struct ArraySweepInfo {
 /// the recipe declares `[sweep].aggregate`, a second job is submitted
 /// with `--dependency=afterok:<array_job_id>` so it runs only after ALL
 /// array tasks complete.
-pub fn submit_sweep(
+pub async fn submit_sweep(
     cluster: &ClusterConfig,
     store: &Store,
     recipe: &Recipe,
@@ -579,7 +592,8 @@ pub fn submit_sweep(
         None,
         submitted_by,
         Some(&array_info),
-    )?;
+    )
+    .await?;
 
     let aggregate = if let Some(agg_path) = &sweep.aggregate {
         let agg_recipe = crate::config::Recipe::load(agg_path)
@@ -596,7 +610,8 @@ pub fn submit_sweep(
             None,
             submitted_by,
             None,
-        )?;
+        )
+        .await?;
         Some(submitted)
     } else {
         None
@@ -609,7 +624,7 @@ pub fn submit_sweep(
     })
 }
 
-pub fn submit_pipeline(
+pub async fn submit_pipeline(
     cluster: &ClusterConfig,
     store: &Store,
     pipeline: &LoadedPipeline,
@@ -623,7 +638,7 @@ pub fn submit_pipeline(
     // deferred until those parents are observed terminal-succeeded by
     // the agent's reconcile loop — see `try_submit_pending_children`.
     let pinned_outputs: BTreeMap<String, ArtifactRow> = match pipeline.from.as_deref() {
-        Some(from_id) => resolve_from(cluster, store, from_id)?,
+        Some(from_id) => resolve_from(cluster, store, from_id).await?,
         None => BTreeMap::new(),
     };
     // Allocate run_ids up-front: pending placeholders need them, and
@@ -635,7 +650,9 @@ pub fn submit_pipeline(
         .collect();
 
     let pipeline_id = util::new_id("pipeline");
-    store.insert_pipeline(&pipeline_id, &pipeline.name, pipeline_path)?;
+    store
+        .insert_pipeline(&pipeline_id, &pipeline.name, pipeline_path)
+        .await?;
 
     // Stages whose outputs are materialised _right now_. Roots that get
     // cache-hit during this call land here; non-cache-hit roots and any
@@ -685,13 +702,16 @@ pub fn submit_pipeline(
                 Some(preallocated.as_str()),
                 submitted_by,
                 None,
-            )?;
-            store.set_pipeline_membership(
-                &submitted.run_id,
-                &pipeline_id,
-                stage_name,
-                &dependency_on,
-            )?;
+            )
+            .await?;
+            store
+                .set_pipeline_membership(
+                    &submitted.run_id,
+                    &pipeline_id,
+                    stage_name,
+                    &dependency_on,
+                )
+                .await?;
             if submitted.cache_hit {
                 materialised.insert(stage_name.clone());
             }
@@ -712,17 +732,19 @@ pub fn submit_pipeline(
                 preallocated,
             );
             let source_path = run_dir.join("source").join(&loaded.recipe.repo);
-            store.insert_pending_pipeline_stage(
-                preallocated,
-                &loaded.recipe,
-                &recipe_hash,
-                &run_dir,
-                &source_path,
-                submitted_by,
-                &pipeline_id,
-                stage_name,
-                &dependency_on,
-            )?;
+            store
+                .insert_pending_pipeline_stage(
+                    preallocated,
+                    &loaded.recipe,
+                    &recipe_hash,
+                    &run_dir,
+                    &source_path,
+                    submitted_by,
+                    &pipeline_id,
+                    stage_name,
+                    &dependency_on,
+                )
+                .await?;
             submitted_stages.push(SubmittedStage {
                 stage_name: stage_name.clone(),
                 run_id: preallocated.clone(),
@@ -758,7 +780,7 @@ pub fn submit_pipeline(
 ///     blocked on this parent. No SLURM activity; the children are
 ///     marked terminal-failed in PG and downstream stages cascade in
 ///     turn on the next reconcile pass.
-pub fn try_submit_pending_children(
+pub async fn try_submit_pending_children(
     cluster: &ClusterConfig,
     store: &Store,
     parent: &crate::store::RunRow,
@@ -767,11 +789,11 @@ pub fn try_submit_pending_children(
         return Ok(0);
     }
     let cascade_failure = !matches!(parent.status.as_str(), "succeeded" | "cache_hit");
-    let candidates = store.pending_children_of(&parent.id)?;
+    let candidates = store.pending_children_of(&parent.id).await?;
     let mut advanced = 0usize;
     for child in candidates {
         if cascade_failure {
-            store.update_status(&child.id, "failed", parent.finished_at)?;
+            store.update_status(&child.id, "failed", parent.finished_at).await?;
             advanced += 1;
             continue;
         }
@@ -789,7 +811,7 @@ pub fn try_submit_pending_children(
             .unwrap_or_default();
         let mut all_ok = true;
         for pid in &parent_ids {
-            let p = store.get_run(pid)?;
+            let p = store.get_run(pid).await?;
             if !matches!(p.status.as_str(), "succeeded" | "cache_hit") {
                 all_ok = false;
                 break;
@@ -798,7 +820,7 @@ pub fn try_submit_pending_children(
         if !all_ok {
             continue;
         }
-        match complete_pending_submission(cluster, store, &child) {
+        match complete_pending_submission(cluster, store, &child).await {
             Ok(()) => advanced += 1,
             Err(e) => {
                 eprintln!(
@@ -806,7 +828,7 @@ pub fn try_submit_pending_children(
                     child.id
                 );
                 let now = crate::util::now_ts();
-                let _ = store.update_status(&child.id, "failed", Some(now));
+                let _ = store.update_status(&child.id, "failed", Some(now)).await;
             }
         }
     }
@@ -818,7 +840,7 @@ pub fn try_submit_pending_children(
 /// dependency_on, and call `submit_recipe_inner` with the existing
 /// run_id. The insert_run upsert path takes care of replacing the
 /// placeholder.
-fn complete_pending_submission(
+async fn complete_pending_submission(
     cluster: &ClusterConfig,
     store: &Store,
     child: &crate::store::RunRow,
@@ -843,7 +865,7 @@ fn complete_pending_submission(
         .stage_name
         .as_deref()
         .with_context(|| format!("pending run {} has no stage_name", child.id))?;
-    let siblings = store.list_pipeline_runs(pipeline_id)?;
+    let siblings = store.list_pipeline_runs(pipeline_id).await?;
     let stage_run_ids: BTreeMap<String, String> = siblings
         .iter()
         .filter_map(|r| r.stage_name.clone().map(|s| (s, r.id.clone())))
@@ -888,7 +910,8 @@ fn complete_pending_submission(
         Some(child.id.as_str()),
         &submitted_by,
         None,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -896,7 +919,7 @@ fn complete_pending_submission(
 /// can drive reconciles with per-run mutex granularity (acquire, do one
 /// run, release; UI requests interleave between iterations) instead of
 /// holding a single lock for the whole pass.
-pub fn reconcile_one(
+pub async fn reconcile_one(
     cluster: &ClusterConfig,
     store: &Store,
     run: &crate::store::RunRow,
@@ -906,20 +929,21 @@ pub fn reconcile_one(
         artifacts_registered: 0,
     };
     let (status, finished_at) = scheduler_outcome(cluster, run)
+        .await
         .map(|o| (o.status, o.finished_at))
         .unwrap_or_else(|| (run.status.clone(), None));
     if status != run.status {
-        store.update_status(&run.id, &status, finished_at)?;
+        store.update_status(&run.id, &status, finished_at).await?;
         step.status_changed = true;
     }
-    let current = store.get_run(&run.id)?;
-    step.artifacts_registered += register_outputs(store, &current)?;
-    let _ = crate::tracking::try_populate_from_log(store, &current);
+    let current = store.get_run(&run.id).await?;
+    step.artifacts_registered += register_outputs(store, &current).await?;
+    let _ = crate::tracking::try_populate_from_log(store, &current).await;
     // Agent-driven cascade: if this run just reached a terminal state,
     // sweep its pending dependent stages and either advance (succeeded /
     // cache_hit) or cascade-fail them.
     if step.status_changed && crate::store::is_terminal(&current.status) {
-        let _ = try_submit_pending_children(cluster, store, &current);
+        let _ = try_submit_pending_children(cluster, store, &current).await;
     }
     Ok(step)
 }
@@ -930,15 +954,15 @@ pub struct ReconcileStep {
     pub artifacts_registered: usize,
 }
 
-pub fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<ReconcileReport> {
+pub async fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<ReconcileReport> {
     let mut runs_reconciled = 0;
     let mut artifacts_registered = 0;
     // Scope to the invoking user's own runs. `labctl reconcile` is a
     // user action — folding the user's own SLURM state back into the
     // registry — and must never touch another user's run rows.
     let submitted_by = crate::store::current_user()?;
-    for run in store.list_active_runs(&submitted_by)? {
-        let step = reconcile_one(cluster, store, &run)?;
+    for run in store.list_active_runs(&submitted_by).await? {
+        let step = reconcile_one(cluster, store, &run).await?;
         if step.status_changed {
             runs_reconciled += 1;
         }
@@ -948,8 +972,11 @@ pub fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<ReconcileRepo
     // this pass observed the parent's status transition. Restart between
     // transition and sweep leaves children orphaned in 'created'; idempotent
     // retroactive sweep closes the gap.
-    for parent in store.list_terminal_runs_with_pending_children(&submitted_by)? {
-        if let Err(e) = try_submit_pending_children(cluster, store, &parent) {
+    for parent in store
+        .list_terminal_runs_with_pending_children(&submitted_by)
+        .await?
+    {
+        if let Err(e) = try_submit_pending_children(cluster, store, &parent).await {
             eprintln!("reconcile: orphan sweep for {} failed: {e:#}", parent.id);
         }
     }
@@ -960,11 +987,15 @@ pub fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<ReconcileRepo
 }
 
 
-pub fn gc(_cluster: &ClusterConfig, store: &Store, terminal_snapshots: bool) -> Result<usize> {
+pub async fn gc(
+    _cluster: &ClusterConfig,
+    store: &Store,
+    terminal_snapshots: bool,
+) -> Result<usize> {
     if !terminal_snapshots {
         return Ok(0);
     }
-    gc_terminal_sources(store, 0)
+    gc_terminal_sources(store, 0).await
 }
 
 /// Reap `<runs_base>/runs/<user>/<id>/` dirs that have no corresponding
@@ -979,14 +1010,14 @@ pub fn gc(_cluster: &ClusterConfig, store: &Store, terminal_snapshots: bool) -> 
 /// the safety cushion: any dir whose mtime is younger than this is
 /// skipped — covers the brief window between mkdir and the `insert_run`
 /// commit on the local user's own machine too.
-pub fn gc_orphan_run_dirs(
+pub async fn gc_orphan_run_dirs(
     cluster: &ClusterConfig,
     store: &Store,
     min_age_secs: u64,
 ) -> Result<usize> {
     let user = crate::store::current_user()?;
     let user_root = fs_layout::user_runs_dir(&cluster.filesystem.runs_base, &user);
-    let entries = match fs::read_dir(&user_root) {
+    let mut entries = match tokio::fs::read_dir(&user_root).await {
         Ok(e) => e,
         // Missing dir on a fresh deployment is fine; no orphans by
         // definition.
@@ -999,19 +1030,18 @@ pub fn gc_orphan_run_dirs(
     let now_sys = std::time::SystemTime::now();
     let min_age = std::time::Duration::from_secs(min_age_secs);
     let mut removed = 0usize;
-    for entry in entries {
-        let entry = entry?;
+    while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        let metadata = entry.metadata()?;
+        let metadata = entry.metadata().await?;
         if !metadata.is_dir() {
             continue;
         }
         // The run-id is the directory name; if the name isn't UTF-8
         // it can't be a labctl-created run-dir, leave alone.
-        let Some(run_id) = path.file_name().and_then(|s| s.to_str()) else {
+        let Some(run_id) = path.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
             continue;
         };
-        if store.get_run_optional(run_id)?.is_some() {
+        if store.get_run_optional(&run_id).await?.is_some() {
             continue;
         }
         // No PG row — but the dir might be in-flight (created by a
@@ -1024,7 +1054,7 @@ pub fn gc_orphan_run_dirs(
         if age < min_age {
             continue;
         }
-        fs::remove_dir_all(&path).with_context(|| {
+        tokio::fs::remove_dir_all(&path).await.with_context(|| {
             format!("gc_orphan_run_dirs: remove_dir_all {}", path.display())
         })?;
         removed += 1;
@@ -1039,11 +1069,11 @@ pub fn gc_orphan_run_dirs(
 /// Used by the CLI (`gc()` wrapper, min_age=0) and by the agent's
 /// gc_loop (min_age>0, gives reconcile time to finalize artifacts
 /// before the working tree is removed).
-pub fn gc_terminal_sources(store: &Store, min_terminal_age_secs: u64) -> Result<usize> {
+pub async fn gc_terminal_sources(store: &Store, min_terminal_age_secs: u64) -> Result<usize> {
     let now = util::now_ts();
     let cutoff = min_terminal_age_secs as i64;
     let mut removed = 0;
-    for run in store.list_runs()? {
+    for run in store.list_runs().await? {
         if !is_terminal(&run.status) {
             continue;
         }
@@ -1057,14 +1087,15 @@ pub fn gc_terminal_sources(store: &Store, min_terminal_age_secs: u64) -> Result<
         if now.saturating_sub(stamp) < cutoff {
             continue;
         }
-        fs::remove_dir_all(&run.source_path)
+        tokio::fs::remove_dir_all(&run.source_path)
+            .await
             .with_context(|| format!("failed to remove {}", run.source_path.display()))?;
         removed += 1;
     }
     Ok(removed)
 }
 
-fn resolve_inputs(
+async fn resolve_inputs(
     cluster: &ClusterConfig,
     store: &Store,
     recipe: &Recipe,
@@ -1076,7 +1107,7 @@ fn resolve_inputs(
     for (role, spec) in &recipe.inputs {
         let resolved = match spec {
             InputSpec::Artifact { artifact } => {
-                let artifact = store.resolve_artifact_ref(artifact)?;
+                let artifact = store.resolve_artifact_ref(artifact).await?;
                 InputResolution {
                     role: role.clone(),
                     artifact_id: Some(artifact.id),
@@ -1094,7 +1125,7 @@ fn resolve_inputs(
                 let artifact_ref = overrides.input_artifacts.get(role).with_context(|| {
                     format!("input {role:?} requires an artifact override from evald")
                 })?;
-                let artifact = store.resolve_artifact_ref(artifact_ref)?;
+                let artifact = store.resolve_artifact_ref(artifact_ref).await?;
                 InputResolution {
                     role: role.clone(),
                     artifact_id: Some(artifact.id),
@@ -1187,9 +1218,9 @@ fn resolve_inputs(
                 // Store::copy_run_outputs → backfill_stage_consumers on
                 // cache-hit / coalesced-follower).
                 let artifact_id =
-                    store.run_output_artifact_id(parent_run_id, parent_role)?;
+                    store.run_output_artifact_id(parent_run_id, parent_role).await?;
                 let resolved_path = match &artifact_id {
-                    Some(aid) => store.get_artifact(aid)?.path,
+                    Some(aid) => store.get_artifact(aid).await?.path,
                     None => fs_layout::artifact_dir(parent_root, submitted_by, &parent_alias),
                 };
                 InputResolution {
@@ -1454,13 +1485,18 @@ fn render_script(
     Ok(script)
 }
 
-fn submit_script(cluster: &ClusterConfig, script_path: &Path, run_id: &str) -> Result<String> {
+async fn submit_script(
+    cluster: &ClusterConfig,
+    script_path: &Path,
+    run_id: &str,
+) -> Result<String> {
     match cluster.scheduler.kind {
         SchedulerKind::Slurm => {
             let output = Command::new(&cluster.scheduler.sbatch)
                 .arg("--parsable")
                 .arg(script_path)
                 .output()
+                .await
                 .with_context(|| format!("failed to execute {}", cluster.scheduler.sbatch))?;
             if !output.status.success() {
                 bail!(
@@ -1477,6 +1513,7 @@ fn submit_script(cluster: &ClusterConfig, script_path: &Path, run_id: &str) -> R
                 .arg(script_path)
                 .env("LABCTL_JOB_ID", &job_id)
                 .status()
+                .await
                 .with_context(|| {
                     format!("failed to execute local script {}", script_path.display())
                 })?;
@@ -1495,7 +1532,7 @@ fn submit_script(cluster: &ClusterConfig, script_path: &Path, run_id: &str) -> R
 /// ambiguity. Returns ``None`` only if sacct itself can't be invoked or
 /// returns nonzero — an unparseable End is fine, we just leave finished_at
 /// empty and let the caller fall back.
-fn scheduler_outcome(
+async fn scheduler_outcome(
     cluster: &ClusterConfig,
     run: &crate::store::RunRow,
 ) -> Option<SchedulerOutcome> {
@@ -1516,6 +1553,7 @@ fn scheduler_outcome(
             &starttime,
         ])
         .output()
+        .await
         .ok()?;
     if !output.status.success() {
         return None;
@@ -1585,7 +1623,7 @@ fn map_slurm_state(state: &str) -> String {
     .to_string()
 }
 
-fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> {
+async fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> {
     // Pending-placeholder rows (inserted by `insert_pending_pipeline_stage`
     // for intra-pipeline children whose parents haven't materialised yet)
     // carry no `outputs` in `context_json` — the stage hasn't been rendered.
@@ -1642,23 +1680,25 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
                 // canonically — so an existing row at this path would
                 // satisfy a fresh insert too, but skipping avoids the
                 // PG round-trip.
-                if let Some(existing) = store.find_artifact_by_path("checkpoint", &step_dir)? {
-                    store.link_run_output(&run.id, role, &existing.id)?;
+                if let Some(existing) = store.find_artifact_by_path("checkpoint", &step_dir).await? {
+                    store.link_run_output(&run.id, role, &existing.id).await?;
                     continue;
                 }
-                let artifact = store.insert_artifact(
-                    "checkpoint",
-                    &step_dir,
-                    Some(&run.id),
-                    &json!({
-                        "role": role,
-                        "step": step,
-                        "marker": marker,
-                        "stream_alias": resolution.alias,
-                        "producer_recipe": run.recipe_name,
-                    }),
-                )?;
-                store.link_run_output(&run.id, role, &artifact.id)?;
+                let artifact = store
+                    .insert_artifact(
+                        "checkpoint",
+                        &step_dir,
+                        Some(&run.id),
+                        &json!({
+                            "role": role,
+                            "step": step,
+                            "marker": marker,
+                            "stream_alias": resolution.alias,
+                            "producer_recipe": run.recipe_name,
+                        }),
+                    )
+                    .await?;
+                store.link_run_output(&run.id, role, &artifact.id).await?;
                 count += 1;
             }
         } else {
@@ -1683,20 +1723,24 @@ fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> 
                     }
                 }
             }
-            let artifact = store.insert_artifact(
-                &resolution.kind,
-                &resolution.path,
-                Some(&run.id),
-                &metadata,
-            )?;
-            store.link_run_output(&run.id, role, &artifact.id)?;
-            store.set_alias(&resolution.alias, &artifact.id)?;
+            let artifact = store
+                .insert_artifact(
+                    &resolution.kind,
+                    &resolution.path,
+                    Some(&run.id),
+                    &metadata,
+                )
+                .await?;
+            store.link_run_output(&run.id, role, &artifact.id).await?;
+            store.set_alias(&resolution.alias, &artifact.id).await?;
             linked_outputs.push((role.clone(), artifact.id.clone()));
             count += 1;
         }
     }
     if !linked_outputs.is_empty() {
-        store.backfill_stage_consumers(&run.id, &linked_outputs)?;
+        store
+            .backfill_stage_consumers(&run.id, &linked_outputs)
+            .await?;
     }
     Ok(count)
 }

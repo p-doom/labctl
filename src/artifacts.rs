@@ -13,7 +13,7 @@ use crate::store::{ArtifactRow, Store};
 /// same artifact id (path-canonical id derivation lives in
 /// `Store::insert_artifact`); moving the data to a new path and
 /// re-registering produces a fresh entry.
-pub fn register_external(
+pub async fn register_external(
     store: &Store,
     alias: &str,
     path: &Path,
@@ -22,17 +22,19 @@ pub fn register_external(
     let path = path
         .canonicalize()
         .with_context(|| format!("external artifact path does not exist: {}", path.display()))?;
-    let artifact = store.insert_artifact(
-        kind,
-        &path,
-        None,
-        &json!({
-            "external": true,
-            "alias": alias,
-            "path": path,
-        }),
-    )?;
-    store.set_alias(alias, &artifact.id)?;
+    let artifact = store
+        .insert_artifact(
+            kind,
+            &path,
+            None,
+            &json!({
+                "external": true,
+                "alias": alias,
+                "path": path,
+            }),
+        )
+        .await?;
+    store.set_alias(alias, &artifact.id).await?;
     Ok(artifact)
 }
 

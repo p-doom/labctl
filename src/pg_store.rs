@@ -1526,8 +1526,7 @@ fn build_connect_options(pg: &PgConfig) -> Result<PgConnectOptions> {
     Ok(opts)
 }
 
-// Column lists kept in sync with migrations/0001_initial_schema.sql +
-// later migrations (notably 0005 dropped `coalesced_peer_run_id`).
+// Column lists kept in sync with migrations/0001_initial_schema.sql.
 const RUN_SELECT_BASE: &str = "
     SELECT id, recipe_name, recipe_hash, status, job_id, run_dir, repo,
            source_path, recipe_json, context_json, created_at, finished_at,

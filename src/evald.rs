@@ -33,7 +33,7 @@ pub struct EvaldReport {
     pub skipped_exhausted: usize,
 }
 
-pub fn run_once(
+pub async fn run_once(
     cluster: &ClusterConfig,
     store: &Store,
     policy: &EvalPolicy,
@@ -54,7 +54,8 @@ pub fn run_once(
     // evals against user B's checkpoints, charging A's SLURM account
     // and double-dispatching against B's daemon's work.
     let checkpoints = store
-        .artifacts_by_kind_for_producer_user(&policy.applies_to.kind, &submitted_by)?;
+        .artifacts_by_kind_for_producer_user(&policy.applies_to.kind, &submitted_by)
+        .await?;
     let mut report = EvaldReport {
         considered: 0,
         submitted: 0,
@@ -74,7 +75,7 @@ pub fn run_once(
         let eval_key = util::sha256_bytes(
             format!("{}:{}:{}", checkpoint.id, recipe_hash, policy.name).as_bytes(),
         );
-        let slot = store.eval_request_status(&eval_key, MAX_EVAL_ATTEMPTS)?;
+        let slot = store.eval_request_status(&eval_key, MAX_EVAL_ATTEMPTS).await?;
         match slot {
             EvalRequestSlot::Active => {
                 report.skipped_existing += 1;
@@ -96,7 +97,7 @@ pub fn run_once(
         // Retry-path UPDATE has its optimistic-concurrency witness. For
         // the Fresh path there is no prior id.
         let prior_run_id = match &slot {
-            EvalRequestSlot::Retry { .. } => store.eval_request_run_id(&eval_key)?,
+            EvalRequestSlot::Retry { .. } => store.eval_request_run_id(&eval_key).await?,
             _ => None,
         };
 
@@ -110,15 +111,20 @@ pub fn run_once(
             &recipe,
             Some(overrides),
             &submitted_by,
-        )?;
+        )
+        .await?;
         let claimed = match &slot {
-            EvalRequestSlot::Fresh => store.claim_eval_slot_fresh(
-                &eval_key,
-                &checkpoint.id,
-                &recipe_hash,
-                &policy.name,
-                &submitted.run_id,
-            )?,
+            EvalRequestSlot::Fresh => {
+                store
+                    .claim_eval_slot_fresh(
+                        &eval_key,
+                        &checkpoint.id,
+                        &recipe_hash,
+                        &policy.name,
+                        &submitted.run_id,
+                    )
+                    .await?
+            }
             EvalRequestSlot::Retry { previous_attempts } => {
                 let prior = prior_run_id.as_deref().with_context(|| {
                     format!(
@@ -127,12 +133,14 @@ pub fn run_once(
                          eval_request_status / eval_request_run_id disagree"
                     )
                 })?;
-                store.claim_eval_slot_retry(
-                    &eval_key,
-                    prior,
-                    *previous_attempts,
-                    &submitted.run_id,
-                )?
+                store
+                    .claim_eval_slot_retry(
+                        &eval_key,
+                        prior,
+                        *previous_attempts,
+                        &submitted.run_id,
+                    )
+                    .await?
             }
             EvalRequestSlot::Active | EvalRequestSlot::Exhausted { .. } => unreachable!(),
         };

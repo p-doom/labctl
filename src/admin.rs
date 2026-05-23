@@ -36,7 +36,7 @@ pub struct AddUserReport {
     pub dirs_created: Vec<PathBuf>,
 }
 
-pub fn add_user(
+pub async fn add_user(
     cluster: &ClusterConfig,
     store: &Store,
     name: &str,
@@ -53,11 +53,13 @@ pub fn add_user(
     let now = util::now_ts();
     let registered = store
         .insert_user(name, now)
+        .await
         .with_context(|| format!("registering user {name:?} in PG"))?;
 
     let pg_role_created = if want_pg_role {
         store
             .ensure_pg_role(name)
+            .await
             .with_context(|| format!("creating PG role {name:?}"))?
     } else {
         false

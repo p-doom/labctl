@@ -39,7 +39,7 @@ sha2 = "0.10"
 # tokio is the runtime for the agent loops (reconcile/evald/throttle)
 # and for the optional UI server. Always built — the size penalty is
 # trivial relative to the rest, and gating it makes feature math messy.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "fs", "io-util"] }
 toml = "0.8"
 uuid = { version = "1.11", features = ["v7", "serde"] }
 walkdir = "2.5"
