@@ -18,6 +18,76 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Versioned, canonical sha256 of a JSON value. Used by the
+/// `recipe_hash` computation so a field reorder, a `#[serde(default)]`
+/// addition, or a `#[serde(alias)]` rename in the underlying Rust
+/// struct doesn't silently shift every historical hash.
+///
+/// Canonicalisation rules (RFC 8785-flavoured, not fully conformant —
+/// we don't normalise number representations because serde already
+/// emits a fixed canonical form for `serde_json::Number`):
+///
+///   * object members emitted in sorted key order;
+///   * array order preserved (arrays are ordered by definition);
+///   * no whitespace between tokens;
+///   * each leaf encoded the way `serde_json::to_string` would emit it.
+///
+/// The version prefix lives in the *input* bytes (not the output) so
+/// the hash stays a plain 64-char hex sha256 — matching the
+/// `runs_recipe_hash_format` schema constraint. Bumping `version` is
+/// how you intentionally invalidate every historical key (e.g. when
+/// adding a new recipe field that should participate in identity).
+pub fn canonical_value_hash(value: &serde_json::Value, version: &str) -> String {
+    let mut buf = String::with_capacity(64);
+    buf.push_str(version);
+    buf.push('\n');
+    canonicalize_into(value, &mut buf);
+    sha256_bytes(buf.as_bytes())
+}
+
+fn canonicalize_into(value: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        // serde_json's `Number::to_string` matches its serialise output —
+        // integers as bare digits, floats in shortest round-trippable
+        // form — so this is canonical for our purposes.
+        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::String(s) => {
+            // Re-use serde's escape rules so embedded quotes, control
+            // chars, and Unicode escapes match what a serialiser would
+            // produce.
+            out.push_str(&serde_json::to_string(s).expect("string serialise"));
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonicalize_into(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            // BTreeMap-style ordering: collect into a Vec, sort by key.
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            out.push('{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(*k).expect("key serialise"));
+                out.push(':');
+                canonicalize_into(v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
 pub fn sha256_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("failed to hash {}", path.display()))?;
     Ok(sha256_bytes(&bytes))
@@ -172,5 +242,83 @@ pub fn shell_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\"'\"'"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn canonical_value_hash_is_key_order_independent() {
+        // Same object, different key insertion order at construction
+        // time. serde_json::Map preserves insertion order on the wire
+        // when the `preserve_order` feature is on, which would make
+        // naive `sha256(to_vec(value))` order-dependent — the canonical
+        // hash must absorb that variance.
+        let mut a = serde_json::Map::new();
+        a.insert("zeta".into(), json!(1));
+        a.insert("alpha".into(), json!(2));
+        a.insert("mu".into(), json!(3));
+
+        let mut b = serde_json::Map::new();
+        b.insert("mu".into(), json!(3));
+        b.insert("alpha".into(), json!(2));
+        b.insert("zeta".into(), json!(1));
+
+        let h_a = canonical_value_hash(&serde_json::Value::Object(a), "v1");
+        let h_b = canonical_value_hash(&serde_json::Value::Object(b), "v1");
+        assert_eq!(h_a, h_b, "key order must not affect canonical hash");
+    }
+
+    #[test]
+    fn canonical_value_hash_recurses_into_nested_objects() {
+        let outer_a = json!({
+            "outer": { "z": 1, "a": 2 },
+            "list": [{ "k": 1, "j": 2 }, { "b": "x", "a": "y" }],
+        });
+        let outer_b = json!({
+            "list": [{ "j": 2, "k": 1 }, { "a": "y", "b": "x" }],
+            "outer": { "a": 2, "z": 1 },
+        });
+        assert_eq!(
+            canonical_value_hash(&outer_a, "v1"),
+            canonical_value_hash(&outer_b, "v1"),
+        );
+    }
+
+    #[test]
+    fn canonical_value_hash_array_order_matters() {
+        // Arrays are ordered — reordering them is a real semantic
+        // change and the hash must reflect it.
+        let a = json!([1, 2, 3]);
+        let b = json!([3, 2, 1]);
+        assert_ne!(
+            canonical_value_hash(&a, "v1"),
+            canonical_value_hash(&b, "v1"),
+        );
+    }
+
+    #[test]
+    fn canonical_value_hash_version_tag_separates() {
+        let v = json!({ "x": 1 });
+        let v1 = canonical_value_hash(&v, "recipe_hash/v1");
+        let v2 = canonical_value_hash(&v, "recipe_hash/v2");
+        assert_ne!(
+            v1, v2,
+            "bumping the version tag must change the hash even for byte-identical input"
+        );
+    }
+
+    #[test]
+    fn canonical_value_hash_handles_leaves() {
+        // Smoke that each leaf variant terminates.
+        let _ = canonical_value_hash(&json!(null), "v1");
+        let _ = canonical_value_hash(&json!(true), "v1");
+        let _ = canonical_value_hash(&json!(false), "v1");
+        let _ = canonical_value_hash(&json!(0), "v1");
+        let _ = canonical_value_hash(&json!(-1.5), "v1");
+        let _ = canonical_value_hash(&json!("has \"quotes\" and \n newlines"), "v1");
     }
 }

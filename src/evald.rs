@@ -38,7 +38,10 @@ pub async fn run_once(
     policy: &EvalPolicy,
 ) -> Result<EvaldReport> {
     let recipe = Recipe::load(&policy.recipe)?;
-    let recipe_hash = util::sha256_bytes(&serde_json::to_vec(&recipe)?);
+    let recipe_hash = util::canonical_value_hash(
+        &serde_json::to_value(&recipe)?,
+        crate::runner::RECIPE_HASH_VERSION,
+    );
     // Eval submissions are owned by the OS user the agent runs as.
     // `current_user()` enforces a real validated $USER — every PG
     // write attributes ownership and there are no acceptable

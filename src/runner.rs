@@ -18,6 +18,14 @@ use crate::{
     util,
 };
 
+/// Version tag fed into `canonical_value_hash` when computing
+/// `recipe_hash`. Bump deliberately to invalidate every historical
+/// recipe key (e.g. when adding a new field that should participate
+/// in recipe identity). The tag lives in the *input* bytes only —
+/// the hash output remains 64-char sha256 hex so it satisfies the
+/// `runs_recipe_hash_format` schema CHECK.
+pub const RECIPE_HASH_VERSION: &str = "recipe_hash/v1";
+
 /// Fully resolved output specification: kind + rendered alias + final path.
 /// Stored in the run's ``context.json`` so reconciliation/registration can
 /// recover the artifact location without re-running the alias template.
@@ -45,6 +53,14 @@ pub struct SubmittedRun {
     pub run_dir: PathBuf,
     #[serde(default)]
     pub cache_hit: bool,
+    /// `Some(leader_run_id)` when the singleflight check found a
+    /// concurrent in-flight run for the same `cache_key` and attached
+    /// this submission as a follower. The follower row is a `created`
+    /// placeholder; the existing pending-children cascade upgrades it
+    /// to `cache_hit` when the leader terminates. `None` for normal
+    /// submissions and direct cache hits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follower_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,21 +116,23 @@ pub struct StageContext<'a> {
 /// same computation and may share outputs.
 ///
 /// Components: recipe content (recipe_hash), code state (git HEAD +
-/// sha256 of uncommitted diff), runtime deps (uv.lock hash), declared
-/// inputs (their artifact IDs or resolved paths), and recipe args.
-/// Source-tree contents are NOT hashed — git provenance is the
-/// authoritative source-state identity.
+/// diff_hash + untracked_files_hash), runtime deps (uv.lock hash),
+/// declared inputs (their artifact IDs or resolved paths), and recipe
+/// args. Both dirtiness hashes are read straight from
+/// `RepoProvenance` — they are sha256 of the persisted patch files
+/// (`tracked.patch` / `untracked.patch`) in the provenance bundle,
+/// computed by `capture_repo`. Doing the hashing once at capture time
+/// keeps the cache_key derivation symmetric across tracked and
+/// untracked dirtiness and makes the key recomputable from the
+/// durable bundle alone — useful for future cache_key schema
+/// migrations (which can backfill historical rows without consulting
+/// the source snapshot, which gets GC'd shortly after termination).
 fn compute_cache_key(
     recipe_hash: &str,
     provenance: &provenance::RepoProvenance,
     inputs: &[crate::store::InputResolution],
     params: &BTreeMap<String, Value>,
 ) -> Result<String> {
-    let diff_hash = provenance
-        .git_diff_head
-        .as_deref()
-        .map(|s| util::sha256_bytes(s.as_bytes()))
-        .unwrap_or_else(|| util::sha256_bytes(b""));
     let mut input_keys: Vec<String> = inputs
         .iter()
         .map(|i| {
@@ -132,7 +150,8 @@ fn compute_cache_key(
     let payload = serde_json::json!({
         "recipe_hash": recipe_hash,
         "git_head": provenance.git_head,
-        "diff_hash": diff_hash,
+        "diff_hash": provenance.diff_hash,
+        "untracked_files_hash": provenance.untracked_files_hash,
         "uv_lock_hash": provenance.uv_lock_hash,
         "inputs": input_keys,
         "params": params_canonical,
@@ -222,13 +241,17 @@ async fn register_cache_hit(
         &serde_json::to_vec_pretty(&ctx)?,
     )?;
 
+    // One transactional write: locks the source row with FOR SHARE,
+    // upserts the new run directly into terminal `cache_hit`, copies
+    // outputs, and emits the `stage_cache_hit` event. Closes the
+    // observation→link race the previous four-call sequence opened up.
     store
-        .insert_run(
+        .register_cache_hit_tx(
             crate::store::NewRun {
                 id: run_id,
                 recipe,
                 recipe_hash,
-                status: "created",
+                status: "cache_hit",
                 run_dir,
                 source_path: &source_path,
                 context_json: &ctx,
@@ -236,20 +259,10 @@ async fn register_cache_hit(
                 cache_key: Some(cache_key),
             },
             inputs,
+            prior_run_id,
+            cache_key,
+            util::now_ts(),
         )
-        .await?;
-
-    // Link the prior run's output artifacts into this new run's output set.
-    store.copy_run_outputs(prior_run_id, run_id).await?;
-
-    // Emit the explanatory event before flipping to the terminal state so
-    // downstream tooling can distinguish "skipped due to cache hit" from
-    // "completed normally".
-    store
-        .append_stage_cache_hit_event(run_id, cache_key, prior_run_id)
-        .await?;
-    store
-        .update_status(run_id, "cache_hit", Some(util::now_ts()))
         .await?;
 
     Ok(SubmittedRun {
@@ -257,6 +270,7 @@ async fn register_cache_hit(
         job_id: String::new(),
         run_dir: run_dir.to_path_buf(),
         cache_hit: true,
+        follower_of: None,
     })
 }
 
@@ -353,15 +367,22 @@ async fn submit_recipe_inner(
         .repos
         .get(&recipe.repo)
         .with_context(|| format!("cluster has no repo mapping for {:?}", recipe.repo))?;
-    let recipe_hash = util::sha256_bytes(&serde_json::to_vec(recipe)?);
+    let recipe_hash =
+        util::canonical_value_hash(&serde_json::to_value(recipe)?, RECIPE_HASH_VERSION);
     let provenance_dir = lab_dir.join("provenance").join(&recipe.repo);
     let repo_provenance = provenance::capture_repo(repo_path, &provenance_dir)?;
     let cache_key = compute_cache_key(&recipe_hash, &repo_provenance, &inputs, &recipe.params)?;
 
     // Cache hit: a prior run with the same cache_key still has its outputs
     // on disk. Link them and skip the entire submit / source-copy / sbatch
-    // path. The recipe is unchanged; the registry IS the cache.
-    if let Some(prior_run) = store.find_cache_hit_candidate(&cache_key).await? {
+    // path. The recipe is unchanged; the registry IS the cache. Walk
+    // multiple candidates (newest first) so an older valid row can satisfy
+    // the hit when the newest's artifacts have been scrubbed off NFS.
+    const CACHE_HIT_CANDIDATE_LIMIT: i64 = 8;
+    for prior_run in store
+        .find_cache_hit_candidates(&cache_key, CACHE_HIT_CANDIDATE_LIMIT)
+        .await?
+    {
         let prior_outputs = store.run_outputs(&prior_run.id).await?;
         if cache_hit_outputs_valid(&prior_outputs, &outputs) {
             return register_cache_hit(
@@ -383,6 +404,78 @@ async fn submit_recipe_inner(
             )
             .await;
         }
+    }
+
+    // Singleflight on cache miss. Before spending source-copy / sbatch /
+    // GPU on this submission, claim the per-`cache_key` slot. If a
+    // concurrent submission already owns it (status in {created,
+    // submitted, running}), `try_claim_or_follow` returns the leader's
+    // id and we attach as a follower instead — a placeholder row whose
+    // `dependency_on` points at the leader. The existing pending-
+    // children cascade picks the follower up when the leader terminates
+    // and re-runs this function, which then resolves the follower as
+    // `cache_hit` against the now-terminal leader. The partial unique
+    // index `runs_cache_key_inflight_unique` (migration 0003) closes
+    // the read→insert race at the schema level.
+    //
+    // The claim insert carries a partial `context.json` — `source_hash`
+    // is unknown until the snapshot is copied below — and is upserted
+    // again post-source-copy by `insert_run` with the full payload.
+    let claim_ctx = json!({
+        "schema_version": 1,
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "recipe_name": recipe.name,
+        "recipe_hash": recipe_hash,
+        "repo": recipe.repo,
+        "source_path": source_path,
+        "source_hash": Value::Null,
+        "inputs": inputs,
+        "outputs": outputs,
+        "params": recipe.params,
+        "provenance": repo_provenance,
+        "stage_name": stage_ctx.map(|c| c.stage_name),
+        "parent_job_ids": parent_job_ids,
+    });
+    let claim = store
+        .try_claim_or_follow(
+            NewRun {
+                id: &run_id,
+                recipe,
+                recipe_hash: &recipe_hash,
+                status: "created",
+                run_dir: &run_dir,
+                source_path: &source_path,
+                context_json: &claim_ctx,
+                submitted_by: Some(submitted_by),
+                cache_key: Some(&cache_key),
+            },
+            &inputs,
+        )
+        .await?;
+    if let crate::store::ClaimOutcome::Following { leader_run_id } = claim {
+        // Lost the race. Insert a follower placeholder pointing at the
+        // leader. We do NOT pay source-copy / sbatch cost — the cascade
+        // upgrades us to `cache_hit` when the leader finishes.
+        store
+            .insert_cache_follower(
+                &run_id,
+                recipe,
+                &recipe_hash,
+                &run_dir,
+                &source_path,
+                submitted_by,
+                &cache_key,
+                &leader_run_id,
+            )
+            .await?;
+        return Ok(SubmittedRun {
+            run_id,
+            job_id: String::new(),
+            run_dir,
+            cache_hit: false,
+            follower_of: Some(leader_run_id),
+        });
     }
 
     // Materialize each output's directory so the recipe's command can write
@@ -519,6 +612,7 @@ async fn submit_recipe_inner(
         job_id,
         run_dir,
         cache_hit: false,
+        follower_of: None,
     })
 }
 
@@ -733,7 +827,10 @@ pub async fn submit_pipeline(
             // At least one parent is still pending or in-flight. Insert
             // a placeholder; the agent's reconcile loop will pick it up
             // after the last parent reaches terminal-succeeded.
-            let recipe_hash = util::sha256_bytes(&serde_json::to_vec(&loaded.recipe)?);
+            let recipe_hash = util::canonical_value_hash(
+                &serde_json::to_value(&loaded.recipe)?,
+                RECIPE_HASH_VERSION,
+            );
             let run_dir =
                 fs_layout::run_dir(&cluster.filesystem.runs_base, submitted_by, preallocated);
             let source_path = run_dir.join("source").join(&loaded.recipe.repo);
@@ -852,10 +949,22 @@ pub async fn try_submit_pending_children(
 }
 
 /// Drive a pending PG row through normal submission: deserialise its
-/// recipe, reconstruct the pipeline-stage context from the recorded
-/// dependency_on, and call `submit_recipe_inner` with the existing
-/// run_id. The insert_run upsert path takes care of replacing the
-/// placeholder.
+/// recipe and call `submit_recipe_inner` with the existing run_id. The
+/// `insert_run` upsert path takes care of replacing the placeholder.
+///
+/// Two flavours of pending row reach here:
+///
+///   * **Pipeline stage placeholder** — has `pipeline_id` + `stage_name`
+///     set. The pipeline-stage context (`stage_run_ids`, `stages` map)
+///     is rebuilt from the sibling rows so template tokens like
+///     `{inputs.X.path}` referencing upstream outputs resolve.
+///   * **Cache-key follower placeholder** — has neither `pipeline_id`
+///     nor `stage_name`; its `dependency_on` points at the leader run
+///     for its `cache_key`. No pipeline context to reconstruct — call
+///     straight through with `stage_ctx = None`. `submit_recipe_inner`
+///     will re-compute the cache_key from the recipe + provenance +
+///     inputs and resolve as `cache_hit` against the now-terminal
+///     leader.
 async fn complete_pending_submission(
     cluster: &ClusterConfig,
     store: &Store,
@@ -868,19 +977,32 @@ async fn complete_pending_submission(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
+    let Some(pipeline_id) = child.pipeline_id.as_deref() else {
+        // Cache-key follower: no pipeline context, no stage siblings.
+        submit_recipe_inner(
+            cluster,
+            store,
+            &recipe,
+            None,
+            None,
+            &[],
+            Some(child.id.as_str()),
+            &submitted_by,
+            None,
+        )
+        .await?;
+        return Ok(());
+    };
+    let stage_name = child
+        .stage_name
+        .as_deref()
+        .with_context(|| format!("pending run {} has pipeline_id but no stage_name", child.id))?;
+
     // Rebuild the stage_run_ids map from the pipeline siblings so
     // template tokens like {inputs.X.path} that reference upstream
     // outputs resolve. Pinned `from` outputs aren't available here —
     // the agent-driven path uses concrete artifact paths via PG, so
     // pinned_outputs can be empty.
-    let pipeline_id = child
-        .pipeline_id
-        .as_deref()
-        .with_context(|| format!("pending run {} has no pipeline_id", child.id))?;
-    let stage_name = child
-        .stage_name
-        .as_deref()
-        .with_context(|| format!("pending run {} has no stage_name", child.id))?;
     let siblings = store.list_pipeline_runs(pipeline_id).await?;
     let stage_run_ids: BTreeMap<String, String> = siblings
         .iter()
