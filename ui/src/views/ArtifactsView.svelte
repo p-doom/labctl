@@ -91,7 +91,7 @@
     for (const a of allArtifacts) {
       m.set(
         a.id,
-        `${a.kind}\n${a.id}\n${a.content_hash}\n${a.path}\n${(a.aliases ?? []).join("\n")}`.toLowerCase(),
+        `${a.kind}\n${a.id}\n${a.path}\n${(a.aliases ?? []).join("\n")}`.toLowerCase(),
       );
     }
     return m;
@@ -146,7 +146,6 @@
     <div class="list-head art-head">
       <div>Catalog</div>
       <div>Specimen</div>
-      <div>Hash</div>
       <div>Logged</div>
       <div></div>
     </div>
@@ -158,7 +157,6 @@
             <div class="skel" style="height: 14px; width: 50%; margin-bottom: 4px"></div>
             <div class="skel" style="height: 11px; width: 70%"></div>
           </div>
-          <div class="skel" style="height: 12px; width: 70px"></div>
           <div class="skel" style="height: 11px; width: 60px"></div>
           <div></div>
         </div>
@@ -197,7 +195,6 @@
             </div>
             <div class="art-meta mono" title={a.path}>{a.path}</div>
           </div>
-          <span class="hash mono">{a.content_hash.slice(0, 10)}</span>
           <span class="rel mono" title={formatAbsolute(a.created_at)}>{formatRelative(a.created_at, nowSecs.value)}</span>
           <span class="chev" aria-hidden="true">›</span>
         </div>
@@ -214,10 +211,10 @@
   .page { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
   .list { flex: 1; overflow-y: auto; }
   /* Stanza specimen geometry:
-     catalog-no | kind+aliases+path stack | hash | logged | chev */
+     catalog-no | kind+aliases+path stack | logged | chev */
   .art-head,
   .art-row {
-    grid-template-columns: 100px 1fr 90px 80px 12px;
+    grid-template-columns: 100px 1fr 80px 12px;
     min-height: 56px;
   }
   .art-head { min-height: auto; }
@@ -273,11 +270,6 @@
     white-space: nowrap;
   }
 
-  .hash {
-    font-size: 12px;
-    color: var(--fg-1);
-    font-variant-numeric: tabular-nums;
-  }
   .rel {
     font-size: 12px;
     color: var(--fg-2);

@@ -61,9 +61,9 @@
       <button
         type="button"
         class="iconbtn"
-        onclick={() => copy(detail.artifact.content_hash)}
-        title="Copy content hash"
-        aria-label="Copy content hash"
+        onclick={() => copy(detail.artifact.id)}
+        title="Copy specimen id"
+        aria-label="Copy specimen id"
       >
         <Icon name="copy" />
       </button>
@@ -104,7 +104,7 @@
       <div class="meta-line">
         <span class="kind-chip">{a.kind}</span>
         <span class="spacer-dot">·</span>
-        <span class="mono">{a.content_hash.slice(0, 12)}</span>
+        <span class="mono">{a.id.slice(0, 12)}</span>
       </div>
     </header>
 

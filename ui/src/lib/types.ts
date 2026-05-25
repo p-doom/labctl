@@ -41,7 +41,6 @@ export interface ArtifactSummary {
   id: string;
   kind: string;
   path: string;
-  content_hash: string;
   producer_run_id: string | null;
   created_at: number;
   aliases?: string[];
