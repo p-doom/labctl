@@ -973,6 +973,15 @@ async fn run_recipe_command(
     println!("run_id: {}", submitted.run_id);
     println!("job_id: {}", submitted.job_id);
     println!("run_dir: {}", submitted.run_dir.display());
+    if submitted.cache_hit {
+        println!("cache_hit: true (reused prior outputs; no SLURM job submitted)");
+    }
+    if let Some(leader) = &submitted.follower_of {
+        println!(
+            "follower_of: {leader} (singleflight: leader run is already computing this \
+             cache_key; this row will resolve to cache_hit when the leader terminates)"
+        );
+    }
     Ok(())
 }
 

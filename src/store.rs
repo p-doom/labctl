@@ -137,6 +137,7 @@ pub enum EvalRequestSlot {
     Exhausted { attempts: i64 },
 }
 
+#[derive(Copy, Clone)]
 pub struct NewRun<'a> {
     pub id: &'a str,
     pub recipe: &'a Recipe,
@@ -151,6 +152,16 @@ pub struct NewRun<'a> {
     /// Used at submit time to short-circuit re-execution of an already-
     /// materialized stage. None disables cache-hit lookup for this run.
     pub cache_key: Option<&'a str>,
+}
+
+/// Outcome of `try_claim_or_follow`: the submitter either won the
+/// per-`cache_key` slot and should proceed with the full submission,
+/// or lost it to a concurrent in-flight run and was attached as a
+/// follower whose row is now a placeholder waiting on the leader.
+#[derive(Debug, Clone)]
+pub enum ClaimOutcome {
+    Won,
+    Following { leader_run_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,9 +484,59 @@ impl Store {
         self.pg.run_outputs(run_id).await
     }
 
-    /// Look up the most-recent succeeded or cache-hit run with this cache key.
-    pub async fn find_cache_hit_candidate(&self, cache_key: &str) -> Result<Option<RunRow>> {
-        self.pg.find_cache_hit_candidate(cache_key).await
+    /// Up to `limit` cache-hit candidates for `cache_key`, newest first.
+    /// The caller walks the list and accepts the first whose outputs are
+    /// still on disk — older rows are a valid fallback when the most-
+    /// recent's artifacts have been scrubbed.
+    pub async fn find_cache_hit_candidates(
+        &self,
+        cache_key: &str,
+        limit: i64,
+    ) -> Result<Vec<RunRow>> {
+        self.pg.find_cache_hit_candidates(cache_key, limit).await
+    }
+
+    /// Submit-time singleflight: insert `run` as the owner of its
+    /// `cache_key`, or — when another non-terminal row already holds
+    /// it — return `ClaimOutcome::Following { leader_run_id }`. See
+    /// `PgStore::try_claim_or_follow` for the read-then-insert
+    /// algorithm and the partial unique index that backs it.
+    pub async fn try_claim_or_follow(
+        &self,
+        run: NewRun<'_>,
+        inputs: &[InputResolution],
+    ) -> Result<ClaimOutcome> {
+        self.pg.try_claim_or_follow(run, inputs).await
+    }
+
+    /// Insert a follower placeholder pointing at `leader_run_id`. The
+    /// existing pending-children cascade picks the follower up when the
+    /// leader terminates, at which point `submit_recipe_inner` re-runs
+    /// for the follower and resolves it as `cache_hit`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_cache_follower(
+        &self,
+        run_id: &str,
+        recipe: &Recipe,
+        recipe_hash: &str,
+        run_dir: &std::path::Path,
+        source_path: &std::path::Path,
+        submitted_by: &str,
+        cache_key_of_leader: &str,
+        leader_run_id: &str,
+    ) -> Result<()> {
+        self.pg
+            .insert_cache_follower(
+                run_id,
+                recipe,
+                recipe_hash,
+                run_dir,
+                source_path,
+                submitted_by,
+                cache_key_of_leader,
+                leader_run_id,
+            )
+            .await
     }
 
     pub async fn append_stage_cache_hit_event(
@@ -491,6 +552,36 @@ impl Store {
 
     pub async fn copy_run_outputs(&self, source_run_id: &str, dest_run_id: &str) -> Result<()> {
         self.pg.copy_run_outputs(source_run_id, dest_run_id).await
+    }
+
+    /// Atomically register a cache hit: locks the source run with
+    /// `FOR SHARE` so a concurrent GC cannot delete it between
+    /// observation and link, upserts the new run directly into
+    /// terminal `cache_hit`, copies outputs, and emits the event —
+    /// all in one transaction. The pipeline-graph backfill (sibling
+    /// `type=stage` inputs that point at this new run's stage) is
+    /// applied after the tx commits using the returned output links;
+    /// it touches other rows, is idempotent, and doesn't need to be
+    /// inside the atomicity envelope.
+    pub async fn register_cache_hit_tx(
+        &self,
+        run: NewRun<'_>,
+        inputs: &[InputResolution],
+        source_run_id: &str,
+        cache_key: &str,
+        finished_at: i64,
+    ) -> Result<()> {
+        let dest_run_id = run.id.to_string();
+        let output_links = self
+            .pg
+            .register_cache_hit_tx(run, inputs, source_run_id, cache_key, finished_at)
+            .await?;
+        if !output_links.is_empty() {
+            self.pg
+                .backfill_stage_consumers(&dest_run_id, &output_links)
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn run_output_links(&self, run_id: &str) -> Result<Vec<(String, String)>> {

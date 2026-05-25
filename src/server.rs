@@ -228,7 +228,7 @@ fn translate_event(ev: &crate::store::EventRow) -> Option<StreamEvent> {
             kind: "run.created",
             id,
         }),
-        "run_submitted" | "run_status" | "stage_cache_hit" => {
+        "run_submitted" | "run_status" | "stage_cache_hit" | "cache_followed" => {
             ev.run_id.clone().map(|id| StreamEvent {
                 kind: "run.updated",
                 id,

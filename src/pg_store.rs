@@ -33,8 +33,8 @@ use sqlx::{
 
 use crate::config::{ClusterConfig, InputSpec, PgConfig, Recipe};
 use crate::store::{
-    ArtifactRow, EvalRequestSlot, EvalSeriesRow, EventRow, InputResolution, NewRun, PipelineRow,
-    PolicySummaryRow, RunRow, RunView, TrackingRow, is_terminal,
+    ArtifactRow, ClaimOutcome, EvalRequestSlot, EvalSeriesRow, EventRow, InputResolution, NewRun,
+    PipelineRow, PolicySummaryRow, RunRow, RunView, TrackingRow, is_terminal,
 };
 
 /// Embedded migration set. Resolved at compile time from `migrations/`;
@@ -359,17 +359,357 @@ impl PgStore {
             .collect()
     }
 
-    pub async fn find_cache_hit_candidate(&self, cache_key: &str) -> Result<Option<RunRow>> {
-        let row = sqlx::query(&format!(
+    /// Up to `limit` cache-hit candidates for `cache_key`, newest first.
+    /// Callers walk the list and accept the first whose outputs are
+    /// still materialized on disk — see `cache_hit_outputs_valid`. The
+    /// most-recent row may have been scrubbed, but an older row's
+    /// artifacts (same recipe + inputs by definition of cache_key) are
+    /// just as valid a hit.
+    pub async fn find_cache_hit_candidates(
+        &self,
+        cache_key: &str,
+        limit: i64,
+    ) -> Result<Vec<RunRow>> {
+        let rows = sqlx::query(&format!(
             "{RUN_SELECT_BASE} \
              WHERE cache_key = $1 AND status IN ('succeeded','cache_hit') \
-             ORDER BY created_at DESC LIMIT 1"
+             ORDER BY created_at DESC LIMIT $2"
         ))
+        .bind(cache_key)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("find_cache_hit_candidates({cache_key}, {limit})"))?;
+        rows.into_iter().map(row_to_run).collect()
+    }
+
+    /// Single-transaction cache-hit registration. Locks the source row
+    /// with `FOR SHARE` so a concurrent GC cannot delete it between the
+    /// caller's validity check (`cache_hit_outputs_valid`) and the link
+    /// of its outputs to the new run. Inside the tx:
+    ///
+    ///   1. Verify the source row is still a cache-hit candidate (status
+    ///      in {succeeded, cache_hit}); `FOR SHARE` blocks any concurrent
+    ///      writer trying to flip it terminal-failed or delete it.
+    ///   2. Upsert the new run row directly into terminal `cache_hit`,
+    ///      with `finished_at` set — no intermediate `created` state.
+    ///   3. Reset and populate `run_inputs` for the new run.
+    ///   4. Copy `run_outputs` rows from source to dest (`INSERT ... SELECT`).
+    ///   5. Append the `stage_cache_hit` event.
+    ///
+    /// The pipeline-graph backfill (`backfill_stage_consumers`) runs
+    /// outside the tx — it is idempotent and touches sibling rows, not
+    /// the cache-hit row, so it doesn't belong in the atomicity envelope.
+    /// Returns the source run's output `(role, artifact_id)` pairs so the
+    /// caller can run that backfill without an extra DB round trip.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_cache_hit_tx(
+        &self,
+        run: NewRun<'_>,
+        inputs: &[InputResolution],
+        source_run_id: &str,
+        cache_key: &str,
+        finished_at: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let submitted_by = run
+            .submitted_by
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("USER").ok())
+            .or_else(|| std::env::var("USERNAME").ok())
+            .context("register_cache_hit_tx: no submitted_by and $USER unset")?;
+        let recipe_value =
+            serde_json::to_value(run.recipe).context("register_cache_hit_tx: serialise recipe")?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("register_cache_hit_tx: begin")?;
+
+        // Lock the source row so concurrent GC / status-flip writers
+        // serialise behind us. If the row is no longer cache-hit-eligible
+        // (deleted, or status flipped away from succeeded/cache_hit), the
+        // caller has to re-decide — bail so the outer loop can pick the
+        // next candidate or fall through to a real submission.
+        let still_eligible = sqlx::query(
+            "SELECT 1 FROM runs \
+             WHERE id = $1 AND status IN ('succeeded','cache_hit') \
+             FOR SHARE",
+        )
+        .bind(source_run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("register_cache_hit_tx: lock source {source_run_id}"))?;
+        if still_eligible.is_none() {
+            bail!(
+                "cache_hit source {source_run_id} is no longer eligible (deleted or status \
+                 transitioned away from succeeded/cache_hit between candidate scan and link)"
+            );
+        }
+
+        // Insert the new run directly in terminal `cache_hit`. Upsert
+        // tolerates a pre-existing placeholder (agent-driven pipeline
+        // stages get an inserted `created` row at submit time).
+        sqlx::query(
+            "INSERT INTO runs
+             (id, recipe_name, recipe_hash, status, run_dir, repo, source_path,
+              recipe_json, context_json, created_at, finished_at, submitted_by, cache_key)
+             VALUES ($1,$2,$3,'cache_hit',$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             ON CONFLICT (id) DO UPDATE SET
+                 recipe_name = EXCLUDED.recipe_name,
+                 recipe_hash = EXCLUDED.recipe_hash,
+                 status      = 'cache_hit',
+                 run_dir     = EXCLUDED.run_dir,
+                 repo        = EXCLUDED.repo,
+                 source_path = EXCLUDED.source_path,
+                 recipe_json = EXCLUDED.recipe_json,
+                 context_json= EXCLUDED.context_json,
+                 finished_at = EXCLUDED.finished_at,
+                 submitted_by= EXCLUDED.submitted_by,
+                 cache_key   = EXCLUDED.cache_key",
+        )
+        .bind(run.id)
+        .bind(&run.recipe.name)
+        .bind(run.recipe_hash)
+        .bind(run.run_dir.display().to_string())
+        .bind(&run.recipe.repo)
+        .bind(run.source_path.display().to_string())
+        .bind(sqlx::types::Json(&recipe_value))
+        .bind(sqlx::types::Json(run.context_json))
+        .bind(finished_at)
+        .bind(finished_at)
+        .bind(&submitted_by)
+        .bind(cache_key)
+        .execute(&mut *tx)
+        .await
+        .context("register_cache_hit_tx: runs upsert")?;
+
+        // Replace any prior run_inputs (placeholder may not have had any,
+        // but this matches `insert_run`'s upsert-friendly shape).
+        sqlx::query("DELETE FROM run_inputs WHERE run_id = $1")
+            .bind(run.id)
+            .execute(&mut *tx)
+            .await
+            .context("register_cache_hit_tx: run_inputs cleanup")?;
+        for input in inputs {
+            sqlx::query(
+                "INSERT INTO run_inputs (run_id, role, artifact_id, resolved_path)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(run.id)
+            .bind(&input.role)
+            .bind(input.artifact_id.as_deref())
+            .bind(input.resolved_path.display().to_string())
+            .execute(&mut *tx)
+            .await
+            .with_context(|| {
+                format!(
+                    "register_cache_hit_tx: run_inputs insert role={}",
+                    input.role
+                )
+            })?;
+        }
+
+        // Copy outputs in one statement and capture (role, artifact_id)
+        // for the post-commit consumer backfill. RETURNING gives us the
+        // rows we just wrote — no second SELECT round-trip and no race
+        // window where the source could be edited mid-copy.
+        let rows = sqlx::query(
+            "INSERT INTO run_outputs (run_id, role, artifact_id)
+             SELECT $1, role, artifact_id FROM run_outputs WHERE run_id = $2
+             ON CONFLICT DO NOTHING
+             RETURNING role, artifact_id",
+        )
+        .bind(run.id)
+        .bind(source_run_id)
+        .fetch_all(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "register_cache_hit_tx: copy outputs {source_run_id} → {}",
+                run.id
+            )
+        })?;
+        let output_links: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|r| {
+                Ok::<_, anyhow::Error>((
+                    r.try_get::<String, _>("role")?,
+                    r.try_get::<String, _>("artifact_id")?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        // Event emission inside the same tx — the NOTIFY fires on commit,
+        // so SSE subscribers only see the hit once the row is durable.
+        sqlx::query(
+            "INSERT INTO events (run_id, event_type, payload_json, created_at)
+             VALUES ($1, 'stage_cache_hit', $2, $3)",
+        )
+        .bind(run.id)
+        .bind(sqlx::types::Json(json!({
+            "cache_key": cache_key,
+            "source_run_id": source_run_id,
+        })))
+        .bind(finished_at)
+        .execute(&mut *tx)
+        .await
+        .context("register_cache_hit_tx: event insert")?;
+
+        tx.commit().await.context("register_cache_hit_tx: commit")?;
+        Ok(output_links)
+    }
+
+    /// Find an in-flight run that already owns the slot for `cache_key`.
+    /// "In-flight" means a row whose status is in `{created, submitted,
+    /// running}` — i.e. the same predicate the partial unique index
+    /// `runs_cache_key_inflight_unique` (migration 0003) enforces. If a
+    /// row is returned, a concurrent submission is computing this
+    /// `cache_key` and the caller should attach as a follower rather
+    /// than submit redundant work.
+    pub async fn find_inflight_for_cache_key(&self, cache_key: &str) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT id FROM runs \
+             WHERE cache_key = $1 \
+               AND status IN ('created','submitted','running') \
+             ORDER BY created_at ASC LIMIT 1",
+        )
         .bind(cache_key)
         .fetch_optional(&self.pool)
         .await
-        .with_context(|| format!("find_cache_hit_candidate({cache_key})"))?;
-        row.map(row_to_run).transpose()
+        .with_context(|| format!("find_inflight_for_cache_key({cache_key})"))?;
+        row.map(|r| r.try_get::<String, _>("id"))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Submit-time singleflight: insert `run` as the slot owner for its
+    /// `cache_key`, or — if another non-terminal row already holds it —
+    /// return that row's id so the caller can attach as a follower.
+    ///
+    /// Algorithm: read-then-insert with bounded retry. The partial
+    /// unique index `runs_cache_key_inflight_unique` (migration 0003)
+    /// closes the read→insert race authoritatively; this method
+    /// recovers from the corresponding `23505` violation by re-reading.
+    ///
+    /// Retry rationale: if the read returns no leader, our insert can
+    /// still lose to a concurrent winner that just committed; we
+    /// re-read. If THAT re-read also returns nothing (the brief winner
+    /// already terminated), we retry the insert — it will now succeed
+    /// because the constraint only covers non-terminal rows. A small
+    /// fixed bound prevents pathological loops.
+    pub async fn try_claim_or_follow(
+        &self,
+        run: NewRun<'_>,
+        inputs: &[InputResolution],
+    ) -> Result<ClaimOutcome> {
+        let cache_key = run
+            .cache_key
+            .context("try_claim_or_follow: cache_key required")?;
+        const MAX_RACE_RETRIES: usize = 8;
+        for attempt in 0..MAX_RACE_RETRIES {
+            if let Some(leader_id) = self.find_inflight_for_cache_key(cache_key).await? {
+                return Ok(ClaimOutcome::Following {
+                    leader_run_id: leader_id,
+                });
+            }
+            match self.insert_run(run, inputs).await {
+                Ok(()) => return Ok(ClaimOutcome::Won),
+                Err(e) if is_inflight_unique_violation(&e) => {
+                    tracing::debug!(
+                        cache_key,
+                        attempt = attempt + 1,
+                        "try_claim_or_follow: insert lost the race; re-reading"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        bail!(
+            "try_claim_or_follow: {MAX_RACE_RETRIES} race retries exhausted for \
+             cache_key={cache_key} — repeated insert-and-vanish loop suggests a writer \
+             flipping its status terminal between our read and our insert"
+        );
+    }
+
+    /// Insert a cache-key follower placeholder. The row points at
+    /// `leader_run_id` via `dependency_on` so the existing
+    /// `pending_children_of` / `try_submit_pending_children` cascade
+    /// picks it up when the leader terminates. The follower's own
+    /// `cache_key` is left NULL (the partial unique index would
+    /// otherwise reject it — only one non-terminal row per cache_key
+    /// is permitted); the cascade re-runs `submit_recipe_inner` for
+    /// the follower, which re-computes the cache_key from the same
+    /// recipe + provenance + inputs and resolves as `cache_hit`
+    /// against the now-terminal leader.
+    ///
+    /// Emits a `cache_followed` event so operators can audit
+    /// coalescing decisions from the event log.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_cache_follower(
+        &self,
+        run_id: &str,
+        recipe: &Recipe,
+        recipe_hash: &str,
+        run_dir: &Path,
+        source_path: &Path,
+        submitted_by: &str,
+        cache_key_of_leader: &str,
+        leader_run_id: &str,
+    ) -> Result<()> {
+        let now = crate::util::now_ts();
+        let recipe_value =
+            serde_json::to_value(recipe).context("insert_cache_follower: serialise recipe")?;
+        // Placeholder context_json — the cascade rewrites it when the
+        // follower is upgraded to a real cache_hit row.
+        let ctx = json!({});
+        let dependency_on = json!({
+            "afterok": [{ "run_id": leader_run_id }]
+        });
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("insert_cache_follower: begin")?;
+        sqlx::query(
+            "INSERT INTO runs
+             (id, recipe_name, recipe_hash, status, run_dir, repo, source_path,
+              recipe_json, context_json, created_at, submitted_by, dependency_on)
+             VALUES ($1,$2,$3,'created',$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(run_id)
+        .bind(&recipe.name)
+        .bind(recipe_hash)
+        .bind(run_dir.display().to_string())
+        .bind(&recipe.repo)
+        .bind(source_path.display().to_string())
+        .bind(sqlx::types::Json(&recipe_value))
+        .bind(sqlx::types::Json(ctx))
+        .bind(now)
+        .bind(submitted_by)
+        .bind(sqlx::types::Json(&dependency_on))
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("insert_cache_follower: insert {run_id}"))?;
+
+        sqlx::query(
+            "INSERT INTO events (run_id, event_type, payload_json, created_at)
+             VALUES ($1, 'cache_followed', $2, $3)",
+        )
+        .bind(run_id)
+        .bind(sqlx::types::Json(json!({
+            "cache_key": cache_key_of_leader,
+            "leader_run_id": leader_run_id,
+        })))
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .context("insert_cache_follower: event insert")?;
+
+        tx.commit().await.context("insert_cache_follower: commit")?;
+        Ok(())
     }
 
     pub async fn run_output_artifact_id(&self, run_id: &str, role: &str) -> Result<Option<String>> {
@@ -1461,6 +1801,21 @@ impl PgStore {
     }
 }
 
+/// True when `err` (or any cause in its source chain) is a unique-
+/// violation on the singleflight index `runs_cache_key_inflight_unique`
+/// from migration 0003. `try_claim_or_follow` uses this to distinguish
+/// "the partial unique index just stopped a duplicate-submit race" from
+/// any other database error, which should propagate.
+fn is_inflight_unique_violation(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let Some(sqlx::Error::Database(db)) = cause.downcast_ref::<sqlx::Error>() else {
+            return false;
+        };
+        db.code().as_deref() == Some("23505")
+            && db.constraint() == Some("runs_cache_key_inflight_unique")
+    })
+}
+
 fn build_connect_options(pg: &PgConfig) -> Result<PgConnectOptions> {
     // host = absolute path → Unix socket dir; else TCP. The port is
     // passed in both cases — under sockets it encodes the socket
@@ -1628,13 +1983,17 @@ mod tests {
         let recipe_hash: String = (0..64)
             .map(|i| std::char::from_digit((i % 16) as u32, 16).unwrap())
             .collect();
+        // Insert as `created` (pre-terminal); the schema's
+        // runs_terminal_finished_at biconditional forbids terminal
+        // statuses without a finished_at, so we flip the row to
+        // succeeded in a second step below.
         store
             .insert_run(
                 crate::store::NewRun {
                     id: &run_id,
                     recipe: &recipe,
                     recipe_hash: &recipe_hash,
-                    status: "succeeded",
+                    status: "created",
                     run_dir: std::path::Path::new("/tmp/labctl-test"),
                     source_path: std::path::Path::new("/tmp/labctl-test/source"),
                     context_json: &serde_json::json!({"schema_version": 1}),
@@ -1646,8 +2005,6 @@ mod tests {
             .await
             .expect("insert_run");
 
-        // Terminal status requires a finished_at to satisfy the
-        // runs_terminal_finished_at biconditional.
         store
             .update_status(&run_id, "succeeded", Some(now))
             .await
@@ -1684,6 +2041,467 @@ mod tests {
             .execute(pg.pool())
             .await
             .expect("delete user");
+    }
+
+    /// Helper: build a minimal `NewRun`-shaped recipe + 64-hex
+    /// recipe_hash for the singleflight / cache tests below.
+    fn dummy_recipe() -> crate::config::Recipe {
+        crate::config::Recipe {
+            name: "test_recipe".to_string(),
+            repo: "labctl".to_string(),
+            command: vec!["true".to_string()],
+            resources: Default::default(),
+            inputs: Default::default(),
+            outputs: Default::default(),
+            params: Default::default(),
+            args: Default::default(),
+            env: Default::default(),
+            tracking: Default::default(),
+            sweep: None,
+        }
+    }
+
+    fn dummy_recipe_hash() -> String {
+        // Any 64-hex string satisfies runs_recipe_hash_format.
+        (0..64).map(|_| 'a').collect()
+    }
+
+    /// Helper: insert a user so a run can FK-attach. Returns the user
+    /// name (caller cleans up).
+    async fn insert_test_user(store: &crate::store::Store) -> String {
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let user_name = format!("__test_user_{suffix}");
+        let now = crate::util::now_ts();
+        store
+            .insert_user(&user_name, now)
+            .await
+            .expect("insert_user");
+        user_name
+    }
+
+    /// Helper: bulk-clean the rows a singleflight test wrote.
+    async fn cleanup_user(pg: &PgStore, user_name: &str) {
+        // Order matters: events/inputs cascade via runs ON DELETE
+        // CASCADE; we just need to delete all runs for the user, then
+        // the user.
+        sqlx::query("DELETE FROM runs WHERE submitted_by = $1")
+            .bind(user_name)
+            .execute(pg.pool())
+            .await
+            .expect("cleanup runs");
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(user_name)
+            .execute(pg.pool())
+            .await
+            .expect("cleanup user");
+    }
+
+    /// The partial unique index `runs_cache_key_inflight_unique`
+    /// (migration 0003) must reject a second non-terminal insert for
+    /// the same `cache_key`, and `is_inflight_unique_violation` must
+    /// recognise the surfaced sqlx::Error so the retry loop kicks in.
+    #[tokio::test]
+    #[ignore = "requires running PG"]
+    async fn inflight_unique_index_rejects_duplicate() {
+        use crate::store::Store;
+        let cluster = live_cluster().expect("cluster.toml present");
+        let store = Store::connect(&cluster).await.expect("connect");
+        let pg = store.pg();
+
+        let user = insert_test_user(&store).await;
+        let recipe = dummy_recipe();
+        let rh = dummy_recipe_hash();
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let cache_key = format!("ck_{suffix}");
+        let run_a = format!("run_{}", uuid::Uuid::now_v7().simple());
+        let run_b = format!("run_{}", uuid::Uuid::now_v7().simple());
+
+        // First insert: takes the slot.
+        store
+            .insert_run(
+                crate::store::NewRun {
+                    id: &run_a,
+                    recipe: &recipe,
+                    recipe_hash: &rh,
+                    status: "created",
+                    run_dir: std::path::Path::new("/tmp/labctl-test-a"),
+                    source_path: std::path::Path::new("/tmp/labctl-test-a/source"),
+                    context_json: &serde_json::json!({"schema_version": 1}),
+                    submitted_by: Some(&user),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+            )
+            .await
+            .expect("insert run A");
+
+        // Second insert for the same cache_key: must fail with the
+        // partial unique index, and the error must be detectable.
+        let res = store
+            .insert_run(
+                crate::store::NewRun {
+                    id: &run_b,
+                    recipe: &recipe,
+                    recipe_hash: &rh,
+                    status: "created",
+                    run_dir: std::path::Path::new("/tmp/labctl-test-b"),
+                    source_path: std::path::Path::new("/tmp/labctl-test-b/source"),
+                    context_json: &serde_json::json!({"schema_version": 1}),
+                    submitted_by: Some(&user),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+            )
+            .await;
+        let err = res.expect_err("second insert must violate the inflight unique index");
+        assert!(
+            is_inflight_unique_violation(&err),
+            "is_inflight_unique_violation must recognise the surfaced error; got: {err:#}"
+        );
+
+        cleanup_user(&pg, &user).await;
+    }
+
+    /// try_claim_or_follow returns Won for the first submitter and
+    /// Following with the leader's id for the second.
+    #[tokio::test]
+    #[ignore = "requires running PG"]
+    async fn try_claim_or_follow_singleflights() {
+        use crate::store::{ClaimOutcome, Store};
+        let cluster = live_cluster().expect("cluster.toml present");
+        let store = Store::connect(&cluster).await.expect("connect");
+        let pg = store.pg();
+
+        let user = insert_test_user(&store).await;
+        let recipe = dummy_recipe();
+        let rh = dummy_recipe_hash();
+        let cache_key = format!("ck_{}", uuid::Uuid::now_v7().simple());
+        let run_a = format!("run_{}", uuid::Uuid::now_v7().simple());
+        let run_b = format!("run_{}", uuid::Uuid::now_v7().simple());
+
+        let outcome_a = pg
+            .try_claim_or_follow(
+                crate::store::NewRun {
+                    id: &run_a,
+                    recipe: &recipe,
+                    recipe_hash: &rh,
+                    status: "created",
+                    run_dir: std::path::Path::new("/tmp/labctl-test-a"),
+                    source_path: std::path::Path::new("/tmp/labctl-test-a/source"),
+                    context_json: &serde_json::json!({"schema_version": 1}),
+                    submitted_by: Some(&user),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+            )
+            .await
+            .expect("claim A");
+        assert!(matches!(outcome_a, ClaimOutcome::Won));
+
+        let outcome_b = pg
+            .try_claim_or_follow(
+                crate::store::NewRun {
+                    id: &run_b,
+                    recipe: &recipe,
+                    recipe_hash: &rh,
+                    status: "created",
+                    run_dir: std::path::Path::new("/tmp/labctl-test-b"),
+                    source_path: std::path::Path::new("/tmp/labctl-test-b/source"),
+                    context_json: &serde_json::json!({"schema_version": 1}),
+                    submitted_by: Some(&user),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+            )
+            .await
+            .expect("claim B");
+        match outcome_b {
+            ClaimOutcome::Following { leader_run_id } => assert_eq!(leader_run_id, run_a),
+            other => panic!("expected Following, got {other:?}"),
+        }
+
+        cleanup_user(&pg, &user).await;
+    }
+
+    /// Once the leader terminates (succeeded), a fresh submitter for
+    /// the same cache_key wins the slot — the partial unique index
+    /// only covers in-flight rows.
+    #[tokio::test]
+    #[ignore = "requires running PG"]
+    async fn terminal_leader_releases_slot() {
+        use crate::store::{ClaimOutcome, Store};
+        let cluster = live_cluster().expect("cluster.toml present");
+        let store = Store::connect(&cluster).await.expect("connect");
+        let pg = store.pg();
+
+        let user = insert_test_user(&store).await;
+        let recipe = dummy_recipe();
+        let rh = dummy_recipe_hash();
+        let cache_key = format!("ck_{}", uuid::Uuid::now_v7().simple());
+        let run_a = format!("run_{}", uuid::Uuid::now_v7().simple());
+        let run_b = format!("run_{}", uuid::Uuid::now_v7().simple());
+
+        // Insert A and flip it to terminal-succeeded.
+        pg.try_claim_or_follow(
+            crate::store::NewRun {
+                id: &run_a,
+                recipe: &recipe,
+                recipe_hash: &rh,
+                status: "created",
+                run_dir: std::path::Path::new("/tmp/labctl-test-a"),
+                source_path: std::path::Path::new("/tmp/labctl-test-a/source"),
+                context_json: &serde_json::json!({"schema_version": 1}),
+                submitted_by: Some(&user),
+                cache_key: Some(&cache_key),
+            },
+            &[],
+        )
+        .await
+        .expect("claim A");
+        let now = crate::util::now_ts();
+        store
+            .update_status(&run_a, "succeeded", Some(now))
+            .await
+            .expect("succeed A");
+
+        // Fresh submission for the same cache_key now wins — terminal
+        // rows are not in the inflight predicate.
+        let outcome_b = pg
+            .try_claim_or_follow(
+                crate::store::NewRun {
+                    id: &run_b,
+                    recipe: &recipe,
+                    recipe_hash: &rh,
+                    status: "created",
+                    run_dir: std::path::Path::new("/tmp/labctl-test-b"),
+                    source_path: std::path::Path::new("/tmp/labctl-test-b/source"),
+                    context_json: &serde_json::json!({"schema_version": 1}),
+                    submitted_by: Some(&user),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+            )
+            .await
+            .expect("claim B");
+        assert!(
+            matches!(outcome_b, ClaimOutcome::Won),
+            "post-terminal slot must be available; got {outcome_b:?}"
+        );
+
+        cleanup_user(&pg, &user).await;
+    }
+
+    /// register_cache_hit_tx upserts a row into terminal `cache_hit`
+    /// state, copies the source's outputs, and emits the event — all
+    /// in one transaction so a concurrent GC can't slip in between.
+    #[tokio::test]
+    #[ignore = "requires running PG"]
+    async fn register_cache_hit_tx_atomically_links_outputs() {
+        use crate::store::Store;
+        let cluster = live_cluster().expect("cluster.toml present");
+        let store = Store::connect(&cluster).await.expect("connect");
+        let pg = store.pg();
+
+        let user = insert_test_user(&store).await;
+        let recipe = dummy_recipe();
+        let rh = dummy_recipe_hash();
+        let cache_key = format!("ck_{}", uuid::Uuid::now_v7().simple());
+        let leader_id = format!("run_{}", uuid::Uuid::now_v7().simple());
+        let follower_id = format!("run_{}", uuid::Uuid::now_v7().simple());
+        let now = crate::util::now_ts();
+
+        // Leader: insert as `created` (pre-terminal) then flip to
+        // succeeded with finished_at, matching the lifecycle the
+        // schema's `runs_terminal_finished_at` biconditional expects.
+        store
+            .insert_run(
+                crate::store::NewRun {
+                    id: &leader_id,
+                    recipe: &recipe,
+                    recipe_hash: &rh,
+                    status: "created",
+                    run_dir: std::path::Path::new("/tmp/labctl-test-leader"),
+                    source_path: std::path::Path::new("/tmp/labctl-test-leader/source"),
+                    context_json: &serde_json::json!({"schema_version": 1}),
+                    submitted_by: Some(&user),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+            )
+            .await
+            .expect("insert leader");
+        store
+            .update_status(&leader_id, "succeeded", Some(now))
+            .await
+            .expect("flip leader");
+
+        // Synthesize one artifact and link it as the leader's output.
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let artifact_id = format!("artifact_{}", &suffix[..16]);
+        let artifact_path = format!("/tmp/labctl-test-leader-output-{suffix}");
+        pg.insert_artifact(
+            &artifact_id,
+            "test_kind",
+            std::path::Path::new(&artifact_path),
+            Some(&leader_id),
+            &serde_json::json!({"role": "out"}),
+            &user,
+            now,
+        )
+        .await
+        .expect("insert artifact");
+        store
+            .link_run_output(&leader_id, "out", &artifact_id)
+            .await
+            .expect("link output");
+
+        // Register the follower as a cache_hit pointing at leader.
+        store
+            .register_cache_hit_tx(
+                crate::store::NewRun {
+                    id: &follower_id,
+                    recipe: &recipe,
+                    recipe_hash: &rh,
+                    status: "cache_hit",
+                    run_dir: std::path::Path::new("/tmp/labctl-test-follower"),
+                    source_path: std::path::Path::new("/tmp/labctl-test-follower/source"),
+                    context_json: &serde_json::json!({"schema_version": 1, "cache_hit": true}),
+                    submitted_by: Some(&user),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+                &leader_id,
+                &cache_key,
+                now,
+            )
+            .await
+            .expect("register cache hit");
+
+        let view = store.run_view(&follower_id).await.expect("view follower");
+        assert_eq!(view.run.status, "cache_hit");
+        assert_eq!(view.run.finished_at, Some(now));
+        assert_eq!(view.outputs.len(), 1, "outputs must be copied from leader");
+        assert_eq!(view.outputs[0].id, artifact_id);
+
+        // The stage_cache_hit event must have landed inside the tx.
+        let events = store
+            .events_for_run(&follower_id)
+            .await
+            .expect("events_for_run");
+        assert!(
+            events.iter().any(|e| e["event_type"] == "stage_cache_hit"),
+            "stage_cache_hit event must be emitted; got {events:?}"
+        );
+
+        // Cleanup: delete artifact (FK from run_outputs cascades from
+        // runs), then user.
+        sqlx::query("DELETE FROM run_outputs WHERE artifact_id = $1")
+            .bind(&artifact_id)
+            .execute(pg.pool())
+            .await
+            .expect("cleanup run_outputs");
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(&artifact_id)
+            .execute(pg.pool())
+            .await
+            .expect("cleanup artifact");
+        cleanup_user(&pg, &user).await;
+    }
+
+    /// insert_cache_follower writes a placeholder with no cache_key
+    /// (so it doesn't itself trip the inflight unique index), with
+    /// dependency_on pointing at the leader, and emits the
+    /// cache_followed event.
+    #[tokio::test]
+    #[ignore = "requires running PG"]
+    async fn cache_follower_placeholder_shape() {
+        use crate::store::Store;
+        let cluster = live_cluster().expect("cluster.toml present");
+        let store = Store::connect(&cluster).await.expect("connect");
+        let pg = store.pg();
+
+        let user = insert_test_user(&store).await;
+        let recipe = dummy_recipe();
+        let rh = dummy_recipe_hash();
+        let leader_id = format!("run_{}", uuid::Uuid::now_v7().simple());
+        let follower_id = format!("run_{}", uuid::Uuid::now_v7().simple());
+        let cache_key = format!("ck_{}", uuid::Uuid::now_v7().simple());
+
+        // Leader exists in-flight to satisfy the dependency_on @>
+        // reference (no FK on dependency_on; we just want the run
+        // present for symmetry with real flows).
+        store
+            .insert_run(
+                crate::store::NewRun {
+                    id: &leader_id,
+                    recipe: &recipe,
+                    recipe_hash: &rh,
+                    status: "created",
+                    run_dir: std::path::Path::new("/tmp/labctl-test-leader"),
+                    source_path: std::path::Path::new("/tmp/labctl-test-leader/source"),
+                    context_json: &serde_json::json!({"schema_version": 1}),
+                    submitted_by: Some(&user),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+            )
+            .await
+            .expect("insert leader");
+
+        store
+            .insert_cache_follower(
+                &follower_id,
+                &recipe,
+                &rh,
+                std::path::Path::new("/tmp/labctl-test-follower"),
+                std::path::Path::new("/tmp/labctl-test-follower/source"),
+                &user,
+                &cache_key,
+                &leader_id,
+            )
+            .await
+            .expect("insert follower");
+
+        let row = store.get_run(&follower_id).await.expect("get follower row");
+        assert_eq!(row.status, "created");
+        assert!(
+            row.cache_key.is_none(),
+            "follower must have NULL cache_key so the inflight unique index doesn't apply"
+        );
+        let dep = row.dependency_on.expect("dependency_on must be set");
+        let afterok = dep
+            .get("afterok")
+            .and_then(|v| v.as_array())
+            .expect("dependency_on.afterok array");
+        assert_eq!(afterok.len(), 1);
+        assert_eq!(
+            afterok[0].get("run_id").and_then(|v| v.as_str()),
+            Some(leader_id.as_str())
+        );
+
+        // cache_followed event present.
+        let events = store
+            .events_for_run(&follower_id)
+            .await
+            .expect("events_for_run");
+        assert!(
+            events.iter().any(|e| e["event_type"] == "cache_followed"),
+            "cache_followed event must be emitted; got {events:?}"
+        );
+
+        // pending_children_of(leader) must surface the follower so the
+        // existing reconcile cascade picks it up when the leader
+        // terminates.
+        let children = pg
+            .pending_children_of(&leader_id)
+            .await
+            .expect("pending_children_of");
+        assert!(
+            children.iter().any(|r| r.id == follower_id),
+            "follower must appear under pending_children_of(leader)"
+        );
+
+        cleanup_user(&pg, &user).await;
     }
 
     #[tokio::test]
