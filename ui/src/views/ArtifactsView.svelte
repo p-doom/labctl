@@ -2,12 +2,16 @@
   import { onMount } from "svelte";
   import { store, loadArtifacts, loadArtifactDetail } from "../lib/store.svelte";
   import { router } from "../lib/router.svelte";
-  import RelativeTime from "../components/RelativeTime.svelte";
-  import Hash from "../components/Hash.svelte";
   import FilterBar from "../components/FilterBar.svelte";
   import FilterChips from "../components/FilterChips.svelte";
   import FilterInput from "../components/FilterInput.svelte";
   import EmptyState from "../components/EmptyState.svelte";
+  import {
+    editionNumber,
+    formatRelative,
+    formatAbsolute,
+  } from "../lib/format";
+  import { nowSecs } from "../lib/time.svelte";
   import type { ChipDef } from "../lib/filters";
   import ArtifactPanel from "./ArtifactPanel.svelte";
 
@@ -67,7 +71,7 @@
   let allArtifacts = $derived(store.artifacts.data ?? []);
   let isLoading = $derived(store.artifacts.loading && allArtifacts.length === 0);
 
-  // Hover prefetch — fires after 100ms of cursor stability over a row.
+  // Hover prefetch — 100ms cursor stability before firing.
   let prefetchTimer: number | null = null;
   let prefetchTarget: string | null = null;
   function onRowEnter(id: string) {
@@ -133,33 +137,36 @@
     <FilterInput
       bind:inputRef={filterInputEl}
       value={filterText}
-      placeholder="Filter artifacts…"
+      placeholder="Filter specimens…"
       onInput={(v) => (filterText = v)}
       onEnter={openCursorRow}
     />
   </FilterBar>
   <div class="list" bind:this={listEl}>
     <div class="list-head art-head">
-      <div>kind</div>
-      <div>aliases / id</div>
-      <div>hash</div>
-      <div>path</div>
-      <div>created</div>
+      <div>Catalog</div>
+      <div>Specimen</div>
+      <div>Hash</div>
+      <div>Logged</div>
+      <div></div>
     </div>
     {#if isLoading}
       {#each Array(6) as _, i (i)}
         <div class="list-row art-row">
-          <div class="skel" style="height: 14px; width: 50px"></div>
-          <div class="skel" style="height: 14px; width: 70%"></div>
-          <div class="skel" style="height: 12px; width: 80px"></div>
-          <div class="skel" style="height: 12px; width: 50%"></div>
-          <div class="skel" style="height: 12px; width: 60px"></div>
+          <div class="skel" style="height: 11px; width: 80px"></div>
+          <div class="art-cell">
+            <div class="skel" style="height: 14px; width: 50%; margin-bottom: 4px"></div>
+            <div class="skel" style="height: 11px; width: 70%"></div>
+          </div>
+          <div class="skel" style="height: 12px; width: 70px"></div>
+          <div class="skel" style="height: 11px; width: 60px"></div>
+          <div></div>
         </div>
       {/each}
     {:else if filtered.length === 0}
-      <EmptyState title="No artifacts">
+      <EmptyState title="No specimens.">
         {#snippet sub()}
-          Artifacts appear once a recipe finishes producing outputs.
+          Specimens are deposited when an edition produces outputs.
         {/snippet}
       </EmptyState>
     {:else}
@@ -178,24 +185,21 @@
           tabindex="0"
           onkeydown={(e) => e.key === "Enter" && router.select("artifacts", a.id)}
         >
-          <span class="kind">{a.kind}</span>
-          <div class="aliases">
-            {#if a.aliases && a.aliases.length}
-              {#each a.aliases as alias}
-                <span class="alias">{alias}</span>
-              {/each}
-            {:else}
-              <span class="dim mono">(no alias)</span>
-            {/if}
-            <span class="id mono">
-              <Hash value={a.id} n={10} />
-            </span>
+          <span class="catno">No. {editionNumber(a.id)}</span>
+          <div class="art-cell">
+            <div class="art-top">
+              <span class="kind">{a.kind}</span>
+              {#if a.aliases && a.aliases.length}
+                {#each a.aliases as alias}
+                  <span class="alias mono">{alias}</span>
+                {/each}
+              {/if}
+            </div>
+            <div class="art-meta mono" title={a.path}>{a.path}</div>
           </div>
-          <span class="hash">
-            <Hash value={a.content_hash} n={10} />
-          </span>
-          <span class="path mono" title={a.path}>{a.path}</span>
-          <RelativeTime ts={a.created_at} />
+          <span class="hash mono">{a.content_hash.slice(0, 10)}</span>
+          <span class="rel mono" title={formatAbsolute(a.created_at)}>{formatRelative(a.created_at, nowSecs.value)}</span>
+          <span class="chev" aria-hidden="true">›</span>
         </div>
       {/each}
     {/if}
@@ -209,31 +213,94 @@
 <style>
   .page { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
   .list { flex: 1; overflow-y: auto; }
+  /* Stanza specimen geometry:
+     catalog-no | kind+aliases+path stack | hash | logged | chev */
   .art-head,
   .art-row {
-    grid-template-columns: 80px 1fr 96px 1.5fr 96px;
+    grid-template-columns: 100px 1fr 90px 80px 12px;
+    min-height: 56px;
+  }
+  .art-head { min-height: auto; }
+
+  .catno {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--fg-2);
+    align-self: start;
+    margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .art-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    overflow: hidden;
+    min-width: 0;
+  }
+  .art-top {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    overflow: hidden;
+    min-width: 0;
   }
   .kind {
-    font-family: theme("fontFamily.mono");
+    font-family: theme("fontFamily.serif");
+    font-style: italic;
+    font-weight: 500;
+    font-size: 15px;
+    color: var(--fg-0);
+    letter-spacing: -0.005em;
+    flex-shrink: 0;
+    font-feature-settings: normal;
+  }
+  .alias {
     font-size: 11px;
     color: var(--accent-dim);
-    padding: 2px 6px;
     background: var(--accent-soft);
+    padding: 1px 6px;
     border-radius: 3px;
-    justify-self: start;
+    flex-shrink: 0;
   }
-  .aliases { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
-  .alias {
-    font-family: theme("fontFamily.mono");
-    font-size: 12px;
-    color: var(--fg-0);
-  }
-  .id { font-size: 11px; }
-  .path {
+  .art-meta {
     font-size: 11px;
     color: var(--fg-2);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .hash {
+    font-size: 12px;
+    color: var(--fg-1);
+    font-variant-numeric: tabular-nums;
+  }
+  .rel {
+    font-size: 12px;
+    color: var(--fg-2);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+  .chev {
+    color: var(--fg-3);
+    font-size: 16px;
+    line-height: 1;
+    text-align: center;
+    transition: color var(--dur-micro) var(--ease), transform var(--dur-micro) var(--ease);
+  }
+  .list-row:hover .chev,
+  .list-row[data-state="active"] .chev { color: var(--fg-1); transform: translateX(2px); }
+
+  .mono { font-family: theme("fontFamily.mono"); }
+  :global(.empty code) {
+    font-family: theme("fontFamily.mono");
+    font-size: 12px;
+    color: var(--fg-0);
+    background: var(--bg-2);
+    padding: 1px 5px;
+    border-radius: 3px;
   }
 </style>

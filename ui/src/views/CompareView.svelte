@@ -104,17 +104,17 @@
 <div class="page">
   <DetailHeader
     label="compare"
-    name={`${ids.length} ${ids.length === 1 ? "run" : "runs"}`}
-    meta={runsByRecipe.size > 0 ? `across ${runsByRecipe.size} ${runsByRecipe.size === 1 ? "recipe" : "recipes"}` : undefined}
+    name={`${ids.length} ${ids.length === 1 ? "edition" : "editions"}`}
+    meta={runsByRecipe.size > 0 ? `across ${runsByRecipe.size} ${runsByRecipe.size === 1 ? "volume" : "volumes"}` : undefined}
     backLabel="Runs"
     onBack={close}
   />
 
   {#if ids.length === 0}
-    <EmptyState title="No runs selected">
+    <EmptyState title="No editions selected.">
       {#snippet sub()}
-        Select runs in the runs list (click the checkbox on the left of
-        each row), then click "Compare" in the floating bar.
+        Tick the checkbox on the left of any row in the editions list,
+        then open this view from the floating bar.
       {/snippet}
     </EmptyState>
   {:else if error}
@@ -124,11 +124,11 @@
       <div class="skel" style="height: 240px; width: 100%"></div>
     </div>
   {:else if metrics.length === 0}
-    <EmptyState title="No eval metrics across these runs">
+    <EmptyState title="No shared figures.">
       {#snippet sub()}
-        These runs don't share any metrics that labctl can recognize.
-        Either evals haven't completed yet, or their result.json doesn't
-        contain a recognizable metric dict.
+        These editions don't share any metrics labctl can read. Either
+        evals haven't completed, or their <code>result.json</code> lacks
+        a recognizable metric dict.
       {/snippet}
     </EmptyState>
   {:else}

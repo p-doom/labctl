@@ -10,20 +10,24 @@
   }
   let { cluster }: Props = $props();
 
+  // The Stanza vocabulary: a run is an *edition*, a pipeline is a
+  // *series*, an artifact is a *specimen*, a policy is a *rule*. The
+  // language is consistent with the website's "No. 5" framing of
+  // research releases.
   const titles: Record<string, string> = {
-    runs: "Runs",
-    pipelines: "Pipelines",
-    artifacts: "Artifacts",
-    policies: "Policies",
+    runs: "Editions",
+    pipelines: "Series",
+    artifacts: "Specimens",
+    policies: "Rules",
   };
 </script>
 
 <header class="top">
   <div class="left">
-    <h1>{titles[router.view]}</h1>
+    <h1 class="masthead">{titles[router.view] ?? router.view}</h1>
     {#if cluster}
       <span class="cluster" title={cluster.registry_db}>
-        <span class="sep">/</span>
+        <span class="sep">·</span>
         <span class="name">{cluster.name}</span>
       </span>
     {/if}
@@ -53,34 +57,40 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 12px 16px;
-    border-bottom: 1px solid theme("colors.line.0");
+    padding: 14px 20px;
+    border-bottom: 1px solid theme("colors.line.1");
     background: theme("colors.bg.0");
-    height: 48px;
+    height: 52px;
     flex-shrink: 0;
   }
   .left {
     display: flex;
-    align-items: baseline;
-    gap: 8px;
+    align-items: center;
+    gap: 10px;
   }
-  h1 {
-    font-size: 18px;
-    font-weight: 500;
-    color: theme("colors.fg.0");
+  /* Masthead-styled view name. The actual title typography is the small-
+   * caps class globally — this just sets the size up a touch. */
+  h1.masthead {
+    font-size: 12px;
     margin: 0;
-    letter-spacing: -0.01em;
   }
   .cluster {
     display: inline-flex;
-    align-items: baseline;
-    gap: 6px;
-    font-size: 13px;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
     color: theme("colors.fg.2");
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
   }
+  .cluster .sep { color: theme("colors.fg.3"); }
   .cluster .name {
     font-family: theme("fontFamily.mono");
     color: theme("colors.fg.1");
+    letter-spacing: 0.04em;
+    text-transform: none;
+    font-weight: 400;
   }
   .right {
     display: flex;

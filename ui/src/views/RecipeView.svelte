@@ -82,9 +82,9 @@
 
 <div class="page">
   <DetailHeader
-    label="recipe"
+    label="volume"
     name={recipeName}
-    meta={recipe ? `${recipe.runs.length} ${recipe.runs.length === 1 ? "run" : "runs"}` : undefined}
+    meta={recipe ? `${recipe.runs.length} ${recipe.runs.length === 1 ? "edition" : "editions"}` : undefined}
     backLabel="Runs"
     onBack={close}
   />
@@ -96,10 +96,10 @@
       <div class="skel" style="height: 240px; width: 100%"></div>
     </div>
   {:else if metrics.length === 0}
-    <EmptyState title="No eval data yet">
+    <EmptyState title="No figures yet.">
       {#snippet sub()}
-        Once these runs produce eval_result artifacts, their trajectories
-        show up here overlaid by run.
+        Once these editions produce eval_result specimens, their
+        trajectories appear here overlaid edition by edition.
       {/snippet}
     </EmptyState>
   {:else}
@@ -155,7 +155,7 @@
 
       <section class="runs">
         <header class="runs-h">
-          <h3>Runs</h3>
+          <h3 class="masthead">Editions</h3>
           <span class="count">{recipe.runs.length}</span>
         </header>
         <div class="run-list">
