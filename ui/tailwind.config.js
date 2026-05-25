@@ -79,6 +79,7 @@ export default {
     fontFamily: {
       sans: ['"Inter Variable"', "Inter", "ui-sans-serif", "system-ui", "sans-serif"],
       mono: ['"JetBrains Mono Variable"', '"JetBrains Mono"', "ui-monospace", "SFMono-Regular", "monospace"],
+      serif: ['"Lora Variable"', "Lora", "Georgia", '"Times New Roman"', "serif"],
     },
     fontSize: {
       xs: ["12px", { lineHeight: "16px", letterSpacing: "0.005em" }],

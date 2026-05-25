@@ -2,14 +2,19 @@
   import { store, loadArtifactDetail } from "../lib/store.svelte";
   import { router } from "../lib/router.svelte";
   import { panelHistory } from "../lib/panel.svelte";
-  import { copy } from "../lib/format";
+  import {
+    copy,
+    editionNumber,
+    formatEditionDate,
+    formatEditionTime,
+    formatAbsolute,
+    formatRelative,
+  } from "../lib/format";
+  import { nowSecs } from "../lib/time.svelte";
 
   import SidePanel from "../components/SidePanel.svelte";
-  import Hash from "../components/Hash.svelte";
-  import RelativeTime from "../components/RelativeTime.svelte";
   import Icon from "../components/Icon.svelte";
   import Result from "../components/Result.svelte";
-  import MetaRow from "../components/MetaRow.svelte";
   import DatasetExplorer from "../components/DatasetExplorer.svelte";
 
   interface Props {
@@ -46,12 +51,7 @@
 >
   {#snippet title()}
     {#if detail}
-      <div class="title-row">
-        <span class="kind">{detail.artifact.kind}</span>
-        <span class="name mono">
-          {detail.artifact.aliases?.[0] ?? detail.artifact.id}
-        </span>
-      </div>
+      <span class="title-edno">Cat. {editionNumber(detail.artifact.id)}</span>
     {:else if error}
       <span class="title-error">{error}</span>
     {/if}
@@ -72,71 +72,88 @@
 
   {#if !detail && !error}
     <div class="loading">
-      <div class="skel" style="height: 24px; width: 50%; margin-bottom: 12px"></div>
-      <div class="skel" style="height: 14px; width: 80%"></div>
+      <div class="skel" style="height: 14px; width: 30%; margin-bottom: 14px"></div>
+      <div class="skel" style="height: 36px; width: 70%"></div>
     </div>
   {:else if error}
-    <div class="error">{error}</div>
+    <div class="error">
+      <p class="headline">A specimen is missing.</p>
+      <p class="error-sub">{error}</p>
+    </div>
   {:else if detail}
-    <section class="meta">
-      <MetaRow label="id"><Hash value={detail.artifact.id} n={20} /></MetaRow>
-      <MetaRow label="content hash"><Hash value={detail.artifact.content_hash} n={16} /></MetaRow>
-      {#if detail.artifact.aliases && detail.artifact.aliases.length}
-        <MetaRow label="aliases">
-          <div class="aliases">
-            {#each detail.artifact.aliases as a}
-              <span class="alias">{a}</span>
-            {/each}
-          </div>
-        </MetaRow>
-      {/if}
-      <MetaRow label="created"><RelativeTime ts={detail.artifact.created_at} /></MetaRow>
-      <MetaRow label="path" path={detail.artifact.path} />
+    {@const a = detail.artifact}
+
+    <!-- ============ MASTHEAD ============ -->
+    <header class="masthead-block">
+      <div class="masthead-line">
+        <span class="masthead">Cat. {editionNumber(a.id)}</span>
+        <span class="spacer-dot">·</span>
+        <span class="masthead">{formatEditionDate(a.created_at)}</span>
+        <span class="spacer-dot">·</span>
+        <span class="masthead">{formatEditionTime(a.created_at)}</span>
+      </div>
+
+      <h1 class="title-display headline">
+        {#if a.aliases && a.aliases.length}
+          {a.aliases[0]}
+        {:else}
+          <span class="kind-name">{a.kind}</span>
+        {/if}
+      </h1>
+
+      <div class="meta-line">
+        <span class="kind-chip">{a.kind}</span>
+        <span class="spacer-dot">·</span>
+        <span class="mono">{a.content_hash.slice(0, 12)}</span>
+      </div>
+    </header>
+
+    <!-- ============ PATH ============ -->
+    <section class="block first">
+      <h2 class="section-h masthead">Path</h2>
+      <p class="path mono">{a.path}</p>
     </section>
 
-    <div class="action-row">
-      <button type="button" class="btn-primary" onclick={openLineage}>
-        <span>Open lineage</span>
-        <Icon name="external" size={12} />
-      </button>
-    </div>
-
-    {#if detail.artifact.metadata && (detail.artifact.metadata as { result?: unknown }).result}
+    {#if a.aliases && a.aliases.length > 1}
       <section class="block">
-        <header class="block-h">
-          <h3>Result</h3>
-        </header>
-        <Result result={(detail.artifact.metadata as { result: unknown }).result} />
+        <h2 class="section-h masthead">Aliases</h2>
+        <div class="aliases">
+          {#each a.aliases as al}
+            <span class="alias mono">{al}</span>
+          {/each}
+        </div>
       </section>
     {/if}
 
+    <!-- ============ PROVENANCE ============ -->
     <section class="block">
-      <header class="block-h">
-        <h3>Producer</h3>
-      </header>
+      <h2 class="section-h masthead">Provenance</h2>
       {#if detail.producer}
         <button
           type="button"
-          class="runlink"
-          onclick={() => router.go("runs", detail!.producer!.id)}
+          class="prov-row"
+          onclick={() => router.go("runs", detail.producer!.id)}
         >
-          <span class="r mono">{detail.producer.recipe_name}</span>
-          {#if detail.producer.stage_name}
-            <span class="s mono">/ {detail.producer.stage_name}</span>
-          {/if}
-          <span class="rid mono"><Hash value={detail.producer.id} n={10} /></span>
-          <Icon name="chevron-right" size={12} />
+          <div class="prov-body">
+            <span class="prov-name">{detail.producer.recipe_name}</span>
+            {#if detail.producer.stage_name}
+              <span class="prov-stage mono">/ {detail.producer.stage_name}</span>
+            {/if}
+          </div>
+          <span class="prov-id mono">No. {editionNumber(detail.producer.id)}</span>
+          <span class="chev">›</span>
         </button>
       {:else}
-        <p class="muted">External or not produced by a tracked run.</p>
+        <p class="muted">External or not produced by a tracked edition.</p>
       {/if}
     </section>
 
+    <!-- ============ CONSUMERS ============ -->
     <section class="block">
-      <header class="block-h">
-        <h3>Consumers</h3>
+      <h2 class="section-h masthead">
+        Consumed by
         <span class="count">{detail.consumers.length}</span>
-      </header>
+      </h2>
       {#if detail.consumers.length === 0}
         <p class="muted">No tracked consumers yet.</p>
       {:else}
@@ -144,58 +161,135 @@
           {#each detail.consumers as c}
             <button
               type="button"
-              class="runlink"
+              class="prov-row"
               onclick={() => router.go("runs", c.id)}
             >
-              <span class="r mono">{c.recipe_name}</span>
-              {#if (c as any).input_role}
-                <span class="role mono">·{(c as any).input_role}</span>
-              {/if}
-              <span class="rid mono"><Hash value={c.id} n={10} /></span>
-              <Icon name="chevron-right" size={12} />
+              <div class="prov-body">
+                <span class="prov-name">{c.recipe_name}</span>
+                {#if (c as any).input_role}
+                  <span class="prov-stage mono">· {(c as any).input_role}</span>
+                {/if}
+              </div>
+              <span class="prov-id mono">No. {editionNumber(c.id)}</span>
+              <span class="chev">›</span>
             </button>
           {/each}
         </div>
       {/if}
     </section>
 
-    {#if detail.artifact.kind === "dataset"}
+    {#if detail.artifact.metadata && (detail.artifact.metadata as { result?: unknown }).result}
       <section class="block">
-        <header class="block-h">
-          <h3>Browse</h3>
-        </header>
-        <DatasetExplorer artifactId={detail.artifact.id} />
+        <h2 class="section-h masthead">Result</h2>
+        <Result result={(detail.artifact.metadata as { result: unknown }).result} />
       </section>
     {/if}
+
+    {#if a.kind === "dataset"}
+      <section class="block">
+        <h2 class="section-h masthead">Browse</h2>
+        <DatasetExplorer artifactId={a.id} />
+      </section>
+    {/if}
+
+    <section class="block actions">
+      <button type="button" class="btn-secondary" onclick={openLineage}>
+        <span>Open in catalog</span>
+        <Icon name="chevron-right" size={12} />
+      </button>
+    </section>
+
+    <!-- ============ COLOPHON ============ -->
+    <footer class="colophon">
+      Recorded by labctl
+      · specimen <span class="mono">{a.id}</span>
+      · <span class="rel">{formatRelative(a.created_at, nowSecs.value)}</span><span class="when-abs" title={formatAbsolute(a.created_at)}></span>
+      <span class="sig">— p(doom)</span>
+    </footer>
   {/if}
 </SidePanel>
 
 <style>
-  .title-row { display: flex; align-items: center; gap: 10px; overflow: hidden; }
-  .kind {
+  .title-edno {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-2);
+    font-variant-numeric: tabular-nums;
+  }
+  .title-error { color: var(--status-failed-fg); font-size: 13px; }
+
+  .loading { padding: 32px 24px; }
+  .error { padding: 48px 24px; text-align: center; }
+  .error .headline { font-size: 22px; color: var(--fg-0); margin: 0 0 8px 0; }
+  .error-sub { font-size: 13px; color: var(--fg-2); margin: 0; }
+
+  /* ============ Masthead ============ */
+  .masthead-block {
+    padding: 32px 24px 24px;
+    border-bottom: 1px solid var(--line-1);
+  }
+  .masthead-line {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .spacer-dot { color: var(--fg-3); font-size: 11px; }
+  .title-display {
+    font-size: 32px;
+    color: var(--fg-0);
+    margin: 0;
+    line-height: 1.1;
+    word-break: break-word;
+  }
+  .title-display .kind-name {
+    color: var(--fg-1);
+  }
+  .meta-line {
+    margin-top: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--fg-1);
+  }
+  .kind-chip {
     font-family: theme("fontFamily.mono");
     font-size: 11px;
-    color: theme("colors.accent.dim");
-    background: theme("colors.accent.soft");
+    color: var(--accent-dim);
+    background: var(--accent-soft);
     padding: 2px 6px;
     border-radius: 3px;
   }
-  .name {
-    font-size: 14px;
-    color: theme("colors.fg.0");
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+
+  /* ============ Section blocks ============ */
+  .block { padding: 24px 24px 0; }
+  .block.first { padding-top: 24px; }
+  .section-h {
+    margin: 0 0 12px 0;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    color: var(--fg-2);
   }
-  .title-error { color: theme("colors.status.failed.fg"); font-size: 13px; }
+  .section-h .count {
+    color: var(--fg-3);
+    font-weight: 600;
+    letter-spacing: 0.06em;
+  }
 
-  .loading { padding: 24px 16px; }
-  .error { padding: 24px 16px; color: theme("colors.status.failed.fg"); font-size: 13px; }
-
-  .meta { padding: 12px 16px 4px 16px; }
+  .path {
+    font-size: 12px;
+    color: var(--fg-1);
+    overflow-wrap: anywhere;
+    margin: 0;
+    line-height: 1.6;
+  }
   .aliases { display: flex; gap: 4px; flex-wrap: wrap; }
   .alias {
-    font-family: theme("fontFamily.mono");
     font-size: 11px;
     color: var(--accent-dim);
     background: var(--accent-soft);
@@ -203,46 +297,97 @@
     border-radius: 3px;
   }
 
-  .action-row { padding: 8px 16px 12px 16px; border-bottom: 1px solid var(--line-0); }
-
-  .block { padding: 16px; border-top: 1px solid theme("colors.line.0"); }
-  .block-h {
+  /* ============ Provenance / Consumers ============ */
+  .prov-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: baseline;
+    gap: 12px;
+    padding: 10px 0;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid var(--line-0);
+    cursor: pointer;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    width: 100%;
+    transition: background-color var(--dur-micro) var(--ease);
+  }
+  .prov-row:last-child { border-bottom: none; }
+  .prov-row:hover { background: var(--bg-1); }
+  .prov-body {
     display: flex;
     align-items: baseline;
-    justify-content: space-between;
-    margin: 0 0 10px 0;
-  }
-  .block-h h3 {
-    font-size: 12px;
-    font-weight: 500;
-    color: theme("colors.fg.1");
-    margin: 0;
-  }
-  .block-h .count { font-family: theme("fontFamily.mono"); font-size: 11px; color: theme("colors.fg.2"); }
-
-  .consumers { display: flex; flex-direction: column; gap: 4px; }
-  .runlink {
-    display: flex;
-    align-items: center;
     gap: 8px;
-    padding: 7px 10px;
-    background: theme("colors.bg.2");
-    border: 1px solid theme("colors.line.0");
-    border-radius: 4px;
-    cursor: pointer;
-    color: theme("colors.fg.1");
-    width: 100%;
-    text-align: left;
+    overflow: hidden;
+    min-width: 0;
   }
-  .runlink:hover {
-    background: theme("colors.bg.3");
-    color: theme("colors.fg.0");
-    border-color: theme("colors.line.1");
+  .prov-name {
+    font-family: theme("fontFamily.serif");
+    font-style: italic;
+    font-weight: 500;
+    font-size: 14px;
+    color: var(--fg-0);
+    letter-spacing: -0.005em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-feature-settings: normal;
   }
-  .runlink .r { color: theme("colors.fg.0"); font-size: 12px; flex: 1; }
-  .runlink .s { color: theme("colors.fg.2"); font-size: 11px; }
-  .runlink .role { color: theme("colors.accent.dim"); font-size: 11px; }
-  .runlink .rid { color: theme("colors.fg.2"); font-size: 11px; }
+  .prov-stage {
+    font-size: 11px;
+    color: var(--fg-2);
+  }
+  .prov-id {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--fg-2);
+  }
+  .chev {
+    color: var(--fg-3);
+    font-size: 16px;
+    line-height: 1;
+    transition: transform var(--dur-micro) var(--ease);
+  }
+  .prov-row:hover .chev { color: var(--fg-1); transform: translateX(2px); }
 
-  .muted { color: theme("colors.fg.2"); font-size: 12px; margin: 0; }
+  .consumers { display: flex; flex-direction: column; }
+  .muted { color: var(--fg-2); font-size: 13px; margin: 0; }
+  .mono { font-family: theme("fontFamily.mono"); }
+
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-top: 28px;
+    padding-bottom: 8px;
+  }
+
+  /* ============ Colophon ============ */
+  .colophon {
+    padding: 24px;
+    margin-top: 16px;
+    border-top: 1px solid var(--line-1);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-3);
+    line-height: 1.7;
+  }
+  .colophon .sig {
+    font-family: theme("fontFamily.serif");
+    font-style: italic;
+    font-weight: 500;
+    font-size: 13px;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--fg-2);
+    margin-left: 6px;
+  }
+  .colophon .mono { color: var(--fg-2); text-transform: none; font-weight: 400; letter-spacing: 0.02em; }
+  .colophon .rel { text-transform: none; font-weight: 400; letter-spacing: 0.02em; color: var(--fg-2); }
 </style>

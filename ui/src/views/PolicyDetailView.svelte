@@ -103,9 +103,9 @@
 
 <div class="page">
   <DetailHeader
-    label="policy"
+    label="rule"
     name={policyName}
-    meta={detail ? `${detail.requests.length} eval${detail.requests.length === 1 ? "" : "s"} · across ${detail.runs.length} training run${detail.runs.length === 1 ? "" : "s"}` : undefined}
+    meta={detail ? `${detail.requests.length} eval${detail.requests.length === 1 ? "" : "s"} · across ${detail.runs.length} ${detail.runs.length === 1 ? "edition" : "editions"}` : undefined}
     backLabel="Policies"
     onBack={close}
   />
@@ -117,11 +117,11 @@
       <div class="skel" style="height: 240px; width: 100%"></div>
     </div>
   {:else if metrics.length === 0}
-    <EmptyState title="No metric values yet">
+    <EmptyState title="No measurements yet.">
       {#snippet sub()}
         {detail.requests.length === 0
-          ? "This policy has no eval requests on record."
-          : "Eval requests exist but their result artifacts don't yet contain a recognizable metric dict. Trajectories will appear once they do."}
+          ? "This rule has fired no eval requests on record."
+          : "Eval requests exist, but their result specimens don't yet contain a recognizable metric dict. Trajectories will appear once they do."}
       {/snippet}
     </EmptyState>
   {:else}

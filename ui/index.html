@@ -5,17 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>labctl</title>
     <!-- Set the theme class before the bundle paints, to avoid a flash of
-         the wrong palette. Mirrors the logic in lib/theme.svelte.ts. -->
+         the wrong palette. Mirrors the logic in lib/theme.svelte.ts.
+         Defaults to light (warm paper) to match pdoom.org. -->
     <script>
       (function () {
         try {
           var pref = localStorage.getItem('labctl.theme') || 'system';
           var effective = pref === 'system'
-            ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+            ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
             : pref;
           document.documentElement.classList.add(effective);
         } catch (e) {
-          document.documentElement.classList.add('dark');
+          document.documentElement.classList.add('light');
         }
       })();
     </script>

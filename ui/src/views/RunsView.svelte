@@ -1,9 +1,8 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
-  import { store, loadRuns, loadRecipeHistory, loadRunDetail } from "../lib/store.svelte";
+  import { store, loadRuns, loadRunDetail } from "../lib/store.svelte";
   import { router } from "../lib/router.svelte";
   import { compareSelection } from "../lib/compare.svelte";
-  import Sparkline from "../components/Sparkline.svelte";
   import FilterBar from "../components/FilterBar.svelte";
   import FilterChips from "../components/FilterChips.svelte";
   import FilterInput from "../components/FilterInput.svelte";
@@ -14,8 +13,7 @@
   import {
     statusGroup,
     shortStatus,
-    shortHash,
-    shortId,
+    editionNumber,
     formatDuration,
     formatRelative,
     formatAbsolute,
@@ -39,9 +37,7 @@
   let textQuery = $derived(filterText.trim().toLowerCase());
 
   // Precomputed lowercase haystack per run. Built once when the list
-  // changes (cheap — ~1ms for 1000 runs); reused on every keystroke so
-  // the per-keystroke filter is one `.includes()` per row, not five
-  // `.toLowerCase().includes()` calls.
+  // changes; reused on every keystroke.
   let haystacks = $derived.by(() => {
     const m = new Map<string, string>();
     for (const r of allRuns) {
@@ -117,13 +113,10 @@
     router.select("runs", r.id);
   }
 
-  // The 6 px colored dot alone collapses timeout / oom / failed /
-  // unknown_terminal onto the same red and makes cancelled-vs-timeout
-  // hard to read at-a-glance (different colors but tiny). For any
-  // terminal status where the dot is ambiguous, surface the
-  // shortStatus text next to it. Succeeded / running / pending stay
-  // dot-only — the dot color is already unambiguous in those cases
-  // and adding text would just be noise.
+  // Surface a short status label next to the headline for terminal non-
+  // success statuses where the dot color alone is ambiguous (timeout,
+  // oom, cancelled, etc.). For running/succeeded/pending the dot speaks
+  // for itself.
   function showStatusLabel(s: string): boolean {
     return (
       s === "failed" ||
@@ -134,25 +127,8 @@
     );
   }
 
-  // Kick off recipe-history loads as new recipes appear in view. We
-  // iterate only the *visible* slice — virtualization already caps that
-  // to ~30 rows, so this stays O(viewport), not O(filtered). Important:
-  // this is the only $effect on the keystroke critical path, and it
-  // used to walk thousands of rows per keystroke.
-  $effect(() => {
-    const seen = new Set<string>();
-    for (const r of visibleRows) {
-      if (seen.has(r.recipe_name)) continue;
-      seen.add(r.recipe_name);
-      if (!store.recipeHistory(r.recipe_name)) {
-        loadRecipeHistory(r.recipe_name).catch(() => {});
-      }
-    }
-  });
-
   // Hover prefetch — by the time the click lands the side panel renders
-  // from cache. 100ms threshold keeps drive-by scrolls from hammering the
-  // server.
+  // from cache.
   let prefetchTimer: number | null = null;
   let prefetchTarget: string | null = null;
   function onRowEnter(r: RunSummary) {
@@ -176,14 +152,12 @@
   let listEl = $state<HTMLDivElement | null>(null);
 
   // -------- virtualization --------
-  // The list can hold thousands of rows. Mounting every row's Pill /
-  // Sparkline / Hash / Duration / RelativeTime on every filter change was
-  // the actual source of keystroke lag. We render only ~viewport-height
-  // worth of rows + a small overscan; spacer divs above and below keep
-  // the scroll height truthful so the scrollbar still represents the full
-  // dataset and scroll-position math stays linear.
-  const ROW_HEIGHT = 37;
-  const HEADER_HEIGHT = 30;
+  // Stanza rows are 56px (two-line: italic-Lora headline + mono meta).
+  // Fewer rows visible than the old 37px Linear-school density, but the
+  // typographic hierarchy buys back the scan speed in a different
+  // dimension: the eye reads a column of italic recipe names cleanly.
+  const ROW_HEIGHT = 56;
+  const HEADER_HEIGHT = 34;
   const OVERSCAN = 8;
 
   let scrollTop = $state(0);
@@ -206,10 +180,7 @@
   let bottomPad = $derived(Math.max(0, (filtered.length - lastIdx) * ROW_HEIGHT));
   let visibleRows = $derived(filtered.slice(firstIdx, lastIdx));
 
-  // Keyboard nav (j/k/Enter when no panel is open and no input is focused).
   let cursor = $state(0);
-  // Reset cursor and scroll position when the filter set changes — keeps
-  // the user grounded at the top of the new result set.
   $effect(() => {
     void statusFilter;
     void repoFilter;
@@ -231,9 +202,6 @@
 
   function onKey(e: KeyboardEvent) {
     if (router.view !== "runs") return;
-    // Cmd/Ctrl-K and "/" focus the inline filter — same shortcut, one
-    // consistent behavior. Works even from inside other inputs, since the
-    // intent is "I want to filter."
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
       filterInputEl?.focus();
@@ -267,20 +235,11 @@
     return () => window.removeEventListener("keydown", onKey);
   });
 
-  // Cursor scrollIntoView — compute target scrollTop directly because the
-  // cursor row may not be in the DOM when virtualized.
-  //
-  // Only `cursor` is a tracked dependency. scrollTop, viewportHeight,
-  // listEl, and filtered.length are read untracked — otherwise the
-  // effect re-fires on every user scroll (because we read scrollTop in
-  // the body) and slams the viewport back to the cursor's row, which
-  // defaults to 0. That made the runs page appear to "jump back to top"
-  // any time you tried to scroll.
   $effect(() => {
     const i = cursor;
     untrack(() => {
       if (!listEl || filtered.length === 0) return;
-      const rowY = i * ROW_HEIGHT; // row position in row-space (header excluded)
+      const rowY = i * ROW_HEIGHT;
       const visTop = scrollTop;
       const visBottom = scrollTop + viewportHeight - HEADER_HEIGHT;
       if (rowY < visTop) {
@@ -304,7 +263,7 @@
     <FilterInput
       bind:inputRef={filterInputEl}
       value={filterText}
-      placeholder="Filter runs…"
+      placeholder="Filter editions…"
       onInput={(v) => (filterText = v)}
       onEnter={openCursorRow}
     />
@@ -318,39 +277,43 @@
   >
     <div class="list-head run-head">
       <div></div>
-      <div>status</div>
-      <div>recipe</div>
-      <div>id</div>
-      <div>history</div>
-      <div>duration</div>
-      <div>age</div>
+      <div>Edition</div>
+      <div>Recipe</div>
+      <div></div>
+      <div>Duration</div>
+      <div>Logged</div>
+      <div></div>
     </div>
 
     {#if isLoading}
       {#each Array(8) as _, i (i)}
         <div class="list-row run-row">
           <div></div>
-          <div class="skel" style="width: 6px; height: 6px; border-radius: 3px"></div>
-          <div class="skel" style="height: 14px; width: 60%"></div>
-          <div class="skel" style="height: 12px; width: 100px"></div>
-          <div class="skel" style="height: 14px; width: 80px"></div>
-          <div class="skel" style="height: 12px; width: 40px"></div>
-          <div class="skel" style="height: 12px; width: 50px"></div>
+          <div class="skel" style="height: 11px; width: 50px"></div>
+          <div class="rec-cell">
+            <div class="skel" style="height: 14px; width: 60%; margin-bottom: 4px"></div>
+            <div class="skel" style="height: 11px; width: 40%"></div>
+          </div>
+          <div class="skel" style="width: 8px; height: 8px; border-radius: 4px"></div>
+          <div class="skel" style="height: 11px; width: 50px"></div>
+          <div class="skel" style="height: 11px; width: 60px"></div>
+          <div></div>
         </div>
       {/each}
     {:else if filtered.length === 0}
-      <EmptyState title={allRuns.length === 0 ? "No runs yet" : "No runs match these filters"}>
+      <EmptyState title={allRuns.length === 0 ? "Nothing to record." : "No editions match these filters."}>
         {#snippet sub()}
-          {allRuns.length === 0
-            ? "Submit a recipe with labctl run, and it shows up here."
-            : "Clear the filter chips above to see the rest."}
+          {#if allRuns.length === 0}
+            Submit a recipe with <code>labctl run</code>. Editions will appear here.
+          {:else}
+            Clear the filter chips above to widen the catalogue.
+          {/if}
         {/snippet}
       </EmptyState>
     {:else}
       {#if topPad > 0}<div class="spacer" style={`height: ${topPad}px`} aria-hidden="true"></div>{/if}
       {#each visibleRows as r, j (r.id)}
         {@const i = firstIdx + j}
-        {@const hist = store.recipeHistory(r.recipe_name)}
         {@const inCompare = compareSelection.has(r.id)}
         {@const group = statusGroup(r.status)}
         {@const pulse = group === "running" || r.status === "submitted"}
@@ -365,8 +328,6 @@
             undefined
           }
           onclick={(e) => {
-            // Shift-click is the power-user shortcut. The visible
-            // checkbox in the leftmost column is the discoverable path.
             if (e.shiftKey) {
               e.preventDefault();
               compareSelection.toggle(r.id);
@@ -397,57 +358,60 @@
               <Icon name="check" size={11} />
             {/if}
           </button>
-          <!-- Inlined Pill (dot + optional short status label) — skips
-               per-row Pill component setup, which dominated render
-               cost at thousands of rows. Label only renders for
-               terminal non-success statuses where the dot color alone
-               doesn't disambiguate (e.g. timeout vs failed vs oom). -->
-          <div class="status" aria-label={r.status}>
-            <span class="dot" data-group={group} class:animate-pulse-dot={pulse}></span>
-            {#if showStatusLabel(r.status)}
-              <span class="status-label mono">{shortStatus(r.status)}</span>
-            {/if}
-          </div>
-          <div class="recipe">
-            <button
-              type="button"
-              class="name"
-              title={`Open all runs of ${r.recipe_name}`}
-              onclick={(e) => {
-                e.stopPropagation();
-                router.go("recipes", r.recipe_name);
-              }}
-            >{r.recipe_name}</button>
-            {#if r.stage_name}
-              <span class="stage" title="pipeline stage">/ {r.stage_name}</span>
-            {/if}
-            {#if r.submitted_by && users.length > 1 && !userFilter}
-              <span class="user" title={`Submitted by ${r.submitted_by}`}>{r.submitted_by}</span>
-            {/if}
-            {#if r.repo && repos.length > 1 && !repoFilter}
-              <span class="repo">{r.repo}</span>
-            {/if}
-          </div>
-          <!-- Hash (id): inlined. Drops the copy-badge animation in
-               exchange for ~30× fewer Svelte component setups. -->
+
+          <!-- Edition number — masthead micro-caps, click to copy id. -->
           <button
             type="button"
-            class="hash"
+            class="edno"
             onclick={(e) => { e.stopPropagation(); copy(r.id); }}
             title={r.id}
             aria-label={`Copy run id ${r.id}`}
-          >{shortId(r.id, 12)}</button>
-          <div class="hist">
-            {#if hist}
-              <Sparkline history={hist.history} />
-            {:else}
-              <div class="skel" style="height: 14px; width: 80px; opacity: 0.5"></div>
-            {/if}
+          >No. {editionNumber(r.id)}</button>
+
+          <!-- Headline + meta stack. Recipe name is the row's hero, in
+               italic Lora; meta below in 11px mono. -->
+          <div class="rec-cell">
+            <div class="rec-top">
+              <button
+                type="button"
+                class="rec-name"
+                title={`Open all runs of ${r.recipe_name}`}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  router.go("recipes", r.recipe_name);
+                }}
+              >{r.recipe_name}</button>
+              {#if r.stage_name}
+                <span class="rec-stage">/ {r.stage_name}</span>
+              {/if}
+              {#if showStatusLabel(r.status)}
+                <span class="rec-status">{shortStatus(r.status)}</span>
+              {/if}
+            </div>
+            <div class="rec-meta">
+              <span class="hash" title={r.recipe_hash}>{r.recipe_hash.slice(0, 7)}</span>
+              {#if r.submitted_by && users.length > 1 && !userFilter}
+                <span class="sep">·</span>
+                <span>{r.submitted_by}</span>
+              {/if}
+              {#if r.repo && repos.length > 1 && !repoFilter}
+                <span class="sep">·</span>
+                <span>{r.repo}</span>
+              {/if}
+            </div>
           </div>
-          <!-- Duration: inlined. -->
+
+          <!-- Status: a single colored dot. Color carries hue; pulse
+               carries "running." Glyph is reserved for high-contrast
+               contexts (the run detail masthead). -->
+          <div class="status" aria-label={r.status}>
+            <span class="dot" data-group={group} class:animate-pulse-dot={pulse}></span>
+          </div>
+
           <span class="dur mono" class:live={!r.is_terminal}>{formatDuration(dur)}</span>
-          <!-- RelativeTime: inlined. -->
           <span class="rel mono" title={formatAbsolute(r.created_at)}>{formatRelative(r.created_at, nowSecs.value)}</span>
+
+          <span class="chev" aria-hidden="true">›</span>
         </div>
       {/each}
       {#if bottomPad > 0}<div class="spacer" style={`height: ${bottomPad}px`} aria-hidden="true"></div>{/if}
@@ -466,18 +430,16 @@
     flex: 1;
     overflow-y: auto;
   }
-  .spacer {
-    /* No content, no border — purely a layout placeholder so the scroll
-     * track size reflects the full filtered list while only a viewport's
-     * worth of rows is actually in the DOM. */
-    width: 100%;
-  }
-  /* Runs view geometry: check | status (dot + optional label) | recipe |
-     id | sparkline | duration | age */
+  .spacer { width: 100%; }
+  /* Stanza geometry:
+     check | edition-no | headline-stack | status-dot | duration | logged | chevron */
   .run-head,
   .run-row {
-    grid-template-columns: 18px 84px 1fr 140px 110px 80px 80px;
+    grid-template-columns: 18px 80px 1fr 16px 70px 70px 12px;
+    min-height: 56px;
   }
+  .run-head { min-height: auto; }
+
   .check {
     width: 16px;
     height: 16px;
@@ -490,10 +452,6 @@
     align-items: center;
     justify-content: center;
     color: var(--bg-0);
-    /* Hidden by default; appears on row hover OR when *any* row is
-     * selected (so the user knows which rows are in the comparison
-     * without having to hover each one), AND stays visible on the row
-     * that's actually checked. */
     opacity: 0;
     transition: opacity var(--dur-micro) var(--ease);
   }
@@ -510,22 +468,51 @@
   .check.checked {
     background: var(--accent);
     border-color: var(--accent);
-    color: var(--bg-0);
+    color: #fff;
   }
   .check.checked:hover {
     background: var(--accent-dim);
     border-color: var(--accent-dim);
   }
 
-  .recipe {
+  /* Edition number — masthead micro-caps, top-aligned to the headline. */
+  .edno {
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    color: var(--fg-2);
+    text-align: left;
+    align-self: start;
+    margin-top: 4px;
+    transition: color var(--dur-micro) var(--ease);
+    font-variant-numeric: tabular-nums;
+  }
+  .edno:hover { color: var(--fg-0); }
+
+  /* Headline + meta stack. */
+  .rec-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    overflow: hidden;
+    min-width: 0;
+  }
+  .rec-top {
     display: flex;
     align-items: baseline;
     gap: 8px;
     overflow: hidden;
+    min-width: 0;
   }
-  .recipe .name {
-    font-family: theme("fontFamily.mono");
-    font-size: 13px;
+  .rec-name {
+    font-family: theme("fontFamily.serif");
+    font-style: italic;
+    font-weight: 500;
+    font-size: 15px;
     color: var(--fg-0);
     letter-spacing: -0.005em;
     overflow: hidden;
@@ -536,40 +523,46 @@
     padding: 0;
     cursor: pointer;
     text-align: left;
+    min-width: 0;
+    flex-shrink: 1;
+    transition: color var(--dur-micro) var(--ease);
+    font-feature-settings: normal;
   }
-  .recipe .name:hover { color: var(--accent-dim); }
-  .recipe .stage {
+  .rec-name:hover { color: var(--accent-dim); }
+  .rec-stage {
     font-family: theme("fontFamily.mono");
-    font-size: 11px;
-    color: var(--fg-1);
-    flex-shrink: 0;
-  }
-  .recipe .repo {
     font-size: 11px;
     color: var(--fg-2);
-    margin-left: auto;
     flex-shrink: 0;
-    padding: 1px 5px;
-    border: 1px solid var(--line-1);
-    border-radius: 3px;
   }
-  .recipe .user {
+  .rec-status {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--status-failed);
+    flex-shrink: 0;
+  }
+  .rec-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
     font-family: theme("fontFamily.mono");
     font-size: 11px;
-    color: var(--fg-1);
-    margin-left: auto;
-    flex-shrink: 0;
+    color: var(--fg-2);
+    overflow: hidden;
+    white-space: nowrap;
   }
-  .recipe .user + .repo { margin-left: 6px; }
-  .hist { display: flex; align-items: center; }
+  .rec-meta .sep { color: var(--fg-3); }
+  .rec-meta .hash {
+    color: var(--fg-1);
+  }
 
-  /* Inlined Pill (dot + optional label). */
+  /* Status: just the colored dot. */
   .status {
     display: flex;
     align-items: center;
-    gap: 6px;
-    overflow: hidden;
-    min-width: 0;
+    justify-content: center;
   }
   .dot {
     width: 6px;
@@ -582,41 +575,43 @@
   .dot[data-group="failed"]    { --dot: var(--status-failed);    background: var(--dot); }
   .dot[data-group="pending"]   { --dot: var(--status-pending);   background: var(--dot); }
   .dot[data-group="neutral"]   { --dot: var(--status-neutral);   background: var(--dot); }
-  .status-label {
-    font-size: 11px;
-    color: var(--fg-2);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
 
-  /* Inlined Hash. No copied-badge — title attr does the job. */
-  .hash {
-    background: transparent;
-    border: none;
-    padding: 0;
-    cursor: pointer;
-    font-family: theme("fontFamily.mono");
-    font-size: 12px;
-    color: var(--fg-1);
-    text-align: left;
-    letter-spacing: 0.01em;
-    transition: color var(--dur-micro) var(--ease);
-  }
-  .hash:hover { color: var(--fg-0); }
-
-  /* Inlined Duration. */
+  /* Duration. Right-aligned tabular numerals so values stack cleanly. */
   .dur {
     font-size: 12px;
     color: var(--fg-1);
     font-variant-numeric: tabular-nums;
+    text-align: right;
   }
   .dur.live { color: var(--fg-0); }
 
-  /* Inlined RelativeTime. */
+  /* Logged-at relative time. */
   .rel {
     font-size: 12px;
-    color: var(--fg-1);
+    color: var(--fg-2);
     font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+
+  /* Chevron — a literal typographic affordance, lighter than an icon. */
+  .chev {
+    color: var(--fg-3);
+    font-size: 16px;
+    line-height: 1;
+    text-align: center;
+    transition: color var(--dur-micro) var(--ease), transform var(--dur-micro) var(--ease);
+  }
+  .list-row:hover .chev,
+  .list-row[data-state="active"] .chev { color: var(--fg-1); transform: translateX(2px); }
+
+  .mono { font-family: theme("fontFamily.mono"); }
+
+  :global(.empty code) {
+    font-family: theme("fontFamily.mono");
+    font-size: 12px;
+    color: var(--fg-0);
+    background: var(--bg-2);
+    padding: 1px 5px;
+    border-radius: 3px;
   }
 </style>

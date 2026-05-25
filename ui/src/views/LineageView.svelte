@@ -253,10 +253,10 @@
 
 <div class="lineage" data-highlighting={highlightAttr}>
   <DetailHeader
-    label="lineage"
+    label="catalog"
     name={focalLabel}
     meta={focalArtifact?.kind}
-    backLabel="Artifact"
+    backLabel="Specimen"
     onBack={close}
   >
     {#snippet actions()}

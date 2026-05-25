@@ -109,12 +109,12 @@
   </FilterBar>
   <div class="list" bind:this={listEl}>
     <div class="list-head policy-head">
-      <div>policy</div>
-      <div>metric</div>
-      <div>trend</div>
-      <div>best</div>
-      <div>activity</div>
-      <div>last fired</div>
+      <div>Rule</div>
+      <div>Metric</div>
+      <div>Trend</div>
+      <div>Best</div>
+      <div>Activity</div>
+      <div>Last fired</div>
     </div>
     {#if isLoading}
       {#each Array(4) as _, i (i)}
@@ -128,12 +128,11 @@
         </div>
       {/each}
     {:else if policies.length === 0}
-      <EmptyState title="No policies yet">
+      <EmptyState title="No house rules.">
         {#snippet sub()}
-          Drop an <code>EvalPolicy</code> TOML file in your dispatcher's
-          <code>policies_dir</code> and the agent will fire eval runs as
-          new checkpoints land. Policies appear here once they have at
-          least one eval request.
+          Drop an <code>EvalPolicy</code> TOML file in the dispatcher's
+          <code>policies_dir</code>. Rules appear here once they have
+          fired at least one eval request.
         {/snippet}
       </EmptyState>
     {:else}
@@ -191,21 +190,28 @@
   .policy-row {
     grid-template-columns: minmax(0, 1.5fr) 140px 180px 80px 110px 96px;
   }
-  .policy-row { padding: 10px var(--row-pad-x); }
+  .policy-row { padding: 12px var(--row-pad-x); min-height: 56px; }
   .policy {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: 10px;
     overflow: hidden;
     min-width: 0;
   }
+  /* Rule name in italic Lora — same treatment as recipe / pipeline /
+   * specimen names elsewhere. Rules are named things. */
   .name {
-    font-size: 13px;
+    font-family: theme("fontFamily.serif");
+    font-style: italic;
+    font-weight: 500;
+    font-size: 15px;
     color: var(--fg-0);
+    letter-spacing: -0.005em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+    font-feature-settings: normal;
   }
   .badge {
     display: inline-block;

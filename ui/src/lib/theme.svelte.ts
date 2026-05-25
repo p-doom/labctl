@@ -9,10 +9,10 @@ const KEY = "labctl.theme";
 
 function effective(t: Theme): "dark" | "light" {
   if (t !== "system") return t;
-  if (typeof window === "undefined") return "dark";
-  return window.matchMedia("(prefers-color-scheme: light)").matches
-    ? "light"
-    : "dark";
+  if (typeof window === "undefined") return "light";
+  return window.matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
 }
 
 function apply(t: Theme) {
@@ -32,7 +32,7 @@ function read(): Theme {
 
 if (typeof window !== "undefined") {
   // Re-apply on system-preference change when in `system` mode.
-  const mq = window.matchMedia("(prefers-color-scheme: light)");
+  const mq = window.matchMedia("(prefers-color-scheme: dark)");
   mq.addEventListener?.("change", () => {
     if (_pref === "system") apply("system");
   });
@@ -52,10 +52,10 @@ export const theme = {
     }
     apply(next);
   },
-  /** Cycle dark → light → system → dark. */
+  /** Cycle light → dark → system → light. */
   cycle() {
     const next: Theme =
-      _pref === "dark" ? "light" : _pref === "light" ? "system" : "dark";
+      _pref === "light" ? "dark" : _pref === "dark" ? "system" : "light";
     this.set(next);
   },
 };

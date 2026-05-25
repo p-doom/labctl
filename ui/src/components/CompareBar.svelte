@@ -24,7 +24,7 @@
 {#if count > 0}
   <div class="bar" role="region" aria-label="Compare selection">
     <span class="count mono">{count}</span>
-    <span class="label">{count === 1 ? "run selected" : "runs selected"}</span>
+    <span class="label">{count === 1 ? "edition selected" : "editions selected"}</span>
     {#if count < 2}
       <span class="hint">pick another to compare</span>
     {/if}

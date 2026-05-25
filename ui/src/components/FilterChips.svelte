@@ -55,8 +55,13 @@
     gap: 8px;
     flex-wrap: wrap;
   }
+  /* Filter row labels follow the masthead grammar: 11px, 600, tracked
+   * uppercase. Same treatment as column headers and section breaks. */
   .label {
     font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
     color: theme("colors.fg.2");
     flex-shrink: 0;
   }

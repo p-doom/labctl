@@ -1,7 +1,15 @@
 /* Self-hosted variable fonts. Vite inlines the WOFF2 imports into the
- * bundle and the @font-face rules; no CDN round-trip on cold load. */
+ * bundle and the @font-face rules; no CDN round-trip on cold load.
+ *
+ * Three faces, used with discipline:
+ *   Inter Variable — UI chrome, body, dense labels (sans).
+ *   JetBrains Mono Variable — ids, hashes, durations, code (mono).
+ *   Lora Variable italic — named entities (recipe, pipeline, specimen
+ *     names; the wordmark; section titles). Always italic, never roman. */
 @import "@fontsource-variable/inter/wght.css";
 @import "@fontsource-variable/jetbrains-mono/wght.css";
+@import "@fontsource-variable/lora/wght.css";
+@import "@fontsource-variable/lora/wght-italic.css";
 
 @tailwind base;
 @tailwind components;
@@ -9,47 +17,102 @@
 
 /* ---------- design tokens ----------
  * Two palettes, both expressed in CSS variables so theme switching is a
- * single class change on <html>. Default is dark; .light flips. The same
- * variables resolve from Tailwind's `theme()` (via the shim in
- * tailwind.config.js) so component CSS doesn't care which is active. */
+ * single class change on <html>. Default is light (warm paper, matching
+ * pdoom.org); .dark flips. The same variables resolve from Tailwind's
+ * `theme()` (via the shim in tailwind.config.js) so component CSS doesn't
+ * care which is active. */
 
 :root,
-:root.dark {
-  /* Surfaces */
-  --bg-0: #0a0b0d; /* page */
-  --bg-1: #101114; /* surface */
-  --bg-2: #15171b; /* raised */
-  --bg-3: #1c1f24; /* hover */
+:root.light {
+  /* Surfaces — warm paper, not screen-gray. The slight cream tint is the
+   * difference between "designed object" and "default Bootstrap." */
+  --bg-0: #ffffff; /* page */
+  --bg-1: #fafaf8; /* raised surface (panels, headers) */
+  --bg-2: #f4f2ec; /* table headers, hover */
+  --bg-3: #ebe8df; /* selection, pressed */
   /* Foregrounds */
-  --fg-0: #ecedef;
-  --fg-1: #a1a4ab;
-  --fg-2: #6b6f78;
-  --fg-3: #42464e;
-  /* Borders/lines */
-  --line-0: #1f2228;
-  --line-1: #2a2d35;
-  --line-2: #3a3e47;
-  /* Accent — desaturated chartreuse */
-  --accent: #bdf26d;
-  --accent-dim: #8cb84d;
-  --accent-soft: rgba(189, 242, 109, 0.12);
-  /* Status */
-  --status-running: #bdf26d;
-  --status-running-soft: rgba(189, 242, 109, 0.12);
-  --status-running-fg: #d6f6a0;
-  --status-succeeded: #4dcfbe;
-  --status-succeeded-soft: rgba(77, 207, 190, 0.12);
-  --status-succeeded-fg: #7dddd0;
-  --status-failed: #ef7c6a;
-  --status-failed-soft: rgba(239, 124, 106, 0.12);
-  --status-failed-fg: #f5a99c;
-  --status-pending: #e8c170;
-  --status-pending-soft: rgba(232, 193, 112, 0.12);
-  --status-pending-fg: #efd49a;
-  --status-neutral: #9da5b4;
-  --status-neutral-soft: rgba(157, 165, 180, 0.18);
-  --status-neutral-fg: #b8bfc9;
-  /* Data series — chart multi-line palette; series-0 tracks accent */
+  --fg-0: #1a1a1a;
+  --fg-1: #555555;
+  --fg-2: #888888;
+  --fg-3: #bbbbbb;
+  /* Borders/lines — warm to match the paper tint */
+  --line-0: #f0eee7;
+  --line-1: #e5e3dc;
+  --line-2: #d4d1c6;
+  /* Accent — the lab red (matches pdoom.org `#e03030`). Used for primary
+   * CTAs, cursor rule, "view" links, and (deliberately) the failed status
+   * color. Failures share the brand color: the bitter-lesson thesis. */
+  --accent: #e03030;
+  --accent-dim: #b82828;
+  --accent-soft: rgba(224, 48, 48, 0.08);
+  /* Status — monochrome biased; only failure is loud. */
+  --status-running: #1a1a1a;
+  --status-running-soft: rgba(26, 26, 26, 0.05);
+  --status-running-fg: #1a1a1a;
+  --status-succeeded: #1a6d3a; /* ledger green, not Slack green */
+  --status-succeeded-soft: rgba(26, 109, 58, 0.07);
+  --status-succeeded-fg: #155b30;
+  --status-failed: #e03030;
+  --status-failed-soft: rgba(224, 48, 48, 0.07);
+  --status-failed-fg: #b82828;
+  --status-pending: #888888;
+  --status-pending-soft: rgba(136, 136, 136, 0.10);
+  --status-pending-fg: #555555;
+  --status-neutral: #888888;
+  --status-neutral-soft: rgba(136, 136, 136, 0.10);
+  --status-neutral-fg: #555555;
+  /* Data series — restrained, paper-friendly. series-0 tracks accent. */
+  --series-0: var(--accent);
+  --series-1: #2a78b8;
+  --series-2: #b35f15;
+  --series-3: #8a3572;
+  --series-4: #1e7045;
+  --series-5: #5e3fb8;
+  --series-6: #8a6010;
+  --series-7: #277070;
+  /* Misc */
+  --shadow-panel-1: rgba(20, 22, 25, 0.10);
+  --selection-bg: rgba(224, 48, 48, 0.18);
+  --scrollbar-thumb: #d4d1c6;
+  --scrollbar-thumb-hover: #b8b4a7;
+  --scrim: rgba(20, 22, 25, 0.28);
+  --scrim-strong: rgba(20, 22, 25, 0.48);
+  --shiki-bg: var(--bg-1);
+  color-scheme: light;
+}
+
+:root.dark {
+  /* Dimmed paper. Warm-biased on purpose: keeps continuity with the light
+   * theme rather than reverting to default-IDE blue-black. */
+  --bg-0: #0e0e0c;
+  --bg-1: #15140f;
+  --bg-2: #1c1a14;
+  --bg-3: #25221b;
+  --fg-0: #efefe8;
+  --fg-1: #a8a59b;
+  --fg-2: #6b685e;
+  --fg-3: #45433a;
+  --line-0: #1c1a14;
+  --line-1: #2a2820;
+  --line-2: #3a382e;
+  --accent: #ff4540;
+  --accent-dim: #cc3030;
+  --accent-soft: rgba(255, 69, 64, 0.10);
+  --status-running: #efefe8;
+  --status-running-soft: rgba(239, 239, 232, 0.06);
+  --status-running-fg: #efefe8;
+  --status-succeeded: #4ec579;
+  --status-succeeded-soft: rgba(78, 197, 121, 0.10);
+  --status-succeeded-fg: #7dd6a0;
+  --status-failed: #ff4540;
+  --status-failed-soft: rgba(255, 69, 64, 0.10);
+  --status-failed-fg: #ff8a85;
+  --status-pending: #6b685e;
+  --status-pending-soft: rgba(107, 104, 94, 0.15);
+  --status-pending-fg: #a8a59b;
+  --status-neutral: #6b685e;
+  --status-neutral-soft: rgba(107, 104, 94, 0.15);
+  --status-neutral-fg: #a8a59b;
   --series-0: var(--accent);
   --series-1: #7dc3e8;
   --series-2: #f0a872;
@@ -58,82 +121,33 @@
   --series-5: #c8b9f0;
   --series-6: #e8c170;
   --series-7: #9ed4d4;
-  /* Misc */
   --shadow-panel-1: rgba(0, 0, 0, 0.6);
-  --selection-bg: rgba(189, 242, 109, 0.25);
-  --scrollbar-thumb: #2a2d35;
-  --scrollbar-thumb-hover: #3a3e47;
-  --scrim: rgba(10, 11, 13, 0.4);
-  --scrim-strong: rgba(10, 11, 13, 0.6);
-  --shiki-bg: var(--bg-0);
+  --selection-bg: rgba(255, 69, 64, 0.25);
+  --scrollbar-thumb: #2a2820;
+  --scrollbar-thumb-hover: #3a382e;
+  --scrim: rgba(0, 0, 0, 0.5);
+  --scrim-strong: rgba(0, 0, 0, 0.7);
+  --shiki-bg: var(--bg-1);
   color-scheme: dark;
-}
-
-:root.light {
-  /* Restrained, warm-cool light. Linear/Marimo discipline — surfaces in
-   * tight near-white range, single accent, status colors darkened just
-   * enough to read on near-white backgrounds. */
-  --bg-0: #fafafa;
-  --bg-1: #f4f5f7;
-  --bg-2: #ebedef;
-  --bg-3: #e0e2e6;
-  --fg-0: #1c1d20;
-  --fg-1: #565a62;
-  --fg-2: #7e828a;
-  --fg-3: #b1b5bc;
-  --line-0: #e7e9ec;
-  --line-1: #d6d9de;
-  --line-2: #b8bcc4;
-  /* Accent — chartreuse darkened for contrast on near-white. */
-  --accent: #5e8e1f;
-  --accent-dim: #4f7a18;
-  --accent-soft: rgba(94, 142, 31, 0.12);
-  --status-running: #5e8e1f;
-  --status-running-soft: rgba(94, 142, 31, 0.10);
-  --status-running-fg: #4a7218;
-  --status-succeeded: #0e8a7e;
-  --status-succeeded-soft: rgba(14, 138, 126, 0.10);
-  --status-succeeded-fg: #065f58;
-  --status-failed: #c1463a;
-  --status-failed-soft: rgba(193, 70, 58, 0.08);
-  --status-failed-fg: #8e2f25;
-  --status-pending: #a87618;
-  --status-pending-soft: rgba(168, 118, 24, 0.08);
-  --status-pending-fg: #7d5712;
-  --status-neutral: #5c6475;
-  --status-neutral-soft: rgba(92, 100, 117, 0.15);
-  --status-neutral-fg: #404856;
-  /* Data series — darkened for light backgrounds */
-  --series-1: #2a78b8;
-  --series-2: #b35f15;
-  --series-3: #8a3572;
-  --series-4: #1e7045;
-  --series-5: #5e3fb8;
-  --series-6: #8a6010;
-  --series-7: #277070;
-  --shadow-panel-1: rgba(20, 22, 25, 0.18);
-  --selection-bg: rgba(94, 142, 31, 0.22);
-  --scrollbar-thumb: #c8cbd0;
-  --scrollbar-thumb-hover: #aeb1b6;
-  --scrim: rgba(20, 22, 25, 0.32);
-  --scrim-strong: rgba(20, 22, 25, 0.5);
-  --shiki-bg: var(--bg-0);
-  color-scheme: light;
 }
 
 /* ---------- layout tokens ----------
  * These aren't theme-dependent; they parameterize the design language.
  * Adjust only when changing the system, never per-component. */
 :root {
-  --row-pad-y: 8px;
+  --row-pad-y: 10px;
   --row-pad-x: 16px;
-  --row-gap: 12px;
+  --row-gap: 14px;
   --block-pad: 16px;
   --meta-label-w: 96px;
   --empty-pad-y: 80px;
   --ease: cubic-bezier(0.2, 0, 0, 1);
   --dur-micro: 150ms;
   --dur-panel: 250ms;
+  /* Stanza row height — two-line rows are taller and more dignified than
+   * the previous 37px Linear-school density. ~16 rows visible at 800px
+   * viewport instead of ~21. The serif headline justifies the trade. */
+  --row-h: 48px;
 }
 
 :root {
@@ -184,9 +198,7 @@ body {
 /* ---------- focus discipline ----------
  * Mouse focus is silent; keyboard focus is loud. The :focus-visible ring
  * is a 2px accent stripe with a 2px bg-0 inset so it remains crisp even
- * when an element sits flush against another (list rows, button groups).
- * We strip the legacy :focus outline on buttons/anchors so click focus
- * doesn't show a ring, but :focus-visible always re-applies. */
+ * when an element sits flush against another (list rows, button groups). */
 *:focus { outline: none; }
 *:focus-visible {
   outline: none;
@@ -195,10 +207,59 @@ body {
 }
 
 @layer components {
+  /* ---------- typography utilities ----------
+   * Stanza-grammar text classes. Use these instead of ad-hoc font-family
+   * declarations so the three-face rule (Inter / Mono / Lora-italic)
+   * stays honest. */
+
+  /* The signature small-caps treatment — column headers, edition
+   * numbers, section breaks, status labels, any "this is a label" text.
+   * 11px / 600 / 0.08em tracking / uppercase / fg-2. */
+  .masthead {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-2);
+    line-height: 14px;
+    font-feature-settings: "ss01", "ss03", "cv11";
+  }
+
+  /* Italic Lora for named entities — recipes, pipelines, specimens, the
+   * wordmark. This is the lab's voice in text. Always italic. */
+  .name-italic {
+    font-family: "Lora Variable", "Lora", Georgia, "Times New Roman", serif;
+    font-style: italic;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    font-feature-settings: normal;
+  }
+
+  /* Display headline — italic Lora at large size. For edition titles,
+   * view headers, the "Nothing to record" empty state. */
+  .headline {
+    font-family: "Lora Variable", "Lora", Georgia, "Times New Roman", serif;
+    font-style: italic;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    line-height: 1.1;
+    font-feature-settings: normal;
+  }
+
+  /* The lab wordmark. Italic Lora with the literal parentheses, exactly
+   * as on pdoom.org. */
+  .wordmark {
+    font-family: "Lora Variable", "Lora", Georgia, "Times New Roman", serif;
+    font-style: italic;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    color: var(--fg-0);
+    font-feature-settings: normal;
+  }
+
   /* ---------- buttons ----------
    * Four shapes: ghost, secondary, primary, icon. Every button in the app
-   * picks one. No special-snowflake variants — if you find yourself
-   * adding a new button style, add a modifier here instead. */
+   * picks one. */
   .btn-ghost,
   .btn-secondary,
   .btn-primary {
@@ -230,19 +291,18 @@ body {
   }
   .btn-secondary[data-state="active"] {
     background: var(--accent-soft);
-    border-color: var(--accent-dim);
+    border-color: var(--accent);
     color: var(--accent-dim);
   }
 
   .btn-primary {
-    background: var(--accent-soft);
-    border-color: var(--accent-soft);
-    color: var(--accent-dim);
-  }
-  .btn-primary:hover {
     background: var(--accent);
     border-color: var(--accent);
-    color: var(--bg-0);
+    color: #fff;
+  }
+  .btn-primary:hover {
+    background: var(--accent-dim);
+    border-color: var(--accent-dim);
   }
   .btn-primary:disabled,
   .btn-secondary:disabled,
@@ -265,7 +325,7 @@ body {
       color var(--dur-micro) var(--ease);
   }
   .iconbtn:hover {
-    background: var(--bg-3);
+    background: var(--bg-2);
     color: var(--fg-0);
   }
   .iconbtn:disabled {
@@ -275,8 +335,8 @@ body {
 
   /* ---------- list-row ----------
    * The canonical list line. Each view supplies its own grid-template-
-   * columns via a `--cols` custom property or local `.list-row` override;
-   * the chrome (padding, border, hover, stripes) is inherited. */
+   * columns via a `--cols` custom property or local `.list-row` override.
+   * Stanza rows are 48px (two lines: italic-Lora headline + mono meta). */
   .list-row {
     display: grid;
     align-items: center;
@@ -287,7 +347,6 @@ body {
     cursor: pointer;
     position: relative;
     background: transparent;
-    /* Reset button defaults so the same class works on <div> and <button>. */
     color: inherit;
     font-family: inherit;
     text-align: left;
@@ -295,17 +354,15 @@ body {
     border-right: none;
     border-top: none;
     width: 100%;
-    /* CSS containment — tells the browser that style/layout/paint inside
-     * this row cannot affect siblings or ancestors. Crucial for long
-     * filtered lists: without this the browser conservatively re-lays
-     * out neighbors when a single row's class changes. With it, hover/
-     * active state changes are painted in isolation. */
+    min-height: var(--row-h);
+    /* CSS containment — long virtualized lists need this so hover/active
+     * state changes don't trigger sibling re-layout. */
     contain: layout style paint;
   }
   .list-row:hover,
   .list-row[data-state="cursor"],
   .list-row[data-state="active"] {
-    background: var(--bg-2);
+    background: var(--bg-1);
   }
   .list-row[data-state="cursor"]::before,
   .list-row[data-state="active"]::before,
@@ -325,19 +382,34 @@ body {
   }
   .list-row[data-state="compared"]::before { background: var(--accent); }
   .list-row[data-state="compared"]:hover {
-    background: var(--bg-2);
+    background: var(--bg-1);
   }
   .list-row:last-child { border-bottom: none; }
+
+  /* The "row just settled" flash — used when a long-running run reaches
+   * a terminal state. Background pulses to accent-soft once, decays. */
+  .list-row.settle {
+    animation: settle 600ms var(--ease);
+  }
+
+  /* The "row just arrived from stream" flash — used when a brand new run
+   * enters the live list. Half-second ribbon of accent-soft + a subtle
+   * left-slide. Communicative motion, not garnish. */
+  .list-row.arrive {
+    animation: arrive 400ms var(--ease);
+  }
 
   .list-head {
     display: grid;
     align-items: center;
     column-gap: var(--row-gap);
-    padding: 6px var(--row-pad-x);
+    padding: 8px var(--row-pad-x);
     font-size: 11px;
-    font-weight: 500;
-    color: var(--fg-1);
-    border-bottom: 1px solid var(--line-0);
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-2);
+    border-bottom: 1px solid var(--line-1);
     background: var(--bg-0);
     position: sticky;
     top: 0;
@@ -345,10 +417,13 @@ body {
   }
 
   /* ---------- pill ----------
-   * Status indicator. Has a label variant and a dot-only variant.
-   * Both share a 6px dot — no more 8px/6px split. */
+   * Status indicator. Has a label variant and a dot-only variant. */
   .pill {
-    @apply inline-flex items-center gap-1.5 rounded-full font-medium font-mono text-xs leading-none;
+    @apply inline-flex items-center gap-1.5 rounded-full leading-none;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
     padding: 4px 8px 4px 6px;
     transition: background-color var(--dur-panel) var(--ease),
       color var(--dur-panel) var(--ease);
@@ -360,8 +435,7 @@ body {
     flex-shrink: 0;
   }
 
-  /* ---------- kbd ----------
-   * Tiny key-cap. Used in palette footers, nav rails, search hints. */
+  /* ---------- kbd ---------- */
   .kbd {
     @apply inline-flex items-center justify-center font-mono text-xs;
     background: var(--bg-2);
@@ -375,8 +449,7 @@ body {
     line-height: 1;
   }
 
-  /* ---------- skel ----------
-   * Loading shimmer block. Sized by inline style at the call site. */
+  /* ---------- skel ---------- */
   .skel {
     background: linear-gradient(
       90deg,
@@ -389,10 +462,18 @@ body {
     border-radius: 4px;
   }
 
-  /* ---------- dim ----------
-   * The canonical "this is less important" treatment. Walk the fg ramp;
-   * never use opacity for persistent dimming. */
+  /* ---------- dim ---------- */
   .dim { color: var(--fg-3); }
+}
+
+/* ---------- Stanza motion ---------- */
+@keyframes settle {
+  0% { background: var(--accent-soft); }
+  100% { background: transparent; }
+}
+@keyframes arrive {
+  0% { background: var(--accent-soft); transform: translateX(-4px); opacity: 0.7; }
+  100% { background: transparent; transform: translateX(0); opacity: 1; }
 }
 
 /* xyflow palette overrides */
