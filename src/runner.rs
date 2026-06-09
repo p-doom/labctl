@@ -354,7 +354,9 @@ async fn submit_recipe_inner(
     let alias_ctx = RenderContext {
         run_id: &run_id,
         run_dir: &run_dir,
+        recipe_name: &recipe.name,
         params: &recipe.params,
+        args: &recipe.args,
         inputs: &inputs,
         outputs: &empty_outputs,
     };
@@ -1348,7 +1350,9 @@ async fn resolve_inputs(
                 let parent_ctx = RenderContext {
                     run_id: parent_run_id,
                     run_dir: &parent_run_dir,
+                    recipe_name: &parent_loaded.recipe.name,
                     params: &parent_loaded.recipe.params,
+                    args: &parent_loaded.recipe.args,
                     inputs: &empty_inputs,
                     outputs: &empty_outputs,
                 };
@@ -1450,7 +1454,9 @@ fn render_script(
     let ctx = RenderContext {
         run_id,
         run_dir,
+        recipe_name: &recipe.name,
         params: &recipe.params,
+        args: &recipe.args,
         inputs,
         outputs,
     };
