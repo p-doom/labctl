@@ -861,6 +861,14 @@ impl PgStore {
                  COALESCE(er_run.status, 'pending') AS state,
                  cp.metadata_json AS checkpoint_metadata,
                  (
+                     SELECT a.id
+                     FROM run_outputs ro
+                     JOIN artifacts a ON a.id = ro.artifact_id
+                     WHERE ro.run_id = er.eval_run_id AND a.kind = 'eval_result'
+                     ORDER BY a.created_at, a.id
+                     LIMIT 1
+                 ) AS eval_result_artifact_id,
+                 (
                      SELECT a.metadata_json
                      FROM run_outputs ro
                      JOIN artifacts a ON a.id = ro.artifact_id
@@ -892,6 +900,143 @@ impl PgStore {
                     eval_run_id: r.try_get("eval_run_id")?,
                     state: r.try_get("state")?,
                     checkpoint_metadata: checkpoint_metadata.map(|j| j.0),
+                    eval_result_artifact_id: r.try_get("eval_result_artifact_id")?,
+                    eval_result_metadata: eval_result_metadata.map(|j| j.0),
+                })
+            })
+            .collect()
+    }
+
+    /// Like [`Self::eval_series_rows`], but for the rollout *browser*: it
+    /// aggregates a training run's evals one export hop down, not just its
+    /// direct checkpoints. In the per-checkpoint-export workflow the
+    /// rollout evals reference HF-export checkpoints whose `producer_run_id`
+    /// is a per-checkpoint *export* run, not the training run — so the
+    /// one-hop `eval_series_rows` (cp.producer_run_id = run) misses them.
+    ///
+    /// Matches an eval when its checkpoint was produced either directly by
+    /// `run_id`, or by a run that consumed a checkpoint produced by `run_id`
+    /// (the export run). Direct-eval workflows (text SFT) still match via the
+    /// first clause. The `step` still comes from the eval's checkpoint
+    /// metadata, which carries it across the export.
+    pub async fn rollout_series_rows(&self, run_id: &str) -> Result<Vec<EvalSeriesRow>> {
+        let rows = sqlx::query(
+            "SELECT
+                 er.eval_key,
+                 er.checkpoint_artifact_id,
+                 er.eval_recipe_hash,
+                 er.policy_id,
+                 er.eval_run_id,
+                 COALESCE(er_run.status, 'pending') AS state,
+                 cp.metadata_json AS checkpoint_metadata,
+                 (
+                     SELECT a.id
+                     FROM run_outputs ro
+                     JOIN artifacts a ON a.id = ro.artifact_id
+                     WHERE ro.run_id = er.eval_run_id AND a.kind = 'eval_result'
+                     ORDER BY a.created_at, a.id
+                     LIMIT 1
+                 ) AS eval_result_artifact_id,
+                 (
+                     SELECT a.metadata_json
+                     FROM run_outputs ro
+                     JOIN artifacts a ON a.id = ro.artifact_id
+                     WHERE ro.run_id = er.eval_run_id AND a.kind = 'eval_result'
+                     ORDER BY a.created_at, a.id
+                     LIMIT 1
+                 ) AS eval_result_metadata
+             FROM eval_requests er
+             LEFT JOIN artifacts cp ON cp.id = er.checkpoint_artifact_id
+             LEFT JOIN runs er_run ON er_run.id = er.eval_run_id
+             WHERE cp.producer_run_id = $1
+                OR er.eval_run_id = $1
+                OR cp.producer_run_id IN (
+                       SELECT ri.run_id
+                       FROM run_inputs ri
+                       JOIN artifacts mc ON mc.id = ri.artifact_id
+                       WHERE mc.producer_run_id = $1
+                   )
+             ORDER BY er.created_at",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("rollout_series_rows({run_id})"))?;
+        rows.into_iter()
+            .map(|r| {
+                let checkpoint_metadata: Option<sqlx::types::Json<Value>> =
+                    r.try_get("checkpoint_metadata")?;
+                let eval_result_metadata: Option<sqlx::types::Json<Value>> =
+                    r.try_get("eval_result_metadata")?;
+                Ok(EvalSeriesRow {
+                    eval_key: r.try_get("eval_key")?,
+                    checkpoint_artifact_id: r.try_get("checkpoint_artifact_id")?,
+                    eval_recipe_hash: r.try_get("eval_recipe_hash")?,
+                    policy_id: r.try_get("policy_id")?,
+                    eval_run_id: r.try_get("eval_run_id")?,
+                    state: r.try_get("state")?,
+                    checkpoint_metadata: checkpoint_metadata.map(|j| j.0),
+                    eval_result_artifact_id: r.try_get("eval_result_artifact_id")?,
+                    eval_result_metadata: eval_result_metadata.map(|j| j.0),
+                })
+            })
+            .collect()
+    }
+
+    /// Rollout evals discovered purely by *lineage*, not via `eval_requests`.
+    /// Picks up manually-submitted freeroll evals (which never create an
+    /// eval_request row) so they still appear in the rollout browser. Finds
+    /// every `eval_result` artifact whose producing run consumed a checkpoint
+    /// that is produced directly by `run_id`, or by a run that consumed a
+    /// checkpoint produced by `run_id` (the one export hop) — the same
+    /// reachability as [`Self::rollout_series_rows`].
+    ///
+    /// `policy_id` is set to the eval run's `recipe_name`; the caller
+    /// normalizes it (collapsing the `step<N>` token) so freerolls of one
+    /// family at different checkpoints group into a single browsable series.
+    /// Rows already covered by `eval_requests` are deduped by the caller.
+    pub async fn lineage_rollout_rows(&self, run_id: &str) -> Result<Vec<EvalSeriesRow>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT
+                 a.id  AS eval_result_artifact_id,
+                 a.metadata_json AS eval_result_metadata,
+                 a.producer_run_id AS eval_run_id,
+                 COALESCE(er_run.status, 'pending') AS state,
+                 COALESCE(er_run.recipe_name, '') AS recipe_name,
+                 cp.id AS checkpoint_artifact_id,
+                 cp.metadata_json AS checkpoint_metadata
+             FROM artifacts a
+             JOIN runs er_run ON er_run.id = a.producer_run_id
+             JOIN run_inputs ri ON ri.run_id = a.producer_run_id
+             JOIN artifacts cp ON cp.id = ri.artifact_id AND cp.kind = 'checkpoint'
+             WHERE a.kind = 'eval_result'
+               AND ( cp.producer_run_id = $1
+                     OR cp.producer_run_id IN (
+                            SELECT ri2.run_id
+                            FROM run_inputs ri2
+                            JOIN artifacts mc ON mc.id = ri2.artifact_id
+                            WHERE mc.producer_run_id = $1
+                        ) )",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("lineage_rollout_rows({run_id})"))?;
+        rows.into_iter()
+            .map(|r| {
+                let checkpoint_metadata: Option<sqlx::types::Json<Value>> =
+                    r.try_get("checkpoint_metadata")?;
+                let eval_result_metadata: Option<sqlx::types::Json<Value>> =
+                    r.try_get("eval_result_metadata")?;
+                Ok(EvalSeriesRow {
+                    eval_key: String::new(),
+                    checkpoint_artifact_id: r.try_get("checkpoint_artifact_id")?,
+                    eval_recipe_hash: String::new(),
+                    policy_id: r.try_get("recipe_name")?,
+                    eval_run_id: r.try_get("eval_run_id")?,
+                    state: r.try_get("state")?,
+                    checkpoint_metadata: checkpoint_metadata.map(|j| j.0),
+                    eval_result_artifact_id: r.try_get("eval_result_artifact_id")?,
                     eval_result_metadata: eval_result_metadata.map(|j| j.0),
                 })
             })

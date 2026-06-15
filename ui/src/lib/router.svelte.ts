@@ -18,7 +18,8 @@ export type View =
   | "lineage"
   | "recipes"
   | "compare"
-  | "colophon";
+  | "colophon"
+  | "rollouts";
 
 export interface Route {
   view: View;
@@ -33,7 +34,7 @@ function parse(hash: string): Route {
   const view = (segments[0] as View) || "runs";
   const selected = segments[1] ?? null;
   const query = new URLSearchParams(queryPart ?? "");
-  if (!["runs", "pipelines", "artifacts", "policies", "lineage", "recipes", "compare", "colophon"].includes(view)) {
+  if (!["runs", "pipelines", "artifacts", "policies", "lineage", "recipes", "compare", "colophon", "rollouts"].includes(view)) {
     return { view: "runs", selected: null, query };
   }
   return { view, selected, query };

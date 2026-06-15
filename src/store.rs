@@ -104,10 +104,11 @@ pub struct InputResolution {
 /// One enriched row from the eval-series query: an `eval_requests` row
 /// joined with its checkpoint artifact's metadata (`checkpoint_metadata`,
 /// source of the `step` field) and with the first `eval_result`
-/// artifact's metadata produced by the eval run (`eval_result_metadata`,
-/// source of the headline metric). Both metadata fields are `Option`
-/// because the checkpoint may have been GC'd or the eval run may not
-/// have produced an `eval_result` artifact yet.
+/// artifact's id + metadata produced by the eval run
+/// (`eval_result_artifact_id` / `eval_result_metadata`, source of the
+/// headline metric and the rollout the browser steps through). The
+/// metadata/id fields are `Option` because the checkpoint may have been
+/// GC'd or the eval run may not have produced an `eval_result` artifact yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalSeriesRow {
     pub eval_key: String,
@@ -117,6 +118,7 @@ pub struct EvalSeriesRow {
     pub eval_run_id: Option<String>,
     pub state: String,
     pub checkpoint_metadata: Option<Value>,
+    pub eval_result_artifact_id: Option<String>,
     pub eval_result_metadata: Option<Value>,
 }
 

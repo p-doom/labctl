@@ -11,9 +11,29 @@
 
   interface Props {
     series: EvalSeries;
+    /** Parent training run id — anchors the rollout browser. */
+    runId: string;
   }
-  let { series }: Props = $props();
+  let { series, runId }: Props = $props();
   let expanded = $state(false);
+
+  // Checkpoints whose eval recorded a browsable rollout (single or multi).
+  let hasRollouts = $derived(series.points.some((p) => p.has_rollout));
+
+  function pointIndex(p: EvalSeriesPoint): number {
+    return series.points.findIndex(
+      (q) => q.checkpoint_artifact_id === p.checkpoint_artifact_id && q.step === p.step,
+    );
+  }
+
+  // Open the full-page rollout browser for this run+policy, positioned at
+  // `index` (into series.points). Falls back to the first rollout-bearing
+  // checkpoint when no index is given.
+  function openBrowser(index?: number) {
+    const i = index ?? series.points.findIndex((p) => p.has_rollout);
+    const q = new URLSearchParams({ policy: series.policy_id, i: String(Math.max(0, i)) });
+    router.go("rollouts", runId, q);
+  }
 
   let delta = $derived.by(() => {
     if (series.latest_value == null || series.previous_value == null) return null;
@@ -43,8 +63,12 @@
     return String(s);
   }
 
+  // Clicking a chart point: jump straight into the rollout browser at that
+  // checkpoint when it has a rollout; otherwise fall back to the eval run's
+  // own panel (e.g. to read logs of a pending/failed eval).
   function onPointClick(_seriesId: string, p: EvalSeriesPoint) {
-    if (p.eval_run_id) router.go("runs", p.eval_run_id);
+    if (p.has_rollout) openBrowser(pointIndex(p));
+    else if (p.eval_run_id) router.go("runs", p.eval_run_id);
   }
   let chartSeries = $derived([
     { id: series.policy_id, points: series.points },
@@ -84,6 +108,12 @@
     <MetricChart series={chartSeries} {onPointClick} />
   </div>
 
+  {#if hasRollouts}
+    <button type="button" class="browse" onclick={() => openBrowser()}>
+      Browse rollouts →
+    </button>
+  {/if}
+
   <button
     type="button"
     class="expand"
@@ -96,19 +126,20 @@
 
   {#if expanded}
     <div class="rows">
-      {#each series.points as p (`${p.step}-${p.checkpoint_artifact_id}`)}
-        {#if p.eval_run_id}
+      {#each series.points as p, i (`${p.step}-${p.checkpoint_artifact_id}`)}
+        {#if p.has_rollout || p.eval_run_id}
           <button
             type="button"
             class="row clickable"
-            onclick={() => router.go("runs", p.eval_run_id!)}
+            onclick={() => (p.has_rollout ? openBrowser(i) : router.go("runs", p.eval_run_id!))}
+            title={p.has_rollout ? "Open rollout" : "Open eval run"}
           >
             <Pill status={p.state} showLabel={false} />
             <span class="step mono">step {fmtStep(p.step)}</span>
             <span class="row-value mono">
               {p.value != null ? fmtValue(p.value) : "—"}
             </span>
-            <span class="row-state mono">{shortStatus(p.state)}</span>
+            <span class="row-state mono">{p.has_rollout ? "rollout →" : shortStatus(p.state)}</span>
           </button>
         {:else}
           <div class="row">
@@ -190,6 +221,22 @@
 
   .chart-wrap {
     padding: 0 4px;
+  }
+
+  .browse {
+    align-self: flex-start;
+    background: transparent;
+    border: 1px solid theme("colors.line.1");
+    border-radius: 5px;
+    padding: 4px 10px;
+    color: theme("colors.accent.DEFAULT");
+    font-size: 11px;
+    font-family: theme("fontFamily.mono");
+    cursor: pointer;
+  }
+  .browse:hover {
+    background: theme("colors.accent.soft");
+    border-color: theme("colors.accent.DEFAULT");
   }
 
   .expand {

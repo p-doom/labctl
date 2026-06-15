@@ -181,7 +181,7 @@
     {#if detail.artifact.metadata && (detail.artifact.metadata as { result?: unknown }).result}
       <section class="block">
         <h2 class="section-h masthead">Result</h2>
-        <Result result={(detail.artifact.metadata as { result: unknown }).result} />
+        <Result result={(detail.artifact.metadata as { result: unknown }).result} artifactId={detail.artifact.id} />
       </section>
     {/if}
 
