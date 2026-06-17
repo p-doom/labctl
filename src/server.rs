@@ -472,7 +472,9 @@ fn build_eval_series(rows: &[crate::store::EvalSeriesRow]) -> Vec<Value> {
                 .is_some_and(|r| {
                     r.get("traj_path").is_some()
                         || r.get("gif_path").is_some()
-                        || r.get("runs").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
+                        || r.get("runs")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|a| !a.is_empty())
                 });
 
         by_policy
@@ -1674,11 +1676,14 @@ fn resolve_rollout_paths(
     let result = artifact.metadata_json.get("result");
 
     // Multi shape: per-instruction subdirs under the artifact path.
-    if let Some(runs) = result.and_then(|r| r.get("runs")).and_then(|v| v.as_array()) {
+    if let Some(runs) = result
+        .and_then(|r| r.get("runs"))
+        .and_then(|v| v.as_array())
+    {
         let idx = task.unwrap_or(0);
-        let run = runs.get(idx).ok_or_else(|| {
-            not_found(format!("task {idx} out of range ({} run(s))", runs.len()))
-        })?;
+        let run = runs
+            .get(idx)
+            .ok_or_else(|| not_found(format!("task {idx} out of range ({} run(s))", runs.len())))?;
         let subdir = run
             .get("subdir")
             .and_then(|v| v.as_str())
