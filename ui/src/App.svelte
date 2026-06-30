@@ -18,6 +18,7 @@
   import RecipeView from "./views/RecipeView.svelte";
   import CompareView from "./views/CompareView.svelte";
   import ColophonView from "./views/ColophonView.svelte";
+  import RolloutBrowserView from "./views/RolloutBrowserView.svelte";
 
   let cluster = $derived(store.cluster);
 
@@ -80,7 +81,7 @@
 <div class="shell">
   <LeftRail />
   <main>
-    {#if router.view !== "lineage" && router.view !== "recipes" && router.view !== "compare" && router.view !== "colophon" && !(router.view === "policies" && router.selected)}
+    {#if router.view !== "lineage" && router.view !== "recipes" && router.view !== "compare" && router.view !== "colophon" && router.view !== "rollouts" && !(router.view === "policies" && router.selected)}
       <TopBar {cluster} />
     {/if}
     <div class="content">
@@ -120,6 +121,10 @@
       {:else if router.view === "colophon"}
         <div class="view" data-active="true">
           <ColophonView />
+        </div>
+      {:else if router.view === "rollouts" && router.selected}
+        <div class="view" data-active="true">
+          <RolloutBrowserView runId={router.selected} />
         </div>
       {/if}
     </div>

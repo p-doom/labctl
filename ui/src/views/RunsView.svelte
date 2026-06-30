@@ -152,10 +152,10 @@
   let listEl = $state<HTMLDivElement | null>(null);
 
   // -------- virtualization --------
-  // Stanza rows are 56px (two-line: italic-Lora headline + mono meta).
+  // Stanza rows are 56px (two-line: Inter-sans headline + mono meta).
   // Fewer rows visible than the old 37px Linear-school density, but the
   // typographic hierarchy buys back the scan speed in a different
-  // dimension: the eye reads a column of italic recipe names cleanly.
+  // dimension: the eye reads a column of clean recipe names cleanly.
   const ROW_HEIGHT = 56;
   const HEADER_HEIGHT = 34;
   const OVERSCAN = 8;
@@ -369,7 +369,7 @@
           >No. {editionNumber(r.id)}</button>
 
           <!-- Headline + meta stack. Recipe name is the row's hero, in
-               italic Lora; meta below in 11px mono. -->
+               clean Inter sans; meta below in 11px mono. -->
           <div class="rec-cell">
             <div class="rec-top">
               <button
@@ -509,12 +509,12 @@
     min-width: 0;
   }
   .rec-name {
-    font-family: theme("fontFamily.serif");
-    font-style: italic;
-    font-weight: 500;
-    font-size: 15px;
+    font-family: theme("fontFamily.sans");
+    font-style: normal;
+    font-weight: 600;
+    font-size: 14px;
     color: var(--fg-0);
-    letter-spacing: -0.005em;
+    letter-spacing: -0.01em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

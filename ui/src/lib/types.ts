@@ -80,7 +80,20 @@ export interface EvalSeriesPoint {
   metric_name: string | null;
   eval_run_id: string | null;
   checkpoint_artifact_id: string;
+  /** The eval_result artifact id, when the eval run produced one. Drives the
+   *  rollout browser; null while the eval is pending/failed. */
+  eval_result_artifact_id: string | null;
+  /** True when the eval_result recorded a GUI rollout (single or multi). */
+  has_rollout: boolean;
   state: string;
+}
+
+/** Response of GET /runs/:id/rollouts — a run's evals aggregated one export
+ *  hop down, grouped by policy and step-sorted (reuses EvalSeries). */
+export interface RolloutSeriesResponse {
+  run_id: string;
+  recipe_name: string;
+  series: EvalSeries[];
 }
 
 export interface Tracking {
@@ -236,6 +249,14 @@ export interface RolloutStep {
 export interface RolloutData {
   steps: RolloutStep[];
   frame_count: number;
+}
+
+/** One instruction in a multi-instruction eval `result.runs[]`. Used to
+ *  build the task selector in the rollout viewer. */
+export interface RolloutTask {
+  index: number;
+  slug: string;
+  instruction: string;
 }
 
 // ---------- Dataset explorer (crowd-cast SFT per-segment datasets) ----------

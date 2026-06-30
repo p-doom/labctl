@@ -196,6 +196,18 @@
         <span class="spacer-dot">·</span>
         <span class="mono backend">{r.repo}@{r.recipe_hash.slice(0, 7)}</span>
       </div>
+
+      {#if detail.outputs.some((o) => o.kind === "checkpoint") || detail.eval_series.some((s) => s.points.some((p) => p.has_rollout))}
+        <button
+          type="button"
+          class="rollouts-cta"
+          onclick={() => router.go("rollouts", r.id)}
+          title="Step through every checkpoint's eval rollout"
+        >
+          <Icon name="play" size={12} />
+          <span>Browse eval rollouts</span>
+        </button>
+      {/if}
     </header>
 
     <!-- ============ METHODS ============
@@ -278,7 +290,7 @@
               <figcaption class="fig-cap masthead">
                 Fig. {i + 1} · {series.metric_name ?? series.policy_id}
               </figcaption>
-              <EvalSeriesCard {series} />
+              <EvalSeriesCard {series} {runId} />
             </figure>
           {/each}
         </div>
@@ -442,10 +454,16 @@
   .masthead-line .by { color: var(--fg-1); text-transform: none; letter-spacing: 0.04em; }
   .spacer-dot { color: var(--fg-3); font-size: 11px; }
   .title-display {
-    font-size: 32px;
+    /* Clean upright sans for the run's recipe name — overrides the global
+       italic-Lora `.headline` on this element (kept readable, not cursive). */
+    font-family: theme("fontFamily.sans");
+    font-style: normal;
+    font-weight: 600;
+    font-size: 28px;
+    letter-spacing: -0.02em;
     color: var(--fg-0);
     margin: 0;
-    line-height: 1.1;
+    line-height: 1.15;
     word-break: break-word;
   }
   .title-display .stage-tail {
@@ -453,6 +471,22 @@
     font-style: italic;
     font-weight: 400;
   }
+  .rollouts-cta {
+    margin-top: 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--accent);
+    background: var(--accent-soft);
+    color: var(--fg-0);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background var(--dur-micro) var(--ease);
+  }
+  .rollouts-cta:hover { background: var(--accent); color: #fff; }
   .status-line {
     margin-top: 14px;
     display: flex;

@@ -13,6 +13,7 @@ import type {
   RecipeHistory,
   RecipeView,
   RolloutData,
+  RolloutSeriesResponse,
   RunDetailResponse,
   RunEvent,
   RunSummary,
@@ -32,6 +33,10 @@ export const api = {
   cluster: () => get<ClusterInfo>("/cluster"),
   runs: () => get<{ runs: RunSummary[] }>("/runs").then((d) => d.runs),
   run: (id: string) => get<RunDetailResponse>(`/runs/${encodeURIComponent(id)}`),
+  // Rollout browser: a run's evals aggregated one export hop down, grouped
+  // by policy + step-sorted. See get_run_rollouts in src/server.rs.
+  runRollouts: (id: string) =>
+    get<RolloutSeriesResponse>(`/runs/${encodeURIComponent(id)}/rollouts`),
   runLog: (id: string, tail = 200) =>
     get<LogResponse>(`/runs/${encodeURIComponent(id)}/log?tail=${tail}`),
   runEvents: (id: string) =>
@@ -55,8 +60,14 @@ export const api = {
   policies: () =>
     get<{ policies: PolicyCard[] }>("/policies").then((d) => d.policies),
   policy: (name: string) => get<PolicyDetail>(`/policies/${encodeURIComponent(name)}`),
-  rollout: (id: string) => get<RolloutData>(`/artifacts/${encodeURIComponent(id)}/rollout`),
-  frameUrl: (id: string, n: number) => `/api/artifacts/${encodeURIComponent(id)}/frames/${n}`,
+  // `task` selects an instruction in a multi-instruction eval rollout;
+  // omit it for single-rollout (legacy) artifacts.
+  rollout: (id: string, task?: number) =>
+    get<RolloutData>(
+      `/artifacts/${encodeURIComponent(id)}/rollout${task === undefined ? "" : `?task=${task}`}`,
+    ),
+  frameUrl: (id: string, n: number, task?: number) =>
+    `/api/artifacts/${encodeURIComponent(id)}/frames/${n}${task === undefined ? "" : `?task=${task}`}`,
   // Dataset explorer. `dataset()` 404s when the artifact isn't a browseable
   // per-segment dataset (e.g. Stage C/D grain shards) — callers treat that
   // as "no Browse section" rather than an error.

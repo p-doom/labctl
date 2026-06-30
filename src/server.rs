@@ -100,6 +100,7 @@ pub async fn serve(cluster: ClusterConfig, pg: Arc<PgStore>, addr: SocketAddr) -
         .route("/runs/:id", get(get_run))
         .route("/runs/:id/log", get(get_run_log))
         .route("/runs/:id/events", get(get_run_events))
+        .route("/runs/:id/rollouts", get(get_run_rollouts))
         .route("/recipes/:name/history", get(get_recipe_history))
         .route("/recipes/:name", get(get_recipe))
         // Top-level so it doesn't collide with the /runs/:id route — matchit
@@ -437,6 +438,8 @@ fn build_eval_series(rows: &[crate::store::EvalSeriesRow]) -> Vec<Value> {
         metric_name: Option<String>,
         eval_run_id: Option<String>,
         checkpoint_artifact_id: String,
+        eval_result_artifact_id: Option<String>,
+        has_rollout: bool,
         state: String,
     }
 
@@ -457,6 +460,23 @@ fn build_eval_series(rows: &[crate::store::EvalSeriesRow]) -> Vec<Value> {
             .map(|(n, v)| (Some(n), Some(v)))
             .unwrap_or((None, None));
 
+        // A point is rollout-browsable when its eval_result recorded a GUI
+        // rollout — single shape (top-level traj_path/gif_path) or multi
+        // shape (a `runs[]` array). Mirrors the detection in the rollout
+        // viewer; lets the browser skip pending/metric-only evals.
+        let has_rollout = ev.eval_result_artifact_id.is_some()
+            && ev
+                .eval_result_metadata
+                .as_ref()
+                .and_then(|m| m.get("result"))
+                .is_some_and(|r| {
+                    r.get("traj_path").is_some()
+                        || r.get("gif_path").is_some()
+                        || r.get("runs")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|a| !a.is_empty())
+                });
+
         by_policy
             .entry(ev.policy_id.clone())
             .or_default()
@@ -466,6 +486,8 @@ fn build_eval_series(rows: &[crate::store::EvalSeriesRow]) -> Vec<Value> {
                 metric_name,
                 eval_run_id: ev.eval_run_id.clone(),
                 checkpoint_artifact_id: ev.checkpoint_artifact_id.clone(),
+                eval_result_artifact_id: ev.eval_result_artifact_id.clone(),
+                has_rollout,
                 state: ev.state.clone(),
             });
     }
@@ -510,12 +532,82 @@ fn build_eval_series(rows: &[crate::store::EvalSeriesRow]) -> Vec<Value> {
                         "metric_name": p.metric_name,
                         "eval_run_id": p.eval_run_id,
                         "checkpoint_artifact_id": p.checkpoint_artifact_id,
+                        "eval_result_artifact_id": p.eval_result_artifact_id,
+                        "has_rollout": p.has_rollout,
                         "state": p.state,
                     }))
                     .collect::<Vec<_>>(),
             })
         })
         .collect()
+}
+
+/// Rollout browser data for one run: its evals aggregated one export hop
+/// down (see [`PgStore::rollout_series_rows`]), grouped by policy and sorted
+/// by checkpoint step — the same shape as a run's `eval_series`, reusing
+/// [`build_eval_series`]. The browser steps through the `has_rollout` points.
+/// Also returns the run's recipe name for the page header.
+async fn get_run_rollouts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let pg = &state.pg;
+    let run = pg
+        .get_run(&id)
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| not_found(format!("run not found: {id}")))?;
+
+    // Policy-dispatched evals (eval_requests), plus manually-submitted evals
+    // found by lineage (e.g. freerolls, which create no eval_request). Dedupe
+    // the lineage rows against eval_result artifacts already covered above, and
+    // normalize their recipe-name group key so a freeroll family at different
+    // checkpoints collapses into one browsable series.
+    let mut rows = pg.rollout_series_rows(&id).await?;
+    let seen: std::collections::HashSet<String> = rows
+        .iter()
+        .filter_map(|r| r.eval_result_artifact_id.clone())
+        .collect();
+    for mut lr in pg.lineage_rollout_rows(&id).await? {
+        match &lr.eval_result_artifact_id {
+            Some(aid) if !seen.contains(aid) => {}
+            _ => continue,
+        }
+        lr.policy_id = normalize_eval_policy(&lr.policy_id);
+        rows.push(lr);
+    }
+
+    let series = build_eval_series(&rows);
+    Ok(axum::Json(json!({
+        "run_id": run.id,
+        "recipe_name": run.recipe_name,
+        "series": series,
+    })))
+}
+
+/// Collapse a `step<N>` token in an eval recipe name so manually-submitted
+/// freerolls of the same family at different checkpoints (…step6742…,
+/// …step8000…) group into a single browsable series.
+fn normalize_eval_policy(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i..].starts_with(&['s', 't', 'e', 'p'])
+            && chars.get(i + 4).is_some_and(|c| c.is_ascii_digit())
+        {
+            out.push_str("step");
+            i += 4;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// All metric points emitted by a run's evals, flattened: one row per
@@ -1560,12 +1652,67 @@ async fn get_cluster(State(state): State<AppState>) -> axum::Json<Value> {
 
 // ---------- rollout viewer ----------
 
+/// Optional `?task=N` selector for multi-instruction eval rollouts. Absent
+/// (or on a single-rollout artifact) means "the one rollout".
+#[derive(Deserialize)]
+struct RolloutQuery {
+    task: Option<usize>,
+}
+
+/// Resolve the `(trajectory.jsonl, steps/)` pair for a rollout, supporting
+/// both eval_result shapes the runner emits:
+///   * single — top-level `result.traj_path` (absolute); `steps/` is its
+///     sibling. `task` is ignored. This is the legacy shape.
+///   * multi  — `result.runs[]`, one entry per instruction, each with a
+///     `subdir` relative to the artifact's path. `task` selects a run
+///     (default 0). traj.jsonl + steps/ live under `<artifact>/<subdir>/`.
+///
+/// The two shapes are disjoint — the multi aggregate result.json has no
+/// top-level `traj_path` — so detection is unambiguous.
+fn resolve_rollout_paths(
+    artifact: &crate::store::ArtifactRow,
+    task: Option<usize>,
+) -> Result<(PathBuf, PathBuf), ApiError> {
+    let result = artifact.metadata_json.get("result");
+
+    // Multi shape: per-instruction subdirs under the artifact path.
+    if let Some(runs) = result
+        .and_then(|r| r.get("runs"))
+        .and_then(|v| v.as_array())
+    {
+        let idx = task.unwrap_or(0);
+        let run = runs
+            .get(idx)
+            .ok_or_else(|| not_found(format!("task {idx} out of range ({} run(s))", runs.len())))?;
+        let subdir = run
+            .get("subdir")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| not_found(format!("run {idx} has no subdir in result")))?;
+        let dir = artifact.path.join(subdir);
+        return Ok((dir.join("trajectory.jsonl"), dir.join("steps")));
+    }
+
+    // Single shape: trust the absolute traj_path the runner wrote.
+    let traj_path_str = result
+        .and_then(|r| r.get("traj_path"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| not_found("artifact has no traj_path or runs in result".to_string()))?;
+    let traj_path = PathBuf::from(traj_path_str);
+    let steps_dir = traj_path
+        .parent()
+        .ok_or_else(|| not_found("invalid traj_path: no parent dir".to_string()))?
+        .join("steps");
+    Ok((traj_path, steps_dir))
+}
+
 /// Return parsed traj.jsonl + frame count for an eval_result artifact that
-/// recorded a GUI rollout. The artifact's metadata.result must contain
-/// `traj_path` (absolute path to traj.jsonl) written by the runner.
+/// recorded a GUI rollout. Supports both single- and multi-instruction
+/// shapes; `?task=N` selects an instruction in the multi shape (see
+/// [`resolve_rollout_paths`]).
 async fn get_artifact_rollout(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RolloutQuery>,
 ) -> Result<axum::Json<Value>, ApiError> {
     let artifact = {
         let pg = &state.pg;
@@ -1574,19 +1721,7 @@ async fn get_artifact_rollout(
             .ok_or_else(|| not_found(format!("artifact not found: {id}")))?
     };
 
-    let traj_path_str = artifact
-        .metadata_json
-        .get("result")
-        .and_then(|r| r.get("traj_path"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| not_found("artifact has no traj_path in result".to_string()))?
-        .to_string();
-
-    let traj_path = PathBuf::from(&traj_path_str);
-    let steps_dir = traj_path
-        .parent()
-        .ok_or_else(|| not_found("invalid traj_path: no parent dir".to_string()))?
-        .join("steps");
+    let (traj_path, steps_dir) = resolve_rollout_paths(&artifact, q.task)?;
 
     // The traj.jsonl + steps/ dir live on NFS; both reads can stall.
     // One spawn_blocking covers both so the handler never blocks the
@@ -1627,10 +1762,12 @@ async fn get_artifact_rollout(
 }
 
 /// Serve step_NNN.png for a GUI rollout artifact. Frame index N is
-/// zero-based and must match a file written by the runner.
+/// zero-based and must match a file written by the runner. `?task=N`
+/// selects an instruction in the multi shape (see [`resolve_rollout_paths`]).
 async fn get_artifact_frame(
     State(state): State<AppState>,
     Path((id, n)): Path<(String, u32)>,
+    Query(q): Query<RolloutQuery>,
 ) -> Result<Response, ApiError> {
     let artifact = {
         let pg = &state.pg;
@@ -1639,18 +1776,7 @@ async fn get_artifact_frame(
             .ok_or_else(|| not_found(format!("artifact not found: {id}")))?
     };
 
-    let traj_path_str = artifact
-        .metadata_json
-        .get("result")
-        .and_then(|r| r.get("traj_path"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| not_found("artifact has no traj_path in result".to_string()))?
-        .to_string();
-
-    let steps_dir = std::path::Path::new(&traj_path_str)
-        .parent()
-        .ok_or_else(|| not_found("invalid traj_path: no parent dir".to_string()))?
-        .join("steps");
+    let (_traj_path, steps_dir) = resolve_rollout_paths(&artifact, q.task)?;
 
     let frame_path = steps_dir.join(format!("step_{n:03}.png"));
 

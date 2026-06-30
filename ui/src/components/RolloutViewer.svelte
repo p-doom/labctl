@@ -1,11 +1,19 @@
 <script lang="ts">
   import { api } from "../lib/api";
-  import type { RolloutData, RolloutStep } from "../lib/types";
+  import type { RolloutData, RolloutStep, RolloutTask } from "../lib/types";
 
   interface Props {
     artifactId: string;
+    /** Multi-instruction tasks; null/undefined renders a single rollout. */
+    tasks?: RolloutTask[] | null;
+    /** Controlled selected task index. When provided, the parent owns the
+     *  selection (e.g. the rollout browser, so it survives checkpoint
+     *  switches / remounts); tab clicks report back via onTaskChange.
+     *  When omitted, the viewer manages its own selection internally. */
+    task?: number;
+    onTaskChange?: (index: number) => void;
   }
-  let { artifactId }: Props = $props();
+  let { artifactId, tasks = null, task, onTaskChange }: Props = $props();
 
   let data = $state<RolloutData | null>(null);
   let error = $state<string | null>(null);
@@ -13,17 +21,43 @@
   let expanded = $state<Set<number>>(new Set());
   let maximized = $state(false);
 
+  // Scroll containers for the trajectory tables (inline + maximized). Used to
+  // keep the selected row in view as the user steps through frames.
+  let trajEl = $state<HTMLElement | null>(null);
+  let ovTrajEl = $state<HTMLElement | null>(null);
+
+  // User's explicit pick in the multi shape, if any. Persists across
+  // artifactId changes (e.g. stepping checkpoints in the rollout browser) so
+  // the chosen instruction stays selected — as long as the new eval still has
+  // that task index; otherwise it falls back to the first task. `undefined`
+  // for a single rollout → no `?task=` param (legacy behavior unchanged).
+  let picked = $state<number | undefined>(undefined);
+  // Controlled `task` prop (if any) wins over the internal pick.
+  let selectedTask = $derived.by(() => {
+    if (!tasks || tasks.length === 0) return undefined;
+    const want = task ?? picked;
+    if (want !== undefined && tasks.some((t) => t.index === want)) return want;
+    return tasks[0].index;
+  });
+  function selectTask(index: number) {
+    picked = index;
+    onTaskChange?.(index);
+  }
+
   $effect(() => {
     if (!artifactId) return;
+    const task = selectedTask;
     data = null;
     error = null;
     current = 0;
     expanded = new Set();
-    maximized = false;
-    api.rollout(artifactId).then((d) => {
+    api.rollout(artifactId, task).then((d) => {
+      // Ignore a stale response if the selection changed mid-flight.
+      if (selectedTask !== task) return;
       data = d;
       if (d.frame_count > 1) current = 1;
     }).catch((e: unknown) => {
+      if (selectedTask !== task) return;
       error = e instanceof Error ? e.message : String(e);
     });
   });
@@ -31,6 +65,19 @@
   function prev() { if (data && current > 0) current--; }
   function next() { if (data && current < data.frame_count - 1) current++; }
   function goTo(n: number) { if (data && n >= 0 && n < data.frame_count) current = n; }
+
+  // Keep the selected trajectory row in view as `current` advances. Runs
+  // after the DOM applies the `.selected` class. `block: "nearest"` is a
+  // no-op when the row is already visible, so it only scrolls (within the
+  // table's own scroll container) when the row has gone out of bounds —
+  // the user never has to scroll manually to follow the action.
+  $effect(() => {
+    void current;
+    void data;
+    const container = maximized ? ovTrajEl : trajEl;
+    const row = container?.querySelector<HTMLElement>("tr.selected");
+    row?.scrollIntoView({ block: "nearest" });
+  });
   function toggleExpand(n: number) {
     const s = new Set(expanded);
     if (s.has(n)) s.delete(n); else s.add(n);
@@ -62,14 +109,29 @@
 
 <!-- ── Inline (compact) view ───────────────────────────────────────── -->
 <div class="rollout">
+  {#if tasks && tasks.length > 0}
+    <!-- svelte-ignore a11y_no_redundant_roles -->
+    <div class="task-tabs" role="tablist" aria-label="instruction">
+      {#each tasks as t (t.index)}
+        <button
+          class="task-tab" class:active={t.index === selectedTask}
+          role="tab" aria-selected={t.index === selectedTask}
+          title={t.instruction || t.slug}
+          onclick={() => selectTask(t.index)}
+        >{t.instruction || t.slug}</button>
+      {/each}
+    </div>
+  {/if}
+
   {#if error}
     <p class="err">Rollout unavailable: {error}</p>
   {:else if !data}
     <div class="skel" style="height: 280px; border-radius: 6px;"></div>
   {:else}
+    <div class="layout">
     <div class="viewer">
       <div class="frame-wrap">
-        <img class="frame" src={api.frameUrl(artifactId, current)} alt="step {current}" />
+        <img class="frame" src={api.frameUrl(artifactId, current, selectedTask)} alt="step {current}" />
         <span class="badge">frame {current} / {data.frame_count - 1}</span>
         <button class="maximize-btn" onclick={() => maximized = true} aria-label="maximize rollout viewer" title="Maximize">
           <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
@@ -105,7 +167,7 @@
       {/if}
     </div>
 
-    <div class="traj">
+    <div class="traj" bind:this={trajEl}>
       <table>
         <thead>
           <tr>
@@ -128,6 +190,7 @@
         </tbody>
       </table>
     </div>
+    </div>
   {/if}
 </div>
 
@@ -146,8 +209,21 @@
 
       <!-- left: frame + controls -->
       <div class="ov-left">
+        {#if tasks && tasks.length > 0}
+          <!-- svelte-ignore a11y_no_redundant_roles -->
+          <div class="task-tabs" role="tablist" aria-label="instruction">
+            {#each tasks as t (t.index)}
+              <button
+                class="task-tab" class:active={t.index === selectedTask}
+                role="tab" aria-selected={t.index === selectedTask}
+                title={t.instruction || t.slug}
+                onclick={() => selectTask(t.index)}
+              >{t.instruction || t.slug}</button>
+            {/each}
+          </div>
+        {/if}
         <div class="ov-frame-wrap">
-          <img class="ov-frame" src={api.frameUrl(artifactId, current)} alt="step {current}" />
+          <img class="ov-frame" src={api.frameUrl(artifactId, current, selectedTask)} alt="step {current}" />
           <span class="badge">frame {current} / {data.frame_count - 1}</span>
         </div>
 
@@ -179,7 +255,7 @@
       </div>
 
       <!-- right: trajectory table -->
-      <div class="ov-right">
+      <div class="ov-right" bind:this={ovTrajEl}>
         <div class="traj">
           <table>
             <thead>
@@ -211,8 +287,54 @@
 
 <style>
   /* ── Inline ───────────────────────────────────────────────────── */
-  .rollout { display: flex; flex-direction: column; gap: 12px; }
+  .rollout { display: flex; flex-direction: column; gap: 12px; container-type: inline-size; }
   .err { color: theme("colors.status.failed.DEFAULT"); font-size: 12px; }
+
+  /* Frame + trajectory stack by default (narrow drawer). When the viewer's
+     own container is wide (the full-page rollout browser), they go
+     side-by-side so the whole action trajectory is visible at once next to
+     a height-capped screenshot. */
+  .layout { display: flex; flex-direction: column; gap: 12px; }
+  @container (min-width: 760px) {
+    .layout { flex-direction: row; align-items: flex-start; }
+    .layout .viewer {
+      flex: 1 1 56%;
+      min-width: 0;
+      position: sticky;
+      top: 0;
+    }
+    .layout .traj {
+      flex: 1 1 44%;
+      min-width: 0;
+      align-self: stretch;
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+    .layout .frame {
+      max-height: 68vh;
+      width: auto;
+      max-width: 100%;
+      margin: 0 auto;
+      object-fit: contain;
+    }
+  }
+
+  /* Instruction selector (multi-instruction eval rollouts). */
+  .task-tabs { display: flex; flex-wrap: wrap; gap: 4px; }
+  .task-tab {
+    max-width: 100%;
+    padding: 3px 9px; border-radius: 4px;
+    border: 1px solid theme("colors.line.0");
+    background: theme("colors.bg.1"); color: theme("colors.fg.2");
+    font-size: 11px; cursor: pointer;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .task-tab:hover { background: theme("colors.bg.2"); color: theme("colors.fg.1"); }
+  .task-tab.active {
+    background: theme("colors.accent.soft");
+    border-color: theme("colors.accent.DEFAULT");
+    color: theme("colors.fg.0");
+  }
 
   .viewer { display: flex; flex-direction: column; gap: 8px; }
 
