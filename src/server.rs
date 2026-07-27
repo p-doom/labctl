@@ -39,7 +39,7 @@ use tower_http::trace::TraceLayer;
 use crate::{
     config::ClusterConfig,
     pg_store::PgStore,
-    store::{ArtifactRow, RunRow, is_terminal},
+    store::{ArtifactRow, RunRow, RunSummary, is_terminal},
 };
 
 #[derive(rust_embed::RustEmbed)]
@@ -319,6 +319,28 @@ fn run_summary(r: &RunRow) -> Value {
     })
 }
 
+/// Same shape as `run_summary` from a blob-free `RunSummary` — the list
+/// endpoint's row source, so it doesn't drag recipe_json/context_json.
+/// Keep the emitted keys identical to `run_summary`.
+fn run_summary_light(r: &RunSummary) -> Value {
+    json!({
+        "id": r.id,
+        "recipe_name": r.recipe_name,
+        "recipe_hash": r.recipe_hash,
+        "status": r.status,
+        "job_id": r.job_id,
+        "run_dir": r.run_dir.display().to_string(),
+        "repo": r.repo,
+        "created_at": r.created_at,
+        "finished_at": r.finished_at,
+        "duration_secs": r.finished_at.map(|f| f.saturating_sub(r.created_at)),
+        "pipeline_id": r.pipeline_id,
+        "stage_name": r.stage_name,
+        "submitted_by": r.submitted_by,
+        "is_terminal": is_terminal(&r.status),
+    })
+}
+
 fn run_full(r: &RunRow) -> Value {
     let mut v = run_summary(r);
     let map = v.as_object_mut().unwrap();
@@ -349,7 +371,12 @@ fn artifact_summary(a: &ArtifactRow) -> Value {
 
 async fn list_runs(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
     let pg = &state.pg;
-    let runs: Vec<Value> = pg.list_runs().await?.iter().map(run_summary).collect();
+    let runs: Vec<Value> = pg
+        .list_run_summaries()
+        .await?
+        .iter()
+        .map(run_summary_light)
+        .collect();
     Ok(axum::Json(json!({ "runs": runs })))
 }
 

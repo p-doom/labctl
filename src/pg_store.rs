@@ -34,7 +34,7 @@ use sqlx::{
 use crate::config::{ClusterConfig, InputSpec, PgConfig, Recipe};
 use crate::store::{
     ArtifactRow, ClaimOutcome, EvalRequestSlot, EvalSeriesRow, EventRow, InputResolution, NewRun,
-    PipelineRow, PolicySummaryRow, RunRow, RunView, TrackingRow, is_terminal,
+    PipelineRow, PolicySummaryRow, RunRow, RunSummary, RunView, TrackingRow, is_terminal,
 };
 
 /// Embedded migration set. Resolved at compile time from `migrations/`;
@@ -90,6 +90,17 @@ impl PgStore {
             .await
             .context("list_runs query")?;
         rows.into_iter().map(row_to_run).collect()
+    }
+
+    /// Full-table list without the `recipe_json`/`context_json` blobs.
+    /// The heavy `list_runs` fetches ~120 MB of TOAST for the whole
+    /// registry; callers that only need the scalar columns use this.
+    pub async fn list_run_summaries(&self) -> Result<Vec<RunSummary>> {
+        let rows = sqlx::query(RUN_SUMMARY_SELECT_ALL)
+            .fetch_all(&self.pool)
+            .await
+            .context("list_run_summaries query")?;
+        rows.into_iter().map(row_to_run_summary).collect()
     }
 
     pub async fn get_run(&self, id: &str) -> Result<Option<RunRow>> {
@@ -2006,6 +2017,16 @@ const RUN_SELECT_ALL: &str = "
     ORDER BY created_at DESC
 ";
 
+// Blob-free projection for list/scan paths. Omits recipe_json/context_json
+// (the TOAST columns) — see RunSummary.
+const RUN_SUMMARY_SELECT_ALL: &str = "
+    SELECT id, recipe_name, recipe_hash, status, job_id, run_dir, repo,
+           source_path, created_at, finished_at, pipeline_id, stage_name,
+           submitted_by
+    FROM runs
+    ORDER BY created_at DESC
+";
+
 const ARTIFACT_SELECT_BASE: &str = "
     SELECT id, kind, path, producer_run_id, metadata_json, created_at
     FROM artifacts
@@ -2033,6 +2054,24 @@ fn row_to_run(r: sqlx::postgres::PgRow) -> Result<RunRow> {
         dependency_on: dependency_on.map(|j| j.0),
         submitted_by: r.try_get("submitted_by")?,
         cache_key: r.try_get("cache_key")?,
+    })
+}
+
+fn row_to_run_summary(r: sqlx::postgres::PgRow) -> Result<RunSummary> {
+    Ok(RunSummary {
+        id: r.try_get("id")?,
+        recipe_name: r.try_get("recipe_name")?,
+        recipe_hash: r.try_get("recipe_hash")?,
+        status: r.try_get("status")?,
+        job_id: r.try_get("job_id")?,
+        run_dir: PathBuf::from(r.try_get::<String, _>("run_dir")?),
+        repo: r.try_get("repo")?,
+        source_path: PathBuf::from(r.try_get::<String, _>("source_path")?),
+        created_at: r.try_get("created_at")?,
+        finished_at: r.try_get("finished_at")?,
+        pipeline_id: r.try_get("pipeline_id")?,
+        stage_name: r.try_get("stage_name")?,
+        submitted_by: r.try_get("submitted_by")?,
     })
 }
 

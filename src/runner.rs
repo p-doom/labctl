@@ -1232,7 +1232,7 @@ pub async fn gc_terminal_sources(store: &Store, min_terminal_age_secs: u64) -> R
     let now = util::now_ts();
     let cutoff = min_terminal_age_secs as i64;
     let mut removed = 0;
-    for run in store.list_runs().await? {
+    for run in store.list_run_summaries().await? {
         if !is_terminal(&run.status) {
             continue;
         }

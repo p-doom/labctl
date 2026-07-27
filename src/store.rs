@@ -64,6 +64,27 @@ pub struct RunRow {
     pub cache_key: Option<String>,
 }
 
+/// Blob-free projection of `RunRow` for list/scan paths (`status`, the
+/// UI `/runs` list, gc). Omits `recipe_json`/`context_json` — the two
+/// large TOAST columns that a full-table `SELECT` would otherwise pull
+/// (~120 MB across the registry) only to be discarded by these callers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunSummary {
+    pub id: String,
+    pub recipe_name: String,
+    pub recipe_hash: String,
+    pub status: String,
+    pub job_id: Option<String>,
+    pub run_dir: PathBuf,
+    pub repo: String,
+    pub source_path: PathBuf,
+    pub created_at: i64,
+    pub finished_at: Option<i64>,
+    pub pipeline_id: Option<String>,
+    pub stage_name: Option<String>,
+    pub submitted_by: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRow {
     pub id: String,
@@ -295,6 +316,13 @@ impl Store {
 
     pub async fn list_runs(&self) -> Result<Vec<RunRow>> {
         self.pg.list_runs().await
+    }
+
+    /// Blob-free list of all runs. Use in place of `list_runs` wherever
+    /// `recipe_json`/`context_json` aren't read — avoids fetching the
+    /// TOAST blobs for the whole table.
+    pub async fn list_run_summaries(&self) -> Result<Vec<RunSummary>> {
+        self.pg.list_run_summaries().await
     }
 
     /// Active runs owned by `submitted_by`. Scoped so a daemon never

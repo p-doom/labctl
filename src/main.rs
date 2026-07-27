@@ -533,7 +533,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Status => {
-            for run in store.list_runs().await? {
+            for run in store.list_run_summaries().await? {
                 println!(
                     "{:<28} {:<12} {:<10} {}",
                     run.id,
