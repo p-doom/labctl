@@ -1878,6 +1878,21 @@ async fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<u
             if !ready {
                 continue;
             }
+            // Artifact identity is the canonical output path. A retry,
+            // duplicate run row, or later reconcile pass may therefore see
+            // the marker after this exact path has already been registered.
+            // Reuse and link that row instead of re-inserting its path-derived
+            // primary key. This mirrors the checkpoint_stream branch above and
+            // makes non-stream output registration idempotent too.
+            if let Some(existing) = store
+                .find_artifact_by_path(&resolution.kind, &resolution.path)
+                .await?
+            {
+                store.link_run_output(&run.id, role, &existing.id).await?;
+                store.set_alias(&resolution.alias, &existing.id).await?;
+                linked_outputs.push((role.clone(), existing.id));
+                continue;
+            }
             let mut metadata = json!({
                 "role": role,
                 "producer_recipe": run.recipe_name,
@@ -1942,4 +1957,151 @@ fn safe_job_name(name: &str) -> String {
         })
         .take(64)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{ClusterConfig, Recipe},
+        store::{NewRun, Store},
+    };
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    fn integration_cluster() -> ClusterConfig {
+        let path = std::env::var("LABCTL_TEST_CLUSTER")
+            .map(PathBuf::from)
+            .expect("LABCTL_TEST_CLUSTER must point to an isolated test cluster");
+        ClusterConfig::load(&path).expect("load isolated test cluster")
+    }
+
+    fn dummy_recipe() -> Recipe {
+        Recipe {
+            name: "nonstream_idempotency_test".to_string(),
+            repo: "labctl".to_string(),
+            command: vec!["true".to_string()],
+            resources: Default::default(),
+            inputs: Default::default(),
+            outputs: Default::default(),
+            params: Default::default(),
+            args: Default::default(),
+            env: Default::default(),
+            tracking: Default::default(),
+            sweep: None,
+        }
+    }
+
+    /// Regression for a stale created run and a successful retry resolving to
+    /// one marked dataset path. Reconcile must link the existing path-canonical
+    /// artifact, not attempt a second INSERT of the same primary key.
+    #[tokio::test]
+    #[ignore = "requires an isolated PG; set LABCTL_TEST_CLUSTER"]
+    async fn nonstream_output_registration_reuses_existing_path() {
+        let cluster = integration_cluster();
+        let store = Store::connect(&cluster)
+            .await
+            .expect("connect isolated store");
+        let pg = store.pg();
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let user = format!("__nonstream_idempotency_{suffix}");
+        let first_run = format!("run_{}a", &suffix[..31]);
+        let retry_run = format!("run_{}b", &suffix[..31]);
+        let alias = format!("same_dataset_{suffix}");
+        let root = cluster
+            .filesystem
+            .artifact_roots
+            .get("dataset")
+            .expect("dataset artifact root");
+        let output = root.join(&user).join(&alias);
+        std::fs::create_dir_all(&output).expect("create marked output");
+        std::fs::write(output.join("manifest.json"), b"{}\n").expect("write marker");
+        let now = crate::util::now_ts();
+        store
+            .insert_user(&user, now)
+            .await
+            .expect("insert test user");
+        let context = json!({
+            "outputs": {
+                "dataset": {
+                    "kind": "dataset",
+                    "path": output,
+                    "role": "dataset",
+                    "alias": alias,
+                    "marker": "manifest.json"
+                }
+            }
+        });
+        let recipe = dummy_recipe();
+        let hash = "a".repeat(64);
+        for run_id in [&first_run, &retry_run] {
+            store
+                .insert_run(
+                    NewRun {
+                        id: run_id,
+                        recipe: &recipe,
+                        recipe_hash: &hash,
+                        status: "created",
+                        run_dir: Path::new("/tmp/labctl-nonstream-test"),
+                        source_path: Path::new("/tmp/labctl-nonstream-test/source"),
+                        context_json: &context,
+                        submitted_by: Some(&user),
+                        cache_key: None,
+                    },
+                    &[],
+                )
+                .await
+                .expect("insert test run");
+        }
+
+        let first = store.get_run(&first_run).await.expect("first run");
+        assert_eq!(
+            register_outputs(&store, &first)
+                .await
+                .expect("first registration"),
+            1
+        );
+        let retry = store.get_run(&retry_run).await.expect("retry run");
+        assert_eq!(
+            register_outputs(&store, &retry)
+                .await
+                .expect("idempotent retry"),
+            0
+        );
+
+        let first_view = store.run_view(&first_run).await.expect("first view");
+        let retry_view = store.run_view(&retry_run).await.expect("retry view");
+        assert_eq!(first_view.outputs.len(), 1);
+        assert_eq!(retry_view.outputs.len(), 1);
+        assert_eq!(first_view.outputs[0].id, retry_view.outputs[0].id);
+        assert_eq!(first_view.outputs[0].path, output);
+
+        let artifact_id = &first_view.outputs[0].id;
+        sqlx::query("DELETE FROM artifact_aliases WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(pg.pool())
+            .await
+            .expect("delete alias");
+        sqlx::query("DELETE FROM run_outputs WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(pg.pool())
+            .await
+            .expect("delete run-output links");
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .execute(pg.pool())
+            .await
+            .expect("delete artifact");
+        sqlx::query("DELETE FROM runs WHERE submitted_by = $1")
+            .bind(&user)
+            .execute(pg.pool())
+            .await
+            .expect("delete runs");
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&user)
+            .execute(pg.pool())
+            .await
+            .expect("delete user");
+        std::fs::remove_dir_all(root.join(&user)).expect("remove test output");
+    }
 }
