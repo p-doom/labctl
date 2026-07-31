@@ -164,7 +164,12 @@ pub struct SchedulerConfig {
     pub kind: SchedulerKind,
     pub sbatch: String,
     pub sacct: String,
+    pub squeue: String,
     pub scancel: String,
+    /// A job absent from both a successful `sacct` query and `squeue` is
+    /// sealed as `unknown_terminal` only after this age. The grace avoids
+    /// racing SLURM propagation immediately after `sbatch`.
+    pub missing_job_grace_secs: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -173,7 +178,9 @@ impl Default for SchedulerConfig {
             kind: SchedulerKind::Slurm,
             sbatch: "sbatch".to_string(),
             sacct: "sacct".to_string(),
+            squeue: "squeue".to_string(),
             scancel: "scancel".to_string(),
+            missing_job_grace_secs: 600,
         }
     }
 }

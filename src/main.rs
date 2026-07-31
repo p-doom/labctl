@@ -754,6 +754,12 @@ async fn run_doctor(cluster_path: &std::path::Path) -> Result<()> {
             sacct_ok,
             &format!("{} ({})", cluster.scheduler.sacct, sched_kind),
         );
+        let squeue_ok = which::which(&cluster.scheduler.squeue).is_ok();
+        emit(
+            "scheduler.squeue",
+            squeue_ok,
+            &format!("{} ({})", cluster.scheduler.squeue, sched_kind),
+        );
         let sbatch_ok = which::which(&cluster.scheduler.sbatch).is_ok();
         emit(
             "scheduler.sbatch",

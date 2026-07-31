@@ -255,10 +255,7 @@ impl PgStore {
         rows.into_iter().map(row_to_run).collect()
     }
 
-    /// Look up an artifact by its on-disk path. Returns the first match.
-    /// Note: the PG schema doesn't constrain `(path)` to be unique on its
-    /// own, so callers that need disambiguation must filter further on
-    /// the client side (e.g. by `kind`).
+    /// Look up an artifact by its globally unique on-disk path.
     pub async fn find_artifact_by_path(&self, path: &str) -> Result<Option<ArtifactRow>> {
         let row = sqlx::query(&format!("{ARTIFACT_SELECT_BASE} WHERE path = $1 LIMIT 1"))
             .bind(path)
@@ -388,14 +385,17 @@ impl PgStore {
     /// caller's validity check (`cache_hit_outputs_valid`) and the link
     /// of its outputs to the new run. Inside the tx:
     ///
-    ///   1. Verify the source row is still a cache-hit candidate (status
+    ///   1. Lock any existing destination placeholder. An already-completed
+    ///      cache hit with the same key is returned idempotently; any other
+    ///      non-`created` destination state is rejected.
+    ///   2. Verify the source row is still a cache-hit candidate (status
     ///      in {succeeded, cache_hit}); `FOR SHARE` blocks any concurrent
     ///      writer trying to flip it terminal-failed or delete it.
-    ///   2. Upsert the new run row directly into terminal `cache_hit`,
+    ///   3. Upsert the new run row directly into terminal `cache_hit`,
     ///      with `finished_at` set — no intermediate `created` state.
-    ///   3. Reset and populate `run_inputs` for the new run.
-    ///   4. Copy `run_outputs` rows from source to dest (`INSERT ... SELECT`).
-    ///   5. Append the `stage_cache_hit` event.
+    ///   4. Reset and populate `run_inputs` for the new run.
+    ///   5. Copy `run_outputs` rows from source to dest (`INSERT ... SELECT`).
+    ///   6. Append the `stage_cache_hit` event.
     ///
     /// The pipeline-graph backfill (`backfill_stage_consumers`) runs
     /// outside the tx — it is idempotent and touches sibling rows, not
@@ -425,6 +425,56 @@ impl PgStore {
             .begin()
             .await
             .context("register_cache_hit_tx: begin")?;
+
+        // Serialize retries/concurrent orphan sweeps on the destination.
+        // Returning the existing links for an exact completed hit avoids a
+        // second event while still letting the facade redo its idempotent
+        // downstream-consumer backfill.
+        let existing_dest =
+            sqlx::query("SELECT status, job_id, cache_key FROM runs WHERE id = $1 FOR UPDATE")
+                .bind(run.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .with_context(|| format!("register_cache_hit_tx: lock destination {}", run.id))?;
+        if let Some(dest) = existing_dest {
+            let status: String = dest.try_get("status")?;
+            let job_id: Option<String> = dest.try_get("job_id")?;
+            let existing_cache_key: Option<String> = dest.try_get("cache_key")?;
+            if status == "cache_hit" {
+                if existing_cache_key.as_deref() != Some(cache_key) {
+                    bail!(
+                        "cache_hit destination {} already completed with a different cache key",
+                        run.id
+                    );
+                }
+                let rows = sqlx::query(
+                    "SELECT role, artifact_id FROM run_outputs WHERE run_id = $1 ORDER BY role, artifact_id",
+                )
+                .bind(run.id)
+                .fetch_all(&mut *tx)
+                .await
+                .context("register_cache_hit_tx: read idempotent destination outputs")?;
+                let output_links = rows
+                    .into_iter()
+                    .map(|r| {
+                        Ok::<_, anyhow::Error>((
+                            r.try_get::<String, _>("role")?,
+                            r.try_get::<String, _>("artifact_id")?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?;
+                tx.commit()
+                    .await
+                    .context("register_cache_hit_tx: idempotent commit")?;
+                return Ok(output_links);
+            }
+            if status != "created" || job_id.is_some() {
+                bail!(
+                    "cache_hit destination {} is not a pristine placeholder (status={status}, job_id={job_id:?})",
+                    run.id
+                );
+            }
+        }
 
         // Lock the source row so concurrent GC / status-flip writers
         // serialise behind us. If the row is no longer cache-hit-eligible
@@ -639,10 +689,9 @@ impl PgStore {
     /// picks it up when the leader terminates. The follower's own
     /// `cache_key` is left NULL (the partial unique index would
     /// otherwise reject it — only one non-terminal row per cache_key
-    /// is permitted); the cascade re-runs `submit_recipe_inner` for
-    /// the follower, which re-computes the cache_key from the same
-    /// recipe + provenance + inputs and resolves as `cache_hit`
-    /// against the now-terminal leader.
+    /// is permitted). The full submit-time context and input resolution
+    /// are persisted so the cascade can finalize strictly against the
+    /// same leader without consulting mutable repository/alias state.
     ///
     /// Emits a `cache_followed` event so operators can audit
     /// coalescing decisions from the event log.
@@ -657,13 +706,12 @@ impl PgStore {
         submitted_by: &str,
         cache_key_of_leader: &str,
         leader_run_id: &str,
+        context_json: &Value,
+        inputs: &[InputResolution],
     ) -> Result<()> {
         let now = crate::util::now_ts();
         let recipe_value =
             serde_json::to_value(recipe).context("insert_cache_follower: serialise recipe")?;
-        // Placeholder context_json — the cascade rewrites it when the
-        // follower is upgraded to a real cache_hit row.
-        let ctx = json!({});
         let dependency_on = json!({
             "afterok": [{ "run_id": leader_run_id }]
         });
@@ -686,13 +734,35 @@ impl PgStore {
         .bind(&recipe.repo)
         .bind(source_path.display().to_string())
         .bind(sqlx::types::Json(&recipe_value))
-        .bind(sqlx::types::Json(ctx))
+        .bind(sqlx::types::Json(context_json))
         .bind(now)
         .bind(submitted_by)
         .bind(sqlx::types::Json(&dependency_on))
         .execute(&mut *tx)
         .await
         .with_context(|| format!("insert_cache_follower: insert {run_id}"))?;
+
+        // Persist the exact submit-time input resolution. A follower is
+        // finalized from this snapshot after its leader terminates; it must
+        // never re-resolve aliases against newer registry state.
+        for input in inputs {
+            sqlx::query(
+                "INSERT INTO run_inputs (run_id, role, artifact_id, resolved_path)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(run_id)
+            .bind(&input.role)
+            .bind(input.artifact_id.as_deref())
+            .bind(input.resolved_path.display().to_string())
+            .execute(&mut *tx)
+            .await
+            .with_context(|| {
+                format!(
+                    "insert_cache_follower: run_inputs insert role={}",
+                    input.role
+                )
+            })?;
+        }
 
         sqlx::query(
             "INSERT INTO events (run_id, event_type, payload_json, created_at)
@@ -1600,7 +1670,12 @@ impl PgStore {
     ) -> Result<()> {
         sqlx::query(
             "UPDATE runs
-             SET pipeline_id = $1, stage_name = $2, dependency_on = $3
+             SET pipeline_id = $1,
+                 stage_name = $2,
+                 dependency_on = CASE
+                     WHEN context_json ? 'cache_follower' THEN dependency_on
+                     ELSE $3
+                 END
              WHERE id = $4",
         )
         .bind(pipeline_id)
@@ -2376,6 +2451,28 @@ mod tests {
             )
             .await
             .expect("register cache hit");
+        // A concurrent orphan sweep / retry for the same destination must
+        // be a no-op: preserve the hit and do not emit a duplicate event.
+        store
+            .register_cache_hit_tx(
+                crate::store::NewRun {
+                    id: &follower_id,
+                    recipe: &recipe,
+                    recipe_hash: &rh,
+                    status: "cache_hit",
+                    run_dir: std::path::Path::new("/tmp/labctl-test-follower"),
+                    source_path: std::path::Path::new("/tmp/labctl-test-follower/source"),
+                    context_json: &serde_json::json!({"schema_version": 1, "cache_hit": true}),
+                    submitted_by: Some(&user),
+                    cache_key: Some(&cache_key),
+                },
+                &[],
+                &leader_id,
+                &cache_key,
+                now,
+            )
+            .await
+            .expect("repeat cache hit is idempotent");
 
         let view = store.run_view(&follower_id).await.expect("view follower");
         assert_eq!(view.run.status, "cache_hit");
@@ -2388,9 +2485,13 @@ mod tests {
             .events_for_run(&follower_id)
             .await
             .expect("events_for_run");
-        assert!(
-            events.iter().any(|e| e["event_type"] == "stage_cache_hit"),
-            "stage_cache_hit event must be emitted; got {events:?}"
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["event_type"] == "stage_cache_hit")
+                .count(),
+            1,
+            "stage_cache_hit must be emitted exactly once; got {events:?}"
         );
 
         // Cleanup: delete artifact (FK from run_outputs cascades from
@@ -2448,6 +2549,18 @@ mod tests {
             .await
             .expect("insert leader");
 
+        let follower_context = serde_json::json!({
+            "schema_version": 1,
+            "cache_follower": {
+                "cache_key": cache_key,
+                "leader_run_id": leader_id,
+            }
+        });
+        let follower_inputs = vec![InputResolution {
+            role: "source".to_string(),
+            artifact_id: None,
+            resolved_path: PathBuf::from("/tmp/labctl-test-input"),
+        }];
         store
             .insert_cache_follower(
                 &follower_id,
@@ -2458,6 +2571,8 @@ mod tests {
                 &user,
                 &cache_key,
                 &leader_id,
+                &follower_context,
+                &follower_inputs,
             )
             .await
             .expect("insert follower");
@@ -2467,6 +2582,17 @@ mod tests {
         assert!(
             row.cache_key.is_none(),
             "follower must have NULL cache_key so the inflight unique index doesn't apply"
+        );
+        assert_eq!(row.context_json, follower_context);
+        let persisted_inputs = store
+            .run_inputs(&follower_id)
+            .await
+            .expect("follower inputs");
+        assert_eq!(persisted_inputs.len(), 1);
+        assert_eq!(persisted_inputs[0].role, "source");
+        assert_eq!(
+            persisted_inputs[0].resolved_path,
+            PathBuf::from("/tmp/labctl-test-input")
         );
         let dep = row.dependency_on.expect("dependency_on must be set");
         let afterok = dep

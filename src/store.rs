@@ -404,21 +404,31 @@ impl Store {
         self.get_artifact(&id).await
     }
 
-    /// Look up an artifact by `(kind, path)`. The PG `find_artifact_by_path`
-    /// query doesn't take a kind (the `(path)` column isn't unique on its
-    /// own — multiple kinds can in principle share a path), so we filter
-    /// the result by kind on the client side. Matches legacy semantics:
-    /// returns the unique row at this path for this kind, or `None`.
+    /// Look up an artifact by `(kind, path)`. Artifact paths are globally
+    /// unique in PG. Reusing one path under a different kind is therefore a
+    /// registry conflict, not a cache miss; fail explicitly instead of
+    /// falling through to a confusing path-derived duplicate-PK insert.
     pub async fn find_artifact_by_path(
         &self,
         kind: &str,
         path: &Path,
     ) -> Result<Option<ArtifactRow>> {
-        Ok(self
+        let existing = self
             .pg
             .find_artifact_by_path(&path.display().to_string())
-            .await?
-            .filter(|a| a.kind == kind))
+            .await?;
+        if let Some(artifact) = &existing
+            && artifact.kind != kind
+        {
+            anyhow::bail!(
+                "artifact path {} is already registered as kind {:?} (requested kind {:?}, id={})",
+                path.display(),
+                artifact.kind,
+                kind,
+                artifact.id
+            );
+        }
+        Ok(existing)
     }
 
     pub async fn get_artifact(&self, id: &str) -> Result<ArtifactRow> {
@@ -511,8 +521,8 @@ impl Store {
 
     /// Insert a follower placeholder pointing at `leader_run_id`. The
     /// existing pending-children cascade picks the follower up when the
-    /// leader terminates, at which point `submit_recipe_inner` re-runs
-    /// for the follower and resolves it as `cache_hit`.
+    /// leader terminates. Its immutable submit context and inputs let that
+    /// cascade perform a closed `created -> cache_hit` transition.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_cache_follower(
         &self,
@@ -524,6 +534,8 @@ impl Store {
         submitted_by: &str,
         cache_key_of_leader: &str,
         leader_run_id: &str,
+        context_json: &Value,
+        inputs: &[InputResolution],
     ) -> Result<()> {
         self.pg
             .insert_cache_follower(
@@ -535,6 +547,8 @@ impl Store {
                 submitted_by,
                 cache_key_of_leader,
                 leader_run_id,
+                context_json,
+                inputs,
             )
             .await
     }

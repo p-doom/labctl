@@ -173,6 +173,7 @@ fn cache_hit_outputs_valid(
         .iter()
         .map(|(r, res)| (r.as_str(), res.marker.as_deref()))
         .collect();
+    let mut materialized_roles = BTreeSet::new();
     for art in prior_outputs {
         // Find the role this artifact filled. The artifact's `metadata_json`
         // includes the role under "role".
@@ -185,6 +186,7 @@ fn cache_hit_outputs_valid(
             Some(m) => *m,
             None => return false,
         };
+        materialized_roles.insert(role);
         if !art.path.exists() {
             return false;
         }
@@ -195,6 +197,7 @@ fn cache_hit_outputs_valid(
         }
     }
     !prior_outputs.is_empty()
+        && materialized_roles == role_to_marker.keys().copied().collect::<BTreeSet<_>>()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -211,7 +214,7 @@ async fn register_cache_hit(
     inputs: &[crate::store::InputResolution],
     outputs: &BTreeMap<String, OutputResolution>,
     repo_provenance: &provenance::RepoProvenance,
-    stage_ctx: Option<&StageContext<'_>>,
+    stage_name: Option<&str>,
     parent_job_ids: &[String],
     submitted_by: &str,
 ) -> Result<SubmittedRun> {
@@ -231,7 +234,7 @@ async fn register_cache_hit(
         "outputs": outputs,
         "params": recipe.params,
         "provenance": repo_provenance,
-        "stage_name": stage_ctx.map(|c| c.stage_name),
+        "stage_name": stage_name,
         "parent_job_ids": parent_job_ids,
         "cache_hit": true,
         "cache_hit_source_run_id": prior_run_id,
@@ -398,7 +401,7 @@ async fn submit_recipe_inner(
                 &inputs,
                 &outputs,
                 &repo_provenance,
-                stage_ctx,
+                stage_ctx.map(|c| c.stage_name),
                 parent_job_ids,
                 submitted_by,
             )
@@ -457,6 +460,11 @@ async fn submit_recipe_inner(
         // Lost the race. Insert a follower placeholder pointing at the
         // leader. We do NOT pay source-copy / sbatch cost — the cascade
         // upgrades us to `cache_hit` when the leader finishes.
+        let mut follower_ctx = claim_ctx.clone();
+        follower_ctx["cache_follower"] = json!({
+            "cache_key": cache_key,
+            "leader_run_id": leader_run_id,
+        });
         store
             .insert_cache_follower(
                 &run_id,
@@ -467,6 +475,8 @@ async fn submit_recipe_inner(
                 submitted_by,
                 &cache_key,
                 &leader_run_id,
+                &follower_ctx,
+                &inputs,
             )
             .await?;
         return Ok(SubmittedRun {
@@ -958,13 +968,11 @@ pub async fn try_submit_pending_children(
 ///     set. The pipeline-stage context (`stage_run_ids`, `stages` map)
 ///     is rebuilt from the sibling rows so template tokens like
 ///     `{inputs.X.path}` referencing upstream outputs resolve.
-///   * **Cache-key follower placeholder** — has neither `pipeline_id`
-///     nor `stage_name`; its `dependency_on` points at the leader run
-///     for its `cache_key`. No pipeline context to reconstruct — call
-///     straight through with `stage_ctx = None`. `submit_recipe_inner`
-///     will re-compute the cache_key from the recipe + provenance +
-///     inputs and resolve as `cache_hit` against the now-terminal
-///     leader.
+///   * **Cache-key follower placeholder** — carries `cache_follower` in
+///     `context_json`; it may also be a pipeline stage. It is finalized
+///     only from its submit-time provenance/input snapshot and exact leader.
+///     This path never calls `submit_recipe_inner`, so an automatic follower
+///     can never drift into a new `sbatch` submission.
 async fn complete_pending_submission(
     cluster: &ClusterConfig,
     store: &Store,
@@ -977,21 +985,15 @@ async fn complete_pending_submission(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
+    if child.context_json.get("cache_follower").is_some() {
+        return complete_cache_follower(cluster, store, child, &recipe, &submitted_by).await;
+    }
+
     let Some(pipeline_id) = child.pipeline_id.as_deref() else {
-        // Cache-key follower: no pipeline context, no stage siblings.
-        submit_recipe_inner(
-            cluster,
-            store,
-            &recipe,
-            None,
-            None,
-            &[],
-            Some(child.id.as_str()),
-            &submitted_by,
-            None,
-        )
-        .await?;
-        return Ok(());
+        bail!(
+            "pending run {} has neither pipeline membership nor a persisted cache_follower snapshot; refusing to auto-submit",
+            child.id
+        );
     };
     let stage_name = child
         .stage_name
@@ -1052,6 +1054,169 @@ async fn complete_pending_submission(
         None,
     )
     .await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheFollowerLink {
+    cache_key: String,
+    leader_run_id: String,
+}
+
+/// Promote a cache follower from its immutable submit-time snapshot.
+///
+/// This is deliberately a closed transition: `created follower -> cache_hit`.
+/// Missing/corrupt provenance, a changed leader key, or incomplete outputs is
+/// an error that the caller turns into `failed`. There is no fallback to the
+/// normal submission path because that would silently spend compute for an
+/// invocation the user was told had coalesced behind a leader.
+async fn complete_cache_follower(
+    cluster: &ClusterConfig,
+    store: &Store,
+    child: &crate::store::RunRow,
+    recipe: &Recipe,
+    submitted_by: &str,
+) -> Result<()> {
+    if child.status != "created" || child.job_id.is_some() || child.cache_key.is_some() {
+        bail!(
+            "cache follower {} is not a pristine created placeholder (status={}, job_id={:?}, cache_key={:?})",
+            child.id,
+            child.status,
+            child.job_id,
+            child.cache_key,
+        );
+    }
+    let link: CacheFollowerLink = serde_json::from_value(
+        child
+            .context_json
+            .get("cache_follower")
+            .cloned()
+            .with_context(|| format!("cache follower {} has no link snapshot", child.id))?,
+    )
+    .with_context(|| format!("cache follower {} link snapshot is invalid", child.id))?;
+
+    let dependency_matches = child
+        .dependency_on
+        .as_ref()
+        .and_then(|d| d.get("afterok"))
+        .and_then(Value::as_array)
+        .is_some_and(|parents| {
+            parents.len() == 1
+                && parents[0].get("run_id").and_then(Value::as_str)
+                    == Some(link.leader_run_id.as_str())
+        });
+    if !dependency_matches {
+        bail!(
+            "cache follower {} dependency does not exactly match snapshotted leader {}",
+            child.id,
+            link.leader_run_id
+        );
+    }
+
+    let inputs = store.run_inputs(&child.id).await?;
+    let repo_provenance: provenance::RepoProvenance = serde_json::from_value(
+        child
+            .context_json
+            .get("provenance")
+            .cloned()
+            .with_context(|| format!("cache follower {} has no provenance snapshot", child.id))?,
+    )
+    .with_context(|| format!("cache follower {} provenance snapshot is invalid", child.id))?;
+    validate_cache_follower_snapshot(
+        &child.id,
+        recipe,
+        &child.recipe_hash,
+        &repo_provenance,
+        &inputs,
+        &link.cache_key,
+    )?;
+
+    let leader = store.get_run(&link.leader_run_id).await?;
+    if !matches!(leader.status.as_str(), "succeeded" | "cache_hit") {
+        bail!(
+            "cache follower {} leader {} is not cache-hit eligible (status={})",
+            child.id,
+            leader.id,
+            leader.status
+        );
+    }
+    if leader.cache_key.as_deref() != Some(link.cache_key.as_str()) {
+        bail!(
+            "cache follower {} leader {} cache key mismatch: expected={}, actual={:?}",
+            child.id,
+            leader.id,
+            link.cache_key,
+            leader.cache_key
+        );
+    }
+
+    let outputs: BTreeMap<String, OutputResolution> = serde_json::from_value(
+        child
+            .context_json
+            .get("outputs")
+            .cloned()
+            .with_context(|| format!("cache follower {} has no output snapshot", child.id))?,
+    )
+    .with_context(|| format!("cache follower {} output snapshot is invalid", child.id))?;
+    let prior_outputs = store.run_outputs(&leader.id).await?;
+    if !cache_hit_outputs_valid(&prior_outputs, &outputs) {
+        bail!(
+            "cache follower {} leader {} has incomplete or unmaterialized outputs",
+            child.id,
+            leader.id
+        );
+    }
+
+    let parent_job_ids: Vec<String> = child
+        .context_json
+        .get("parent_job_ids")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .with_context(|| format!("cache follower {} parent_job_ids are invalid", child.id))?
+        .unwrap_or_default();
+    register_cache_hit(
+        cluster,
+        store,
+        recipe,
+        &child.id,
+        &child.run_dir,
+        &child.run_dir.join(fs_layout::LAB_DIRNAME),
+        &child.recipe_hash,
+        &link.cache_key,
+        &leader.id,
+        &inputs,
+        &outputs,
+        &repo_provenance,
+        child.stage_name.as_deref(),
+        &parent_job_ids,
+        submitted_by,
+    )
+    .await?;
+    Ok(())
+}
+
+fn validate_cache_follower_snapshot(
+    run_id: &str,
+    recipe: &Recipe,
+    recipe_hash: &str,
+    repo_provenance: &provenance::RepoProvenance,
+    inputs: &[InputResolution],
+    expected_cache_key: &str,
+) -> Result<()> {
+    let recomputed_recipe_hash =
+        util::canonical_value_hash(&serde_json::to_value(recipe)?, RECIPE_HASH_VERSION);
+    if recomputed_recipe_hash != recipe_hash {
+        bail!(
+            "cache follower {run_id} recipe hash drift: row={recipe_hash}, recomputed={recomputed_recipe_hash}"
+        );
+    }
+    let recomputed_key = compute_cache_key(recipe_hash, repo_provenance, inputs, &recipe.params)?;
+    if recomputed_key != expected_cache_key {
+        bail!(
+            "cache follower {run_id} snapshot does not reproduce its cache key: expected={expected_cache_key}, recomputed={recomputed_key}"
+        );
+    }
     Ok(())
 }
 
@@ -1637,8 +1802,8 @@ fn render_script(
     script.push_str(&rendered_command);
     script.push_str("\nrc=$?\n");
     script.push_str("exit \"$rc\"\n");
-    // sacct is the sole source of truth for job state; bash wrapper exits
-    // with the user command's rc and SLURM/sacct records the outcome.
+    // SLURM is the sole source of truth for job state; bash wrapper exits
+    // with the user command's rc and sacct/squeue expose the outcome.
     // Compute has no PG-bound responsibilities — outputs land at their
     // declared paths and login-side reconcile walks + registers them.
     Ok(script)
@@ -1688,9 +1853,9 @@ async fn submit_script(
 /// from the run's ``created_at`` (minus a 1-day buffer) so that very old jobs
 /// still appear, and so a recycled job_id can't return a row from a different
 /// run that ran much later. ``TZ=UTC`` is forced so we can parse End without
-/// ambiguity. Returns ``None`` only if sacct itself can't be invoked or
-/// returns nonzero — an unparseable End is fine, we just leave finished_at
-/// empty and let the caller fall back.
+/// ambiguity. If a successful query has no rows, consult `squeue`: an active
+/// row wins, while absence from both sources seals an old run as
+/// `unknown_terminal`. The age grace avoids racing scheduler propagation.
 async fn scheduler_outcome(
     cluster: &ClusterConfig,
     run: &crate::store::RunRow,
@@ -1715,12 +1880,28 @@ async fn scheduler_outcome(
         .await
         .ok()?;
     if !output.status.success() {
-        return None;
+        return squeue_active_outcome(cluster, job_id).await;
     }
     // Aggregate all sacct rows: handles both normal jobs (one row) and
     // array jobs (one row per element). Priority: any failure trumps all;
     // running > submitted > succeeded (so partial completion stays "running").
     let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(outcome) = parse_sacct_outcome(&stdout) {
+        return Some(outcome);
+    }
+
+    match probe_squeue(cluster, job_id).await {
+        SqueueProbe::Active(outcome) => Some(outcome),
+        SqueueProbe::Absent => absent_scheduler_outcome(
+            run.created_at,
+            util::now_ts(),
+            cluster.scheduler.missing_job_grace_secs,
+        ),
+        SqueueProbe::Unavailable => None,
+    }
+}
+
+fn parse_sacct_outcome(stdout: &str) -> Option<SchedulerOutcome> {
     let mut best: Option<String> = None;
     let mut latest_end: Option<i64> = None;
     for line in stdout.lines() {
@@ -1755,6 +1936,96 @@ async fn scheduler_outcome(
     Some(SchedulerOutcome {
         status,
         finished_at: latest_end,
+    })
+}
+
+#[derive(Debug)]
+enum SqueueProbe {
+    Active(SchedulerOutcome),
+    Absent,
+    Unavailable,
+}
+
+async fn squeue_active_outcome(cluster: &ClusterConfig, job_id: &str) -> Option<SchedulerOutcome> {
+    match probe_squeue(cluster, job_id).await {
+        SqueueProbe::Active(outcome) => Some(outcome),
+        SqueueProbe::Absent | SqueueProbe::Unavailable => None,
+    }
+}
+
+async fn probe_squeue(cluster: &ClusterConfig, job_id: &str) -> SqueueProbe {
+    let output = match Command::new(&cluster.scheduler.squeue)
+        .args(["-h", "-j", job_id, "-o", "%T"])
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(_) => return SqueueProbe::Unavailable,
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        return if stderr.contains("invalid job id") || stderr.contains("invalid job") {
+            SqueueProbe::Absent
+        } else {
+            SqueueProbe::Unavailable
+        };
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match parse_squeue_outcome(&stdout) {
+        Some(outcome) => SqueueProbe::Active(outcome),
+        None if stdout.trim().is_empty() => SqueueProbe::Absent,
+        None => SqueueProbe::Unavailable,
+    }
+}
+
+fn parse_squeue_outcome(stdout: &str) -> Option<SchedulerOutcome> {
+    let mut best: Option<String> = None;
+    for line in stdout.lines() {
+        let state = line.split_whitespace().next().unwrap_or("").trim();
+        if state.is_empty() {
+            continue;
+        }
+        let status = match state {
+            "PENDING" | "CONFIGURING" | "SUSPENDED" | "RESV_DEL_HOLD" | "REQUEUE_HOLD" => {
+                "submitted"
+            }
+            "RUNNING" | "COMPLETING" | "STAGE_OUT" => "running",
+            "COMPLETED" => "succeeded",
+            "CANCELLED" => "cancelled",
+            "TIMEOUT" => "timeout",
+            "OUT_OF_MEMORY" => "oom",
+            "FAILED" | "BOOT_FAIL" | "DEADLINE" | "NODE_FAIL" | "PREEMPTED" => "failed",
+            // `squeue` is the active-job authority. Unknown/new states must
+            // not be guessed terminal; leave the PG row untouched.
+            _ => return None,
+        }
+        .to_string();
+        best = Some(match (best.as_deref(), status.as_str()) {
+            (_, "failed" | "timeout" | "oom" | "cancelled") => status,
+            (None, _) => status,
+            (Some("running"), _) => "running".to_string(),
+            (Some("submitted"), "running") => "running".to_string(),
+            (Some("submitted"), _) => best.unwrap(),
+            (Some("succeeded"), "running") => "running".to_string(),
+            (Some("succeeded"), "submitted") => "running".to_string(),
+            _ => best.unwrap(),
+        });
+    }
+    best.map(|status| SchedulerOutcome {
+        status,
+        finished_at: None,
+    })
+}
+
+fn absent_scheduler_outcome(
+    created_at: i64,
+    now: i64,
+    missing_job_grace_secs: u64,
+) -> Option<SchedulerOutcome> {
+    let age = now.saturating_sub(created_at);
+    (age >= missing_job_grace_secs as i64).then_some(SchedulerOutcome {
+        status: "unknown_terminal".to_string(),
+        finished_at: Some(now),
     })
 }
 
@@ -1968,6 +2239,118 @@ mod tests {
     };
     use serde_json::json;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn cache_follower_snapshot_rejects_provenance_drift() {
+        let recipe = dummy_recipe();
+        let recipe_hash = util::canonical_value_hash(
+            &serde_json::to_value(&recipe).unwrap(),
+            RECIPE_HASH_VERSION,
+        );
+        let inputs = vec![InputResolution {
+            role: "source".to_string(),
+            artifact_id: Some("artifact_input".to_string()),
+            resolved_path: PathBuf::from("/tmp/input"),
+        }];
+        let original = provenance::RepoProvenance {
+            repo_path: PathBuf::from("/repo"),
+            git_head: Some("abc123".to_string()),
+            git_status_porcelain: None,
+            git_diff_head: None,
+            diff_hash: None,
+            uv_lock_hash: Some("lock-a".to_string()),
+            uv_lock_path: None,
+            untracked_files_hash: None,
+        };
+        let expected = compute_cache_key(&recipe_hash, &original, &inputs, &recipe.params).unwrap();
+        validate_cache_follower_snapshot(
+            "run_follower",
+            &recipe,
+            &recipe_hash,
+            &original,
+            &inputs,
+            &expected,
+        )
+        .expect("the persisted submit-time snapshot must validate");
+
+        let mut live_repo_later = original.clone();
+        live_repo_later.untracked_files_hash = Some("new-untracked-file".to_string());
+        let err = validate_cache_follower_snapshot(
+            "run_follower",
+            &recipe,
+            &recipe_hash,
+            &live_repo_later,
+            &inputs,
+            &expected,
+        )
+        .expect_err("a recaptured live repository must not satisfy the follower key");
+        assert!(err.to_string().contains("does not reproduce its cache key"));
+    }
+
+    #[test]
+    fn cache_hit_requires_every_declared_output_role() {
+        let temp = tempfile::tempdir().unwrap();
+        let dataset_path = temp.path().join("dataset");
+        let metrics_path = temp.path().join("metrics");
+        std::fs::create_dir_all(&dataset_path).unwrap();
+        std::fs::create_dir_all(&metrics_path).unwrap();
+        let outputs = BTreeMap::from([
+            (
+                "dataset".to_string(),
+                OutputResolution {
+                    role: "dataset".to_string(),
+                    kind: "dataset".to_string(),
+                    alias: "dataset".to_string(),
+                    marker: None,
+                    path: dataset_path.clone(),
+                },
+            ),
+            (
+                "metrics".to_string(),
+                OutputResolution {
+                    role: "metrics".to_string(),
+                    kind: "eval_result".to_string(),
+                    alias: "metrics".to_string(),
+                    marker: None,
+                    path: metrics_path.clone(),
+                },
+            ),
+        ]);
+        let artifact = |id: &str, role: &str, path: PathBuf| crate::store::ArtifactRow {
+            id: id.to_string(),
+            kind: "dataset".to_string(),
+            path,
+            producer_run_id: Some("run_leader".to_string()),
+            metadata_json: json!({"role": role}),
+            created_at: 1,
+        };
+        let only_dataset = vec![artifact("artifact_dataset", "dataset", dataset_path)];
+        assert!(!cache_hit_outputs_valid(&only_dataset, &outputs));
+        let complete = vec![
+            only_dataset[0].clone(),
+            artifact("artifact_metrics", "metrics", metrics_path),
+        ];
+        assert!(cache_hit_outputs_valid(&complete, &outputs));
+    }
+
+    #[test]
+    fn old_job_absent_from_sacct_and_squeue_seals_unknown_terminal() {
+        assert!(parse_sacct_outcome("").is_none());
+        assert!(parse_squeue_outcome("").is_none());
+        assert!(absent_scheduler_outcome(1_000, 1_599, 600).is_none());
+        let outcome = absent_scheduler_outcome(1_000, 1_600, 600).unwrap();
+        assert_eq!(outcome.status, "unknown_terminal");
+        assert_eq!(outcome.finished_at, Some(1_600));
+    }
+
+    #[test]
+    fn squeue_unknown_state_fails_open() {
+        assert!(parse_squeue_outcome("FUTURE_SLURM_STATE\n").is_none());
+        assert_eq!(
+            parse_squeue_outcome("PENDING\nRUNNING\n").unwrap().status,
+            "running"
+        );
+    }
 
     fn integration_cluster() -> ClusterConfig {
         let path = std::env::var("LABCTL_TEST_CLUSTER")
