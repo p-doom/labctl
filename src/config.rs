@@ -209,6 +209,53 @@ pub struct PgConfig {
     /// user's agent + CLI + UI process group.
     #[serde(default = "default_pg_max_connections")]
     pub max_connections: u32,
+    /// How long `pool.acquire()` waits for a free connection before
+    /// giving up. Without a bound, a pool starved by slow queries makes
+    /// every caller — including interactive `labctl status` — hang
+    /// indefinitely instead of failing. Defaults to 10s.
+    #[serde(default = "default_pg_acquire_timeout_secs")]
+    pub acquire_timeout_secs: u64,
+    /// Idle connections are closed after this long. Bounds the "ten
+    /// connections idle for six days" state observed on the shared
+    /// instance. Defaults to 600s.
+    #[serde(default = "default_pg_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// Hard lifetime for any pooled connection, idle or not. Recycles
+    /// backends so a leaked session or a bloated per-backend cache
+    /// can't persist indefinitely. Defaults to 1800s.
+    #[serde(default = "default_pg_max_lifetime_secs")]
+    pub max_lifetime_secs: u64,
+    /// Server-side `statement_timeout` applied per session. The
+    /// backstop that makes a runaway query self-cancel instead of
+    /// pinning a pool slot forever. `0` disables. Defaults to 30s.
+    #[serde(default = "default_pg_statement_timeout_ms")]
+    pub statement_timeout_ms: u64,
+    /// Server-side `idle_session_timeout` applied per session. `0`
+    /// disables. Defaults to 3600s — comfortably above `idle_timeout`
+    /// so the client-side reaper normally wins and this only catches
+    /// sessions the pool has lost track of.
+    #[serde(default = "default_pg_idle_session_timeout_ms")]
+    pub idle_session_timeout_ms: u64,
+    /// Per-session `log_min_duration_statement`. Makes slow queries
+    /// visible in the PG log for labctl's own sessions only.
+    ///
+    /// Deliberately per-session rather than a `postgresql.conf` change:
+    /// the shared instance currently has this at `-1` (nothing has ever
+    /// been logged), and flipping it globally would start logging every
+    /// other user's traffic too. That is an operator decision, not
+    /// labctl's. `-1` disables. Defaults to 5000ms.
+    #[serde(default = "default_pg_log_min_duration_ms")]
+    pub log_min_duration_statement_ms: i64,
+    /// Per-session `max_parallel_workers_per_gather`.
+    ///
+    /// The shared instance runs on a login node under a 2-core CPU
+    /// quota. Parallel sequential scans against a 2-core cap add worker
+    /// startup and tuple-queue overhead while contending for the very
+    /// cores the leader needs, so a parallel plan can be slower than
+    /// the serial one. `1` keeps one worker available; `0` forces
+    /// serial plans. Negative leaves the server default untouched.
+    #[serde(default = "default_pg_max_parallel_workers_per_gather")]
+    pub max_parallel_workers_per_gather: i32,
 }
 
 fn default_pg_port() -> u16 {
@@ -221,6 +268,34 @@ fn default_pg_db() -> String {
 
 fn default_pg_max_connections() -> u32 {
     8
+}
+
+fn default_pg_acquire_timeout_secs() -> u64 {
+    10
+}
+
+fn default_pg_idle_timeout_secs() -> u64 {
+    600
+}
+
+fn default_pg_max_lifetime_secs() -> u64 {
+    1800
+}
+
+fn default_pg_statement_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_pg_idle_session_timeout_ms() -> u64 {
+    3_600_000
+}
+
+fn default_pg_log_min_duration_ms() -> i64 {
+    5_000
+}
+
+fn default_pg_max_parallel_workers_per_gather() -> i32 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

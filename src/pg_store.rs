@@ -23,10 +23,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use sqlx::{
-    PgPool, Row,
+    Executor, PgPool, Row,
     migrate::Migrator,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
@@ -61,8 +63,7 @@ impl PgStore {
             )
         })?;
         let opts = build_connect_options(pg)?;
-        let pool = PgPoolOptions::new()
-            .max_connections(pg.max_connections)
+        let pool = build_pool_options(pg)
             .connect_with(opts)
             .await
             .with_context(|| {
@@ -2051,6 +2052,70 @@ fn build_connect_options(pg: &PgConfig) -> Result<PgConnectOptions> {
         opts = opts.password(&pw);
     }
     Ok(opts)
+}
+
+/// Build the connection-pool policy.
+///
+/// **This is a mitigation, not a root-cause fix.** None of these
+/// settings makes a slow query fast or a wedged reconcile correct; what
+/// they do is convert an unbounded hang into a fast, legible error.
+/// Before this, the pool set only `max_connections`: a caller that
+/// couldn't get a connection waited forever, a connection once idle
+/// stayed idle indefinitely (ten were observed idle for six days), and
+/// with the server's `statement_timeout`, `idle_session_timeout` and
+/// `idle_in_transaction_session_timeout` all at `0`, nothing anywhere
+/// in the stack bounded a single query. The real fixes are the
+/// blob-free projection, the idempotent artifact insert, and the
+/// reconcile step isolation.
+///
+/// The session GUCs are set per-connection via `after_connect` rather
+/// than in `postgresql.conf`, so they apply to labctl's sessions and
+/// nobody else's on the shared instance. Server config is the
+/// operator's call.
+fn build_pool_options(pg: &PgConfig) -> PgPoolOptions {
+    let statement_timeout_ms = pg.statement_timeout_ms;
+    let idle_session_timeout_ms = pg.idle_session_timeout_ms;
+    let log_min_duration_ms = pg.log_min_duration_statement_ms;
+    let max_parallel_workers = pg.max_parallel_workers_per_gather;
+
+    PgPoolOptions::new()
+        .max_connections(pg.max_connections)
+        .acquire_timeout(Duration::from_secs(pg.acquire_timeout_secs))
+        .idle_timeout(Duration::from_secs(pg.idle_timeout_secs))
+        .max_lifetime(Duration::from_secs(pg.max_lifetime_secs))
+        .after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                // `SET` only accepts a literal here, and these values
+                // come from our own typed config (u64/i64/i32), not
+                // from user input — no injection surface.
+                let mut stmts = vec![
+                    format!("SET statement_timeout = {statement_timeout_ms}"),
+                    format!("SET idle_session_timeout = {idle_session_timeout_ms}"),
+                    // A transaction left open holds row locks and
+                    // pins its snapshot, blocking autovacuum from
+                    // reclaiming dead tuples registry-wide. Bound it
+                    // to the statement timeout.
+                    format!(
+                        "SET idle_in_transaction_session_timeout = {}",
+                        statement_timeout_ms
+                    ),
+                ];
+                if log_min_duration_ms >= 0 {
+                    stmts.push(format!(
+                        "SET log_min_duration_statement = {log_min_duration_ms}"
+                    ));
+                }
+                if max_parallel_workers >= 0 {
+                    stmts.push(format!(
+                        "SET max_parallel_workers_per_gather = {max_parallel_workers}"
+                    ));
+                }
+                for stmt in stmts {
+                    conn.execute(stmt.as_str()).await?;
+                }
+                Ok(())
+            })
+        })
 }
 
 // Column lists kept in sync with migrations/0001_initial_schema.sql.
