@@ -2832,4 +2832,218 @@ mod tests {
             .expect("cleanup");
         found.clear();
     }
+
+    // ---------------------------------------------------------------
+    // Idempotent artifact registration.
+    //
+    // These run against a *throwaway* PG (see `crate::test_support`),
+    // never the shared registry.
+    // ---------------------------------------------------------------
+
+    /// Registering the same artifact twice succeeds both times and
+    /// leaves exactly one row.
+    ///
+    /// Before `ON CONFLICT DO NOTHING`, the second call raised
+    /// `duplicate key value violates unique constraint
+    /// "artifacts_pkey"`. Because `register_outputs` re-runs on every
+    /// reconcile tick for as long as a run stays non-terminal, that
+    /// error repeated once a minute per affected run — 121,988 of them
+    /// in the production log.
+    #[tokio::test]
+    #[ignore = "requires a throwaway PG; see crate::test_support"]
+    async fn insert_artifact_is_idempotent() {
+        use crate::store::Store;
+        use crate::test_support::*;
+
+        let Some(cluster) = test_cluster("idempotent_artifact") else {
+            eprintln!("LABCTL_TEST_PG_HOST unset; skipping");
+            return;
+        };
+        let store = Store::connect(&cluster).await.expect("connect");
+        let suffix = unique_suffix();
+        let user = format!("__test_user_{suffix}");
+        store
+            .insert_user(&user, crate::util::now_ts())
+            .await
+            .expect("insert_user");
+        let path = staging_dir(&cluster, &user, &format!("alias_{suffix}"));
+
+        let first = store
+            .insert_artifact("dataset", &path, None, &serde_json::json!({"n": 1}))
+            .await
+            .expect("first insert_artifact");
+
+        // The re-register. This is the call that used to blow up.
+        let second = store
+            .insert_artifact("dataset", &path, None, &serde_json::json!({"n": 2}))
+            .await
+            .expect("second insert_artifact must succeed (idempotent)");
+
+        assert_eq!(
+            first.id, second.id,
+            "re-registering the same path must resolve to the same artifact",
+        );
+
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE path = $1")
+            .bind(path.display().to_string())
+            .fetch_one(store.pg().pool())
+            .await
+            .expect("count");
+        assert_eq!(count, 1, "exactly one row must survive two registrations");
+
+        // First-write-wins: the no-op insert must not have clobbered
+        // the original metadata.
+        assert_eq!(
+            second.metadata_json["n"], 1,
+            "the surviving row is the original, not the re-registration",
+        );
+    }
+
+    /// A path already registered under a *different* kind is not a
+    /// benign duplicate and must not be silently adopted. Guards the
+    /// one case where `ON CONFLICT DO NOTHING` could otherwise hide a
+    /// genuine conflict.
+    #[tokio::test]
+    #[ignore = "requires a throwaway PG; see crate::test_support"]
+    async fn insert_artifact_rejects_kind_mismatch() {
+        use crate::store::Store;
+        use crate::test_support::*;
+
+        let Some(cluster) = test_cluster("artifact_kind_mismatch") else {
+            eprintln!("LABCTL_TEST_PG_HOST unset; skipping");
+            return;
+        };
+        let store = Store::connect(&cluster).await.expect("connect");
+        let suffix = unique_suffix();
+        let user = format!("__test_user_{suffix}");
+        store
+            .insert_user(&user, crate::util::now_ts())
+            .await
+            .expect("insert_user");
+        let path = staging_dir(&cluster, &user, &format!("alias_{suffix}"));
+
+        store
+            .insert_artifact("dataset", &path, None, &serde_json::json!({}))
+            .await
+            .expect("first insert");
+        let err = store
+            .insert_artifact("checkpoint", &path, None, &serde_json::json!({}))
+            .await
+            .expect_err("kind mismatch must be rejected, not silently adopted");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already registered as kind"),
+            "unexpected error: {msg}",
+        );
+    }
+
+    /// `update_status` cannot violate `runs_finished_at_sane`, whatever
+    /// timestamp it is handed. The in-statement `GREATEST(ts,
+    /// created_at)` clamp is the invariant guard behind the
+    /// `scheduler_outcome` fix.
+    #[tokio::test]
+    #[ignore = "requires a throwaway PG; see crate::test_support"]
+    async fn update_status_clamps_reversed_finished_at() {
+        use crate::store::Store;
+        use crate::test_support::*;
+
+        let Some(cluster) = test_cluster("clamp_finished_at") else {
+            eprintln!("LABCTL_TEST_PG_HOST unset; skipping");
+            return;
+        };
+        let store = Store::connect(&cluster).await.expect("connect");
+        let (_user, run_id) = seed_run(
+            &store,
+            &cluster,
+            &serde_json::json!({"schema_version": 1}),
+            "running",
+            Some(&format!("{}", 900_000 + rand_small())),
+        )
+        .await
+        .expect("seed_run");
+
+        let created_at = store.get_run(&run_id).await.expect("get_run").created_at;
+
+        // A day before the run existed — exactly what a recycled
+        // job_id's sacct row produced in production.
+        store
+            .update_status(&run_id, "succeeded", Some(created_at - 86_400))
+            .await
+            .expect("update_status must not violate runs_finished_at_sane");
+
+        let row = store.get_run(&run_id).await.expect("get_run");
+        assert_eq!(row.status, "succeeded");
+        assert_eq!(
+            row.finished_at,
+            Some(created_at),
+            "reversed finished_at must be clamped up to created_at",
+        );
+    }
+
+    /// The `after_connect` session settings are actually applied to
+    /// pooled connections.
+    ///
+    /// Without this, `build_pool_options` would be an untestable
+    /// assertion about intent: a typo'd GUC name or a silently-dropped
+    /// hook leaves every session on the server defaults (all `0` on the
+    /// shared instance) while the code *looks* correct.
+    #[tokio::test]
+    #[ignore = "requires a throwaway PG; see crate::test_support"]
+    async fn session_settings_are_applied_to_pooled_connections() {
+        use crate::test_support::*;
+
+        let Some(cluster) = test_cluster("session_settings") else {
+            eprintln!("LABCTL_TEST_PG_HOST unset; skipping");
+            return;
+        };
+        let pg_cfg = cluster.postgres.as_ref().expect("[postgres]");
+        // Confirm the defaults we expect to be in force.
+        assert_eq!(pg_cfg.statement_timeout_ms, 30_000);
+        assert_eq!(pg_cfg.max_parallel_workers_per_gather, 1);
+
+        let store = PgStore::connect(&cluster).await.expect("connect");
+
+        let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(store.pool())
+            .await
+            .expect("SHOW statement_timeout");
+        assert_eq!(statement_timeout, "30s", "statement_timeout not applied");
+
+        let idle_in_txn: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+            .fetch_one(store.pool())
+            .await
+            .expect("SHOW idle_in_transaction_session_timeout");
+        assert_eq!(
+            idle_in_txn, "30s",
+            "idle_in_transaction timeout not applied"
+        );
+
+        let idle_session: String = sqlx::query_scalar("SHOW idle_session_timeout")
+            .fetch_one(store.pool())
+            .await
+            .expect("SHOW idle_session_timeout");
+        assert_eq!(idle_session, "1h", "idle_session_timeout not applied");
+
+        let parallel: String = sqlx::query_scalar("SHOW max_parallel_workers_per_gather")
+            .fetch_one(store.pool())
+            .await
+            .expect("SHOW max_parallel_workers_per_gather");
+        assert_eq!(parallel, "1", "max_parallel_workers_per_gather not applied");
+
+        let slow_log: String = sqlx::query_scalar("SHOW log_min_duration_statement")
+            .fetch_one(store.pool())
+            .await
+            .expect("SHOW log_min_duration_statement");
+        assert_eq!(slow_log, "5s", "log_min_duration_statement not applied");
+    }
+
+    /// Cheap non-colliding small integer for synthetic job ids
+    /// (`runs_job_id_unique` is a partial unique index).
+    fn rand_small() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64
+    }
 }
