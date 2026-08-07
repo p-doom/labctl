@@ -1438,10 +1438,21 @@ impl PgStore {
     ) -> Result<()> {
         let terminal = is_terminal(status);
         let ts = finished_at.unwrap_or_else(crate::util::now_ts);
+        // `GREATEST(ts, created_at)` is an invariant guard, not a
+        // correction: it makes `runs_finished_at_sane` (finished_at >=
+        // created_at) unviolatable by this statement for *any* caller,
+        // whatever timestamp they hand us. The upstream defect that
+        // produced reversed timestamps lives in `runner::
+        // scheduler_outcome` (a recycled SLURM job_id whose sacct row
+        // predates the run) and is fixed there; this clamp is the
+        // structural backstop so a future bad writer degrades to a
+        // slightly-wrong duration instead of aborting the status write
+        // and livelocking the run. Clamping in-statement also avoids a
+        // read-then-write race on created_at.
         sqlx::query(
             "UPDATE runs
              SET status = $1,
-                 finished_at = CASE WHEN $2 THEN $3 ELSE finished_at END
+                 finished_at = CASE WHEN $2 THEN GREATEST($3, created_at) ELSE finished_at END
              WHERE id = $4",
         )
         .bind(status)
@@ -1454,8 +1465,10 @@ impl PgStore {
         Ok(())
     }
 
+    /// Set `finished_at`, clamped to `created_at`. Same invariant guard
+    /// as `update_status` — see the comment there.
     pub async fn set_finished_at(&self, run_id: &str, finished_at: i64) -> Result<()> {
-        sqlx::query("UPDATE runs SET finished_at=$1 WHERE id=$2")
+        sqlx::query("UPDATE runs SET finished_at=GREATEST($1, created_at) WHERE id=$2")
             .bind(finished_at)
             .bind(run_id)
             .execute(&self.pool)

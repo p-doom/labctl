@@ -1690,13 +1690,37 @@ async fn submit_script(
     }
 }
 
-/// Query sacct for the run's State and End. We pass ``--starttime`` derived
-/// from the run's ``created_at`` (minus a 1-day buffer) so that very old jobs
-/// still appear, and so a recycled job_id can't return a row from a different
-/// run that ran much later. ``TZ=UTC`` is forced so we can parse End without
-/// ambiguity. Returns ``None`` only if sacct itself can't be invoked or
-/// returns nonzero — an unparseable End is fine, we just leave finished_at
-/// empty and let the caller fall back.
+/// Clock-skew allowance on the sacct `--starttime` lower bound.
+///
+/// The bound is the run's own `created_at`, which is stamped by
+/// `insert_run` *before* `sbatch` — so the job's start is always at or
+/// after it and no legitimate row is excluded, however old the run.
+/// The slack exists only because `created_at` comes from the labctl
+/// host's clock while sacct reports the SLURM controller's; five
+/// minutes is far beyond any NTP-synced disagreement and far below the
+/// hours-to-days needed to admit a recycled job_id's row.
+///
+/// This replaces a 24-hour buffer. That buffer admitted sacct rows for
+/// jobs that ran up to a day *before* the run existed — a recycled
+/// job_id — whose `End` then landed in `finished_at` and violated the
+/// `runs_finished_at_sane` check constraint, aborting the status write
+/// and leaving the run permanently non-terminal.
+const SACCT_CLOCK_SKEW_SLACK_SECS: i64 = 300;
+
+/// Query sacct for the run's State and End. We pass ``--starttime``
+/// derived from the run's ``created_at`` (minus a small clock-skew
+/// allowance, see `SACCT_CLOCK_SKEW_SLACK_SECS`) so that very old jobs
+/// still appear while rows predating the run — which can only come from
+/// a recycled job_id — are excluded. ``TZ=UTC`` is forced so we can
+/// parse End without ambiguity. Returns ``None`` only if sacct itself
+/// can't be invoked or returns nonzero — an unparseable End is fine, we
+/// just leave finished_at empty and let the caller fall back.
+///
+/// Residual, deliberately not addressed here: a job_id recycled to a
+/// job that ran *later* than this run is still admitted, because
+/// `--starttime` is a lower bound and we have no upper bound to give
+/// (the run's own end is exactly what we're trying to learn). Detecting
+/// that needs a recorded submit-time upper bound on the row.
 async fn scheduler_outcome(
     cluster: &ClusterConfig,
     run: &crate::store::RunRow,
@@ -1705,7 +1729,7 @@ async fn scheduler_outcome(
         return None;
     }
     let job_id = run.job_id.as_ref()?;
-    let starttime = fmt_starttime_utc((run.created_at - 86_400).max(0));
+    let starttime = fmt_starttime_utc((run.created_at - SACCT_CLOCK_SKEW_SLACK_SECS).max(0));
     let output = Command::new(&cluster.scheduler.sacct)
         .env("TZ", "UTC")
         .args([
@@ -1737,7 +1761,28 @@ async fn scheduler_outcome(
         let state = state_field.split_whitespace().next().unwrap_or("").trim();
         let end_field = parts.next().unwrap_or("").trim();
         let status = map_slurm_state(state);
-        if let Some(ts) = parse_sacct_end_utc(end_field) {
+        let end = parse_sacct_end_utc(end_field);
+        // A job cannot have finished before the run row that submitted
+        // it was created: `created_at` is stamped at `insert_run`, which
+        // strictly precedes `sbatch`. An End earlier than `created_at`
+        // therefore proves this sacct row belongs to a *different* job
+        // that recycled the same job_id. The row is not ours — drop it
+        // whole (State as well as End), because its State would be just
+        // as wrong as its End.
+        if let Some(ts) = end
+            && ts < run.created_at
+        {
+            tracing::warn!(
+                run_id = %run.id,
+                job_id = %job_id,
+                sacct_end = ts,
+                created_at = run.created_at,
+                "scheduler_outcome: sacct row ends before the run was created; \
+                 treating job_id as recycled and ignoring the row",
+            );
+            continue;
+        }
+        if let Some(ts) = end {
             latest_end = Some(latest_end.map_or(ts, |prev: i64| prev.max(ts)));
         }
         best = Some(match (best.as_deref(), status.as_str()) {
