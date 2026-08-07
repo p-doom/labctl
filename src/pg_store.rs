@@ -266,10 +266,14 @@ impl PgStore {
         rows.into_iter().map(row_to_run).collect()
     }
 
-    /// Look up an artifact by its on-disk path. Returns the first match.
-    /// Note: the PG schema doesn't constrain `(path)` to be unique on its
-    /// own, so callers that need disambiguation must filter further on
-    /// the client side (e.g. by `kind`).
+    /// Look up an artifact by its on-disk path. At most one row can
+    /// match: `migrations/0001_initial_schema.sql` declares
+    /// `CONSTRAINT artifacts_path_unique UNIQUE (path)`.
+    ///
+    /// (An earlier version of this comment claimed the schema does *not*
+    /// constrain `(path)`; that was wrong, and the `Store` wrapper's
+    /// client-side `kind` filter was built on the false premise. See
+    /// `Store::find_artifact_by_path`.)
     pub async fn find_artifact_by_path(&self, path: &str) -> Result<Option<ArtifactRow>> {
         let row = sqlx::query(&format!("{ARTIFACT_SELECT_BASE} WHERE path = $1 LIMIT 1"))
             .bind(path)
@@ -1460,8 +1464,42 @@ impl PgStore {
         Ok(())
     }
 
-    /// Insert an artifact row. DB-only: the caller owns the sidecar
-    /// (`.meta.json`) write and any other FS work.
+    /// Insert an artifact row, idempotently. DB-only: the caller owns
+    /// the sidecar (`.meta.json`) write and any other FS work.
+    ///
+    /// Returns `true` if a row was inserted, `false` if an equivalent
+    /// row already existed and the insert was a no-op.
+    ///
+    /// # Why `ON CONFLICT DO NOTHING` is semantically exact here
+    ///
+    /// Artifact identity is path-canonical: `Store::insert_artifact`
+    /// computes `id = "artifact_" + sha256(canonical_path)[..16]`, so
+    /// the id is a pure function of the (symlink-resolved) path. The
+    /// table carries *two* unique constraints, and both are keyed on
+    /// the same underlying thing — a location on disk:
+    ///
+    ///   * `artifacts_pkey (id)`         — the canonical path
+    ///   * `artifacts_path_unique (path)` — the staging path as stored
+    ///
+    /// The conflict target is deliberately left *untargeted* rather
+    /// than written `ON CONFLICT (id)`. The id is hashed from the
+    /// **canonical** path while the `path` column stores the
+    /// **staging** path (`Store::insert_artifact` passes `staging_path`,
+    /// not `canonical`), so the two can diverge — e.g. when the first
+    /// registration happened before the directory materialised and
+    /// `canonicalize()` fell back to the unresolved path, or when the
+    /// same directory is reached through a symlinked root. A re-insert
+    /// can therefore collide on `path` while *not* colliding on `id`,
+    /// and `ON CONFLICT (id)` would still raise a unique violation.
+    /// Untargeted `DO NOTHING` covers both indexes.
+    ///
+    /// In every case the pre-existing row denotes the same on-disk
+    /// artifact: colliding on `path` means literally the same path
+    /// string, and colliding on `id` means the same canonical path
+    /// (modulo a 128-bit sha256 collision). So swallowing the insert
+    /// cannot merge two genuinely distinct artifacts. Callers that need
+    /// the surviving row's identity re-read it — see
+    /// `Store::insert_artifact`, which resolves by id and then by path.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_artifact(
         &self,
@@ -1472,11 +1510,12 @@ impl PgStore {
         metadata: &Value,
         user: &str,
         created_at: i64,
-    ) -> Result<()> {
-        sqlx::query(
+    ) -> Result<bool> {
+        let result = sqlx::query(
             "INSERT INTO artifacts
              (id, kind, path, producer_run_id, metadata_json, created_at, \"user\")
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT DO NOTHING",
         )
         .bind(id)
         .bind(kind)
@@ -1488,7 +1527,7 @@ impl PgStore {
         .execute(&self.pool)
         .await
         .with_context(|| format!("insert_artifact({id})"))?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Upsert into the GLOBAL `artifact_aliases` table. Mirrors the

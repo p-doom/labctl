@@ -407,7 +407,8 @@ impl Store {
                 .context("artifact sidecar write join")??;
         }
 
-        self.pg
+        let inserted = self
+            .pg
             .insert_artifact(
                 &id,
                 kind,
@@ -418,6 +419,49 @@ impl Store {
                 now,
             )
             .await?;
+
+        // Re-registering an existing artifact is a normal, expected
+        // event, not an error: `register_outputs` re-runs on every
+        // reconcile tick for as long as a run stays non-terminal, and
+        // the output marker is on disk from the first tick onwards.
+        // Resolve whichever row survived. `id` covers a conflict on the
+        // primary key; the `path` fallback covers a conflict on
+        // `artifacts_path_unique` where the stored staging path matched
+        // but the canonical-path-derived id did not (see
+        // `PgStore::insert_artifact`).
+        let existing = if inserted {
+            None
+        } else {
+            match self.pg.get_artifact_optional(&id).await? {
+                Some(row) => Some(row),
+                None => {
+                    self.pg
+                        .find_artifact_by_path(&staging_path.display().to_string())
+                        .await?
+                }
+            }
+        };
+        if let Some(row) = &existing {
+            // A row at this exact path under a *different* kind is not
+            // a benign duplicate — it means two output specs disagree
+            // about what lives here, and silently returning the other
+            // kind would link the wrong artifact into run_outputs.
+            // Surface it. Callers isolate per-run failures
+            // (`runner::reconcile_one`), so this cannot livelock.
+            if row.kind != kind {
+                anyhow::bail!(
+                    "insert_artifact: {} already registered as kind {:?} (id {}), \
+                     refusing to re-register it as kind {:?}; two output specs \
+                     disagree about this path",
+                    staging_path.display(),
+                    row.kind,
+                    row.id,
+                    kind,
+                );
+            }
+            return Ok(row.clone());
+        }
+
         self.pg
             .rehydrate_inputs_by_path(&staging_path.display().to_string(), &id)
             .await?;
@@ -434,11 +478,15 @@ impl Store {
         self.get_artifact(&id).await
     }
 
-    /// Look up an artifact by `(kind, path)`. The PG `find_artifact_by_path`
-    /// query doesn't take a kind (the `(path)` column isn't unique on its
-    /// own — multiple kinds can in principle share a path), so we filter
-    /// the result by kind on the client side. Matches legacy semantics:
-    /// returns the unique row at this path for this kind, or `None`.
+    /// Look up an artifact by `(kind, path)`.
+    ///
+    /// `path` is UNIQUE in the schema (`artifacts_path_unique`), so at
+    /// most one row can match and the client-side `kind` filter is only
+    /// a guard, not disambiguation: it returns `None` when a row exists
+    /// at this path under a *different* kind. Callers therefore treat a
+    /// `None` as "not registered under my kind", and a subsequent
+    /// `insert_artifact` will fail loudly on the kind mismatch rather
+    /// than silently adopting the other kind's row.
     pub async fn find_artifact_by_path(
         &self,
         kind: &str,

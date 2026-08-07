@@ -1884,6 +1884,26 @@ async fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<u
             if !ready {
                 continue;
             }
+            // Short-circuit, mirroring the checkpoint_stream branch
+            // above. `ready` goes true the moment the marker file lands
+            // and stays true, so for a run that remains non-terminal
+            // this branch is re-entered on *every* reconcile tick
+            // (60s). Without the short-circuit each tick re-issued an
+            // insert for an already-registered path — the dominant
+            // source of the duplicate-key storm in the PG log.
+            // `Store::insert_artifact` is idempotent now, so this is a
+            // round-trip saving rather than a correctness fix, but it
+            // also keeps `count` honest: a re-registration is not a
+            // newly-registered artifact.
+            if let Some(existing) = store
+                .find_artifact_by_path(&resolution.kind, &resolution.path)
+                .await?
+            {
+                store.link_run_output(&run.id, role, &existing.id).await?;
+                store.set_alias(&resolution.alias, &existing.id).await?;
+                linked_outputs.push((role.clone(), existing.id.clone()));
+                continue;
+            }
             let mut metadata = json!({
                 "role": role,
                 "producer_recipe": run.recipe_name,
