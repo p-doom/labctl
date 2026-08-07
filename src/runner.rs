@@ -1061,6 +1061,29 @@ async fn complete_pending_submission(
 /// can drive reconciles with per-run mutex granularity (acquire, do one
 /// run, release; UI requests interleave between iterations) instead of
 /// holding a single lock for the whole pass.
+///
+/// # Step isolation
+///
+/// Every step is attempted independently and failures are accumulated,
+/// rather than the first error short-circuiting the rest with `?`. This
+/// is deliberate and is the core of the livelock fix.
+///
+/// The pathology it removes: the status write is the *first* step, and
+/// a run only leaves `list_active_runs` once its status is terminal. So
+/// under the old shape, any error at all — including one raised by a
+/// *later*, unrelated step — left the run non-terminal, the dispatch
+/// loop re-picked it 60s later, and it failed identically. Forever. Two
+/// concrete triggers were live in production (a duplicate-key insert in
+/// `register_outputs` and a `runs_finished_at_sane` violation from a
+/// recycled job_id), and both are fixed at source elsewhere in this
+/// change — but fixing individual triggers does not stop the *next*
+/// unanticipated write error from becoming the next storm. Isolation
+/// does: a failing step now costs one logged error per attempt instead
+/// of blocking every subsequent step and every subsequent attempt.
+///
+/// The returned `Err` is a *signal*, not a control-flow abort: it is
+/// produced only after all steps have run, and callers use it to drive
+/// per-run backoff (see `agent::ReconcileBackoff`).
 pub async fn reconcile_one(
     cluster: &ClusterConfig,
     store: &Store,
@@ -1070,28 +1093,81 @@ pub async fn reconcile_one(
         status_changed: false,
         artifacts_registered: 0,
     };
+    // Accumulated per-step failures. Reported as one aggregate error
+    // *after* every step has been attempted.
+    let mut failures: Vec<String> = Vec::new();
+
     let (status, finished_at) = scheduler_outcome(cluster, run)
         .await
         .map(|o| (o.status, o.finished_at))
         .unwrap_or_else(|| (run.status.clone(), None));
     if status != run.status {
-        store.update_status(&run.id, &status, finished_at).await?;
-        step.status_changed = true;
+        match store.update_status(&run.id, &status, finished_at).await {
+            Ok(()) => step.status_changed = true,
+            Err(e) => {
+                tracing::error!(
+                    run_id = %run.id,
+                    from = %run.status,
+                    to = %status,
+                    "reconcile: update_status failed: {e:#}",
+                );
+                failures.push(format!("update_status({} -> {status}): {e:#}", run.status));
+            }
+        }
     }
-    let current = store.get_run(&run.id).await?;
-    step.artifacts_registered += register_outputs(store, &current).await?;
+
+    // Re-read to pick up the status we may have just written. This one
+    // is genuinely fatal for the rest of the pass — every remaining
+    // step needs the current row — so it returns early. It is also a
+    // pure read of a single row by primary key, i.e. the step least
+    // likely to fail.
+    let current = match store.get_run(&run.id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(run_id = %run.id, "reconcile: get_run failed: {e:#}");
+            return Err(e.context(format!("reconcile_one({}): get_run", run.id)));
+        }
+    };
+
+    let artifacts_ok = match register_outputs(store, &current).await {
+        Ok(n) => {
+            step.artifacts_registered += n;
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                run_id = %current.id,
+                "reconcile: register_outputs failed: {e:#}",
+            );
+            failures.push(format!("register_outputs: {e:#}"));
+            false
+        }
+    };
+
     // Best-effort: a broken log parser or missing log file shouldn't
     // fail reconcile, but the error should surface so we can fix it.
+    // Warn-only, and deliberately not counted as a failure — it must
+    // not trip backoff, since it never blocks the run from settling.
     if let Err(e) = crate::tracking::try_populate_from_log(store, &current).await {
         tracing::warn!(
             run_id = %current.id,
             "tracking: try_populate_from_log failed: {e:#}",
         );
     }
+
     // Agent-driven cascade: if this run just reached a terminal state,
     // sweep its pending dependent stages and either advance (succeeded /
     // cache_hit) or cascade-fail them.
+    //
+    // Gated on `artifacts_ok` because children resolve their inputs
+    // against this run's registered outputs; advancing them before
+    // registration succeeded would resolve against a half-populated
+    // set. This preserves the previous behaviour (where the `?` on
+    // `register_outputs` skipped the cascade) and is safe to defer:
+    // `do_reconcile`'s retroactive orphan sweep re-attempts the
+    // cascade on every subsequent pass.
     if step.status_changed
+        && artifacts_ok
         && crate::store::is_terminal(&current.status)
         && let Err(e) = try_submit_pending_children(cluster, store, &current).await
     {
@@ -1099,8 +1175,19 @@ pub async fn reconcile_one(
             parent_run_id = %current.id,
             "reconcile cascade: try_submit_pending_children failed: {e:#}",
         );
+        failures.push(format!("try_submit_pending_children: {e:#}"));
     }
-    Ok(step)
+
+    if failures.is_empty() {
+        Ok(step)
+    } else {
+        Err(anyhow::anyhow!(
+            "reconcile_one({}): {} of the pass's steps failed [{}]",
+            run.id,
+            failures.len(),
+            failures.join("; "),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1117,11 +1204,19 @@ pub async fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<Reconci
     // registry — and must never touch another user's run rows.
     let submitted_by = crate::store::current_user()?;
     for run in store.list_active_runs(&submitted_by).await? {
-        let step = reconcile_one(cluster, store, &run).await?;
-        if step.status_changed {
-            runs_reconciled += 1;
+        // Per-run isolation, matching `agent::do_reconcile`: one bad run
+        // must not starve every run after it in the iteration order.
+        match reconcile_one(cluster, store, &run).await {
+            Ok(step) => {
+                if step.status_changed {
+                    runs_reconciled += 1;
+                }
+                artifacts_registered += step.artifacts_registered;
+            }
+            Err(e) => {
+                tracing::error!("reconcile: reconcile_one failed for {}: {e:#}", run.id);
+            }
         }
-        artifacts_registered += step.artifacts_registered;
     }
     // try_submit_pending_children inside reconcile_one only fires when
     // this pass observed the parent's status transition. Restart between
@@ -2013,4 +2108,320 @@ fn safe_job_name(name: &str) -> String {
         })
         .take(64)
         .collect()
+}
+
+#[cfg(test)]
+mod reconcile_isolation_tests {
+    //! Step-isolation ("livelock") tests for `reconcile_one`.
+    //!
+    //! Run against a *throwaway* PG only — see `crate::test_support`
+    //! for the isolation contract. `#[ignore]`d, so a bare `cargo test`
+    //! never touches a database.
+
+    use super::*;
+    use crate::store::Store;
+    use crate::test_support::*;
+
+    /// Guard: refuse to install fault-injection DDL anywhere that could
+    /// be the shared registry. `LABCTL_TEST_PG_HOST` is never set in
+    /// production, but the database name is checked too.
+    fn assert_throwaway(cluster: &ClusterConfig) {
+        let pg = cluster.postgres.as_ref().expect("[postgres] configured");
+        assert!(
+            std::env::var("LABCTL_TEST_PG_HOST").is_ok(),
+            "fault injection requires an explicitly-configured throwaway PG",
+        );
+        assert_ne!(
+            pg.database, "labctl",
+            "refusing to install a test trigger on the production database",
+        );
+    }
+
+    /// Install a BEFORE UPDATE trigger on `runs` that hard-fails any
+    /// update to `run_id`. A generic, realistic write fault: the client
+    /// sees an ordinary `sqlx` error, exactly as it would from a check
+    /// constraint.
+    ///
+    /// Deliberately *not* reusing either of the two real triggers
+    /// (duplicate key, `runs_finished_at_sane`) — both are fixed
+    /// elsewhere in this change, and the point of step isolation is
+    /// that it holds for faults nobody anticipated.
+    async fn wedge_status_writes(store: &Store, cluster: &ClusterConfig, run_id: &str) {
+        assert_throwaway(cluster);
+        let fn_name = format!("wedge_{}", run_id.replace('-', "_"));
+        // One command per statement: sqlx `query()` goes through the
+        // extended (prepared) protocol, which rejects multi-command
+        // strings with 42601.
+        for stmt in [
+            format!(
+                "CREATE OR REPLACE FUNCTION {fn_name}() RETURNS trigger AS $$
+                 BEGIN
+                     RAISE EXCEPTION 'injected fault: status write wedged for %', NEW.id;
+                 END;
+                 $$ LANGUAGE plpgsql"
+            ),
+            format!(
+                "CREATE TRIGGER {fn_name}_trg BEFORE UPDATE ON runs
+                     FOR EACH ROW WHEN (NEW.id = '{run_id}')
+                     EXECUTE FUNCTION {fn_name}()"
+            ),
+        ] {
+            sqlx::query(&stmt)
+                .execute(store.pg().pool())
+                .await
+                .expect("install fault-injection trigger");
+        }
+    }
+
+    async fn unwedge_status_writes(store: &Store, run_id: &str) {
+        let fn_name = format!("wedge_{}", run_id.replace('-', "_"));
+        for stmt in [
+            format!("DROP TRIGGER IF EXISTS {fn_name}_trg ON runs"),
+            format!("DROP FUNCTION IF EXISTS {fn_name}()"),
+        ] {
+            sqlx::query(&stmt)
+                .execute(store.pg().pool())
+                .await
+                .expect("remove fault-injection trigger");
+        }
+    }
+
+    /// Build a cluster whose `sacct` is a fake reporting COMPLETED at
+    /// `end_ts`.
+    fn cluster_with_fake_sacct(tag: &str, end_ts: i64) -> Option<ClusterConfig> {
+        let mut cluster = test_cluster(tag)?;
+        let bin_dir = scratch_root().join(tag).join("bin");
+        let script = fake_sacct(&bin_dir, &format!("COMPLETED|{}", sacct_end(end_ts)));
+        cluster.scheduler.sacct = script.display().to_string();
+        Some(cluster)
+    }
+
+    /// ★ THE LIVELOCK ASSERTION.
+    ///
+    /// When the *first* step (`update_status`) fails, every later step
+    /// must still run. Concretely: the artifact still gets registered.
+    ///
+    /// This is the non-vacuous form of the property. The obvious
+    /// phrasing — "a run whose artifact insert fails still reaches
+    /// terminal" — is *vacuously true even without the fix*, because
+    /// `update_status` runs before `register_outputs`, so the status
+    /// has already landed by the time the artifact step can fail. The
+    /// direction that actually distinguishes fixed from broken is the
+    /// reverse one, tested here.
+    ///
+    /// Falsification: replacing the `match` on `update_status` in
+    /// `reconcile_one` with the original `?` makes this test fail on
+    /// the `artifact was registered` assertion — the artifact row does
+    /// not exist, because the function returned before
+    /// `register_outputs` was ever called.
+    #[tokio::test]
+    #[ignore = "requires a throwaway PG; see crate::test_support"]
+    async fn status_write_failure_does_not_block_artifact_registration() {
+        let now = crate::util::now_ts();
+        let Some(cluster) = cluster_with_fake_sacct("livelock_status_wedged", now) else {
+            eprintln!("LABCTL_TEST_PG_HOST unset; skipping");
+            return;
+        };
+        let store = Store::connect(&cluster).await.expect("connect");
+
+        let suffix = unique_suffix();
+        let user = format!("__test_user_{suffix}");
+        let alias = format!("out_{suffix}");
+        let out_path = artifact_root(&cluster).join(&user).join(&alias);
+        let ctx = context_with_output("main", "dataset", &alias, &out_path, "DONE");
+
+        let (user, run_id) = {
+            // seed_run creates its own user; reuse its name for the
+            // artifact path so `decompose_artifact_path` accepts it.
+            let (u, r) = seed_run(&store, &cluster, &ctx, "running", Some(&fresh_job_id()))
+                .await
+                .expect("seed_run");
+            (u, r)
+        };
+
+        // Re-point the output at the *actual* user's subtree and mark
+        // it ready on disk.
+        let out_path = artifact_root(&cluster).join(&user).join(&alias);
+        std::fs::create_dir_all(&out_path).expect("mkdir output");
+        std::fs::write(out_path.join("DONE"), b"ok").expect("write marker");
+        let ctx = context_with_output("main", "dataset", &alias, &out_path, "DONE");
+        sqlx::query("UPDATE runs SET context_json = $1 WHERE id = $2")
+            .bind(sqlx::types::Json(&ctx))
+            .bind(&run_id)
+            .execute(store.pg().pool())
+            .await
+            .expect("repoint output path");
+
+        let run = store.get_run(&run_id).await.expect("get_run");
+        assert_eq!(run.status, "running", "precondition: run is non-terminal");
+
+        // Wedge the status write, then reconcile.
+        wedge_status_writes(&store, &cluster, &run_id).await;
+        let result = reconcile_one(&cluster, &store, &run).await;
+
+        // The failure is reported (so the caller can back off) ...
+        let err = result.expect_err("a wedged status write must be reported");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("update_status"),
+            "error should name the failing step, got: {msg}",
+        );
+
+        // ... the status did NOT change, as expected ...
+        let after = store.get_run(&run_id).await.expect("get_run");
+        assert_eq!(
+            after.status, "running",
+            "the wedged write must not have applied",
+        );
+
+        // ... but every *later* step still ran. This is the assertion
+        // that fails without the fix.
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE path = $1")
+            .bind(out_path.display().to_string())
+            .fetch_one(store.pg().pool())
+            .await
+            .expect("count artifacts");
+        assert_eq!(
+            count, 1,
+            "register_outputs must run even though update_status failed \
+             (this is the livelock: under the old `?` shape the artifact \
+             is never registered because the function returns first)",
+        );
+
+        // Recovery: with the fault cleared, the very next pass settles
+        // the run. A wedged run is not permanently poisoned.
+        unwedge_status_writes(&store, &run_id).await;
+        let run = store.get_run(&run_id).await.expect("get_run");
+        let step = reconcile_one(&cluster, &store, &run)
+            .await
+            .expect("clean pass after the fault is cleared");
+        assert!(step.status_changed, "run should transition once unwedged");
+        let settled = store.get_run(&run_id).await.expect("get_run");
+        assert_eq!(settled.status, "succeeded");
+        assert!(crate::store::is_terminal(&settled.status));
+    }
+
+    /// The other direction: when the artifact step fails, the run still
+    /// reaches terminal and the error is still reported.
+    ///
+    /// Weaker than the test above (the status write already precedes
+    /// the artifact step, so terminality held before the fix too), but
+    /// it pins the ordering guarantee against regressions — if anyone
+    /// reorders `register_outputs` ahead of `update_status`, this
+    /// starts failing.
+    #[tokio::test]
+    #[ignore = "requires a throwaway PG; see crate::test_support"]
+    async fn artifact_failure_still_settles_the_run() {
+        let now = crate::util::now_ts();
+        let Some(cluster) = cluster_with_fake_sacct("livelock_artifact_fails", now) else {
+            eprintln!("LABCTL_TEST_PG_HOST unset; skipping");
+            return;
+        };
+        let store = Store::connect(&cluster).await.expect("connect");
+
+        let suffix = unique_suffix();
+        let alias = format!("out_{suffix}");
+        let (user, run_id) = seed_run(
+            &store,
+            &cluster,
+            &serde_json::json!({"schema_version": 1}),
+            "running",
+            Some(&fresh_job_id()),
+        )
+        .await
+        .expect("seed_run");
+
+        let out_path = artifact_root(&cluster).join(&user).join(&alias);
+        std::fs::create_dir_all(&out_path).expect("mkdir output");
+        std::fs::write(out_path.join("DONE"), b"ok").expect("write marker");
+
+        // Poison the artifact step: claim this path under a different
+        // kind, so `Store::insert_artifact` refuses to re-register it
+        // as `dataset`.
+        store
+            .insert_artifact("checkpoint", &out_path, None, &serde_json::json!({}))
+            .await
+            .expect("pre-register under a conflicting kind");
+
+        let ctx = context_with_output("main", "dataset", &alias, &out_path, "DONE");
+        sqlx::query("UPDATE runs SET context_json = $1 WHERE id = $2")
+            .bind(sqlx::types::Json(&ctx))
+            .bind(&run_id)
+            .execute(store.pg().pool())
+            .await
+            .expect("set outputs");
+
+        let run = store.get_run(&run_id).await.expect("get_run");
+        let err = reconcile_one(&cluster, &store, &run)
+            .await
+            .expect_err("the artifact failure must be reported");
+        assert!(
+            format!("{err:#}").contains("register_outputs"),
+            "error should name the failing step: {err:#}",
+        );
+
+        let after = store.get_run(&run_id).await.expect("get_run");
+        assert_eq!(
+            after.status, "succeeded",
+            "the status write must land despite the artifact failure",
+        );
+        assert!(crate::store::is_terminal(&after.status));
+        assert!(
+            after.finished_at.is_some(),
+            "terminal runs must carry finished_at",
+        );
+    }
+
+    /// A recycled job_id whose sacct row predates the run is discarded
+    /// rather than written. Root-cause fix for the
+    /// `runs_finished_at_sane` violations.
+    #[tokio::test]
+    #[ignore = "requires a throwaway PG; see crate::test_support"]
+    async fn recycled_job_id_row_is_ignored() {
+        let now = crate::util::now_ts();
+        // sacct reports a COMPLETED row that ended a day before the run
+        // was created — impossible for this run's job.
+        let Some(cluster) = cluster_with_fake_sacct("recycled_job_id", now - 86_400) else {
+            eprintln!("LABCTL_TEST_PG_HOST unset; skipping");
+            return;
+        };
+        let store = Store::connect(&cluster).await.expect("connect");
+        let (_user, run_id) = seed_run(
+            &store,
+            &cluster,
+            &serde_json::json!({"schema_version": 1}),
+            "running",
+            Some(&fresh_job_id()),
+        )
+        .await
+        .expect("seed_run");
+
+        let run = store.get_run(&run_id).await.expect("get_run");
+        let step = reconcile_one(&cluster, &store, &run)
+            .await
+            .expect("must not error");
+        assert!(
+            !step.status_changed,
+            "a row predating the run must not drive a status transition",
+        );
+        let after = store.get_run(&run_id).await.expect("get_run");
+        assert_eq!(
+            after.status, "running",
+            "the run keeps its real status; the recycled row is discarded",
+        );
+        assert!(after.finished_at.is_none());
+    }
+
+    /// Unique synthetic job id — `runs_job_id_unique` is a partial
+    /// unique index over non-NULL job_ids.
+    fn fresh_job_id() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        format!("{}", base.wrapping_add(n) % 1_000_000_000)
+    }
 }

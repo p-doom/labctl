@@ -21,7 +21,12 @@
 //! flake doesn't kill the daemon. systemd's `Restart=on-failure` is the
 //! safety net for panics.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use tokio::sync::Notify;
@@ -32,6 +37,100 @@ use crate::{
     store::Store,
     util,
 };
+
+/// Upper bound on the reconcile retry interval for a persistently
+/// failing run.
+///
+/// The trade this encodes: a run that keeps failing to reconcile is, by
+/// definition, not settling — so retrying it at the base interval buys
+/// nothing and costs a log line plus a round-trip every tick, per run.
+/// At 15 minutes a wedged run still gets 96 attempts a day (so it
+/// self-heals promptly once the underlying cause is fixed, with no
+/// operator action) while a fleet-wide fault produces ~1/15th the error
+/// volume of an un-backed-off loop.
+///
+/// The cost is bounded and known: a run that fails once transiently and
+/// would have settled on the next tick settles up to this much later
+/// instead. Only reached after ~5 consecutive failures at a 60s base.
+const RECONCILE_BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
+
+/// Per-run exponential backoff for reconcile failures.
+///
+/// Purely in-memory and intentionally so: it is a rate limiter, not
+/// state. An agent restart clearing it is the desired behaviour —
+/// a restart usually means new code, which deserves a fresh attempt at
+/// every run. Nothing here is a schema change.
+#[derive(Debug)]
+pub(crate) struct ReconcileBackoff {
+    base: Duration,
+    cap: Duration,
+    entries: HashMap<String, BackoffEntry>,
+}
+
+#[derive(Debug)]
+struct BackoffEntry {
+    consecutive_failures: u32,
+    retry_after: Instant,
+}
+
+impl ReconcileBackoff {
+    pub(crate) fn new(base: Duration, cap: Duration) -> Self {
+        Self {
+            base,
+            cap,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// True if `run_id` failed recently enough that we should skip it
+    /// this pass.
+    pub(crate) fn is_deferred(&self, run_id: &str, now: Instant) -> bool {
+        self.entries
+            .get(run_id)
+            .is_some_and(|e| now < e.retry_after)
+    }
+
+    /// Record a failed reconcile. Returns the delay now in force, for
+    /// logging.
+    pub(crate) fn record_failure(&mut self, run_id: &str, now: Instant) -> Duration {
+        let entry = self
+            .entries
+            .entry(run_id.to_string())
+            .or_insert(BackoffEntry {
+                consecutive_failures: 0,
+                retry_after: now,
+            });
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        // base * 2^(n-1), saturating at `cap`. `checked_mul` on the u32
+        // exponent keeps a long-lived wedged run from overflowing.
+        let factor = 1u32
+            .checked_shl(entry.consecutive_failures - 1)
+            .unwrap_or(u32::MAX);
+        let delay = self
+            .base
+            .checked_mul(factor)
+            .unwrap_or(self.cap)
+            .min(self.cap);
+        entry.retry_after = now + delay;
+        delay
+    }
+
+    /// Clear a run's backoff after a clean pass.
+    pub(crate) fn record_success(&mut self, run_id: &str) {
+        self.entries.remove(run_id);
+    }
+
+    /// Drop entries for runs that are no longer active, so the map
+    /// tracks the active set rather than growing without bound.
+    pub(crate) fn retain_active(&mut self, active: &HashSet<String>) {
+        self.entries.retain(|id, _| active.contains(id));
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 /// Spawn reconcile + evald + gc tokio tasks. Returns their join
 /// handles so the caller can `.await` each on shutdown — without that
@@ -126,13 +225,16 @@ async fn reconcile_loop(
     shutdown: Arc<Notify>,
 ) {
     let interval = Duration::from_secs(dispatch.reconcile_interval_secs);
+    // Per-run failure backoff, owned by the loop so it persists across
+    // passes (and dies with the process — see `ReconcileBackoff`).
+    let mut backoff = ReconcileBackoff::new(interval, RECONCILE_BACKOFF_CAP);
     // Run once immediately on boot so the registry isn't stale waiting
     // for the first tick.
-    do_reconcile(&cluster, &store).await;
+    do_reconcile(&cluster, &store, &mut backoff).await;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {
-                do_reconcile(&cluster, &store).await;
+                do_reconcile(&cluster, &store, &mut backoff).await;
             }
             _ = shutdown.notified() => {
                 tracing::info!("labctl dispatch: reconcile_loop shutdown");
@@ -142,7 +244,7 @@ async fn reconcile_loop(
     }
 }
 
-async fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
+async fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>, backoff: &mut ReconcileBackoff) {
     // Scope to runs this daemon's OS user submitted: in a multi-tenant
     // deployment each user runs their own daemon over a shared
     // filesystem-truth registry, and a daemon that reconciles another
@@ -162,23 +264,44 @@ async fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
             return;
         }
     };
+    // Forget runs that have left the active set; keeps the backoff map
+    // sized to the active set rather than to all runs ever seen.
+    backoff.retain_active(&runs.iter().map(|r| r.id.clone()).collect());
+
     let mut runs_reconciled = 0usize;
     let mut artifacts_registered = 0usize;
+    let mut deferred = 0usize;
     for run in runs {
+        let now = Instant::now();
+        if backoff.is_deferred(&run.id, now) {
+            deferred += 1;
+            continue;
+        }
         match runner::reconcile_one(cluster, store, &run).await {
             Ok(step) => {
+                backoff.record_success(&run.id);
                 if step.status_changed {
                     runs_reconciled += 1;
                 }
                 artifacts_registered += step.artifacts_registered;
             }
             Err(e) => {
+                // `reconcile_one` isolates its own steps, so by the time
+                // it returns Err every step has been attempted and any
+                // that could succeed has. The error is a signal to slow
+                // this run down, not a reason to abandon the pass.
+                let delay = backoff.record_failure(&run.id, now);
                 tracing::error!(
+                    run_id = %run.id,
+                    retry_in_secs = delay.as_secs(),
                     "labctl dispatch: reconcile_one failed for {}: {e:#}",
                     run.id
                 );
             }
         }
+    }
+    if deferred > 0 {
+        tracing::debug!("labctl dispatch: {deferred} run(s) deferred by reconcile backoff");
     }
     // Retroactive child-advance sweep — covers the gap where the agent
     // restarted between a parent's terminal transition and the in-pass
@@ -585,5 +708,106 @@ mod tests {
         for a in &actions {
             assert!(matches!(a, ThrottleAction::Release(_)));
         }
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    //! Pure unit tests for `ReconcileBackoff` — no DB, no clock sleeps.
+    //! `Instant` is passed in so time can be advanced synthetically.
+
+    use super::*;
+
+    const BASE: Duration = Duration::from_secs(60);
+    const CAP: Duration = Duration::from_secs(900);
+
+    #[test]
+    fn unknown_run_is_never_deferred() {
+        let b = ReconcileBackoff::new(BASE, CAP);
+        assert!(!b.is_deferred("run_x", Instant::now()));
+    }
+
+    /// The livelock's rate-limiting half: a run that keeps failing must
+    /// not be retried every tick forever.
+    #[test]
+    fn failure_defers_the_next_attempt() {
+        let mut b = ReconcileBackoff::new(BASE, CAP);
+        let t0 = Instant::now();
+        let delay = b.record_failure("run_x", t0);
+        assert_eq!(delay, BASE, "first failure waits one base interval");
+        // Still inside the window — the next tick must skip this run.
+        assert!(b.is_deferred("run_x", t0 + Duration::from_secs(59)));
+        // Window elapsed — eligible again.
+        assert!(!b.is_deferred("run_x", t0 + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn consecutive_failures_back_off_exponentially() {
+        let mut b = ReconcileBackoff::new(BASE, CAP);
+        let t = Instant::now();
+        assert_eq!(b.record_failure("run_x", t), Duration::from_secs(60));
+        assert_eq!(b.record_failure("run_x", t), Duration::from_secs(120));
+        assert_eq!(b.record_failure("run_x", t), Duration::from_secs(240));
+        assert_eq!(b.record_failure("run_x", t), Duration::from_secs(480));
+    }
+
+    /// A permanently-failing run must plateau, not grow without bound
+    /// (and must not overflow the shift).
+    #[test]
+    fn backoff_saturates_at_the_cap() {
+        let mut b = ReconcileBackoff::new(BASE, CAP);
+        let t = Instant::now();
+        for _ in 0..200 {
+            let d = b.record_failure("run_x", t);
+            assert!(d <= CAP, "delay {d:?} exceeded cap {CAP:?}");
+        }
+        assert_eq!(
+            b.record_failure("run_x", t),
+            CAP,
+            "a wedged run settles at the cap, still retrying ~96x/day",
+        );
+    }
+
+    /// Recovery must be immediate: one clean pass clears the penalty,
+    /// so a fixed run isn't held back by its failure history.
+    #[test]
+    fn success_clears_the_backoff() {
+        let mut b = ReconcileBackoff::new(BASE, CAP);
+        let t = Instant::now();
+        b.record_failure("run_x", t);
+        b.record_failure("run_x", t);
+        assert!(b.is_deferred("run_x", t + Duration::from_secs(1)));
+        b.record_success("run_x");
+        assert!(!b.is_deferred("run_x", t + Duration::from_secs(1)));
+        // And the exponent resets, rather than resuming where it left off.
+        assert_eq!(b.record_failure("run_x", t), BASE);
+    }
+
+    #[test]
+    fn failures_are_tracked_per_run() {
+        let mut b = ReconcileBackoff::new(BASE, CAP);
+        let t = Instant::now();
+        b.record_failure("run_a", t);
+        assert!(b.is_deferred("run_a", t + Duration::from_secs(1)));
+        assert!(
+            !b.is_deferred("run_b", t + Duration::from_secs(1)),
+            "one bad run must not throttle any other run",
+        );
+    }
+
+    /// The map tracks the active set, so a long-lived agent doesn't
+    /// accumulate an entry for every run it has ever seen.
+    #[test]
+    fn retain_active_prunes_departed_runs() {
+        let mut b = ReconcileBackoff::new(BASE, CAP);
+        let t = Instant::now();
+        b.record_failure("run_a", t);
+        b.record_failure("run_b", t);
+        assert_eq!(b.tracked(), 2);
+        let active: HashSet<String> = ["run_b".to_string()].into_iter().collect();
+        b.retain_active(&active);
+        assert_eq!(b.tracked(), 1);
+        assert!(!b.is_deferred("run_a", t + Duration::from_secs(1)));
+        assert!(b.is_deferred("run_b", t + Duration::from_secs(1)));
     }
 }
