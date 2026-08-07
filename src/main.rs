@@ -14,6 +14,8 @@ mod server;
 mod service;
 mod store;
 mod template;
+#[cfg(test)]
+mod test_support;
 mod tracking;
 mod util;
 
