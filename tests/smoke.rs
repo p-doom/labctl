@@ -26,7 +26,7 @@ fn example_clusters_parse() {
 
 #[test]
 fn example_recipes_parse() {
-    for name in ["train", "eval", "sweep", "eval_from"] {
+    for name in ["train", "eval", "sweep", "eval_from", "hetjob"] {
         validate(&format!("examples/recipes/{name}.toml"));
     }
 }

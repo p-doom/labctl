@@ -478,6 +478,37 @@ pub struct Resources {
     /// prepends the `#SBATCH ` prefix.
     #[serde(default)]
     pub sbatch_extra: Vec<String>,
+    /// Additional heterogeneous-job components (SLURM het job). Each entry
+    /// becomes a `#SBATCH hetjob` separator followed by its own directive
+    /// block, so one recipe can allocate, say, a CPU node for an environment
+    /// fleet alongside the GPU node that trains against it — co-scheduled,
+    /// and torn down together when the job ends.
+    ///
+    /// The fields above describe component 0. The batch script body runs on
+    /// component 0 only (SLURM semantics), so `command` is responsible for
+    /// launching work on the others via `srun --het-group=N`.
+    #[serde(default)]
+    pub components: Vec<HetComponent>,
+}
+
+/// One extra component of a heterogeneous job. Mirrors the subset of
+/// [`Resources`] that SLURM accepts per component; `time`, `qos`, `account`
+/// and dependencies stay job-wide and are taken from [`Resources`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HetComponent {
+    #[serde(default)]
+    pub gpus: u32,
+    pub cpus: u32,
+    pub mem: String,
+    /// `--nodes` for this component. Defaults to 1 when unset.
+    #[serde(default)]
+    pub nodes: Option<u32>,
+    #[serde(default)]
+    pub partition: Option<String>,
+    /// Same escape hatch as [`Resources::sbatch_extra`], scoped to this
+    /// component's directive block.
+    #[serde(default)]
+    pub sbatch_extra: Vec<String>,
 }
 
 impl Default for Resources {
@@ -492,6 +523,7 @@ impl Default for Resources {
             account: None,
             exclude_nodes: None,
             sbatch_extra: Vec::new(),
+            components: Vec::new(),
         }
     }
 }
