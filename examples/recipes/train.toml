@@ -2,7 +2,7 @@
 
 name    = "train_example"
 repo    = "myrepo"
-command = ["python", "scripts/train.py", "--out", "{outputs.checkpoint.dir}"]
+command = ["python", "scripts/train.py", "--out", "{outputs.checkpoint.path}"]
 
 [resources]
 gpus = 1

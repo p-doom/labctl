@@ -33,9 +33,9 @@ This makes the W&B URL fully derivable from `(entity, project, run_id)` —
 no per-run sentinel file required.
 
 ### Templated args
-Anything in `[args]`, `[outputs.<role>.alias]`, or values in `[env]` may
-reference these tokens; labctl substitutes them before rendering the
-sbatch script:
+`command`, anything in `[args]`, `[outputs.<role>.alias]`, and values in
+`[env]` may reference these tokens; labctl substitutes them before
+rendering the sbatch script:
 
 | Token                    | Meaning                                       |
 |--------------------------|-----------------------------------------------|
@@ -47,7 +47,9 @@ sbatch script:
 | `{outputs.<role>.path}`  | Absolute path where the output is expected.   |
 
 Any leftover `{...}` token at submission time is a hard error — labctl will
-not submit a recipe with unresolved templates.
+not submit a recipe with unresolved templates. Only the labctl token shape
+(`{word(.word)*}`) is treated as a token, so inline JSON in a `bash -c`
+command passes through untouched.
 
 ### Status writing
 labctl wraps your command with a `write_status` helper that emits
