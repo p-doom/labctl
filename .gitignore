@@ -1,1 +1,7 @@
 *.log
+
+# Build artifacts. Without these a `git add -A` in a built checkout stages
+# thousands of files, including a ~120 MB debug binary.
+/target
+ui/node_modules/
+ui/dist/
