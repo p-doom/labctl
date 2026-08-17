@@ -5,7 +5,7 @@ repo    = "myrepo"
 command = [
   "python", "scripts/eval.py",
   "--checkpoint", "{inputs.checkpoint.path}",
-  "--out", "{outputs.result.dir}",
+  "--out", "{outputs.result.path}",
 ]
 
 [resources]

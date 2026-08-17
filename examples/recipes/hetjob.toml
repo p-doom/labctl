@@ -13,7 +13,7 @@ name    = "hetjob_example"
 repo    = "myrepo"
 command = [
   "bash", "-c",
-  "srun --het-group=0 python scripts/env_fleet.py & srun --het-group=1 python scripts/train.py --out {outputs.checkpoint.dir}; wait",
+  "srun --het-group=0 python scripts/env_fleet.py & srun --het-group=1 python scripts/train.py --out {outputs.checkpoint.path}; wait",
 ]
 
 [resources]

@@ -1460,7 +1460,16 @@ fn render_script(
         inputs,
         outputs,
     };
-    let mut command = recipe.command.clone();
+    // `command` is templated like every other user-authored string. Without
+    // this a token such as {outputs.result.path} reaches the job verbatim and
+    // fails at runtime inside the user's program — and render_value's
+    // unresolved-token guard never sees it, so nothing catches it at submit
+    // time. The shipped example recipes all put tokens in `command`.
+    let mut command = recipe
+        .command
+        .iter()
+        .map(|part| render_value(part, &ctx))
+        .collect::<Result<Vec<_>>>()?;
     for (key, value) in &recipe.args {
         command.push(format!("--{}={}", key, render_value(value, &ctx)?));
     }
@@ -1620,7 +1629,12 @@ fn render_script(
         script.push_str(&format!("export {key}={}\n", util::shell_quote(value)));
     }
     for (key, value) in &recipe.env {
-        script.push_str(&format!("export {key}={}\n", util::shell_quote(value)));
+        // Templated, as RECIPE_CONTRACT documents — an [env] value is the
+        // natural way to hand a computed output path to a `bash -c` command.
+        script.push_str(&format!(
+            "export {key}={}\n",
+            util::shell_quote(&render_value(value, &ctx)?)
+        ));
     }
     script.push_str(&format!(
         "export LABCTL_RUN_ID={}\n",
@@ -2095,5 +2109,102 @@ time = "12:00:00"
             format!("{err}").contains("bare flags"),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod template_site_tests {
+    use super::*;
+
+    fn cluster() -> ClusterConfig {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/clusters/single-user.toml");
+        toml::from_str(&std::fs::read_to_string(path).expect("read example cluster"))
+            .expect("parse example cluster")
+    }
+
+    fn render(recipe_toml: &str) -> Result<String> {
+        let recipe: Recipe = toml::from_str(recipe_toml).expect("parse recipe");
+        let mut outputs = BTreeMap::new();
+        outputs.insert("result".to_string(), PathBuf::from("/artifacts/result-42"));
+        render_script(
+            &cluster(),
+            &recipe,
+            "run_test",
+            Path::new("/tmp/labctl-test/run"),
+            Path::new("/tmp/labctl-test/src"),
+            &[],
+            &outputs,
+            &[],
+            None,
+        )
+    }
+
+    const BASE: &str = r#"
+name = "t"
+repo = "myrepo"
+"#;
+
+    const RES: &str = r#"
+[resources]
+gpus = 0
+cpus = 1
+mem  = "2GB"
+time = "00:05:00"
+
+[outputs.result]
+type   = "eval_result"
+marker = "metrics.json"
+alias  = "t_{run.id}"
+"#;
+
+    #[test]
+    fn output_token_in_command_is_substituted() {
+        let script = render(&format!(
+            "{BASE}command = [\"python\", \"train.py\", \"--out\", \"{{outputs.result.path}}\"]\n{RES}"
+        ))
+        .expect("render");
+        assert!(
+            script.contains("/artifacts/result-42"),
+            "token not substituted:\n{script}"
+        );
+        assert!(
+            !script.contains("{outputs.result.path}"),
+            "literal token survived:\n{script}"
+        );
+    }
+
+    #[test]
+    fn output_token_in_env_is_substituted() {
+        let script = render(&format!(
+            "{BASE}command = [\"true\"]\n\n[env]\nRESULT_DIR = \"{{outputs.result.path}}\"\n{RES}"
+        ))
+        .expect("render");
+        assert!(
+            script.contains("export RESULT_DIR=/artifacts/result-42")
+                || script.contains("export RESULT_DIR='/artifacts/result-42'"),
+            "env token not substituted:\n{script}"
+        );
+    }
+
+    #[test]
+    fn unknown_token_in_command_fails_at_submit() {
+        let err = render(&format!(
+            "{BASE}command = [\"python\", \"--out\", \"{{outputs.typo.path}}\"]\n{RES}"
+        ))
+        .expect_err("unknown token must not submit");
+        assert!(
+            format!("{err}").contains("unresolved template token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn json_braces_in_command_are_left_alone() {
+        let script = render(&format!(
+            "{BASE}command = [\"bash\", \"-c\", \"echo '{{\\\"ok\\\": true}}'\"]\n{RES}"
+        ))
+        .expect("json braces must not trip the token guard");
+        assert!(script.contains("ok"), "command missing:\n{script}");
     }
 }
