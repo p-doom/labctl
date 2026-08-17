@@ -1571,6 +1571,42 @@ fn render_script(
             }
             script.push_str(&format!("#SBATCH {trimmed}\n"));
         }
+        // Heterogeneous components. Everything above described component 0;
+        // each entry here opens a new component with `#SBATCH hetjob` and
+        // its own directives. Job-wide settings (time, qos, account,
+        // dependencies, log paths) are deliberately NOT repeated — SLURM
+        // takes those from the first component.
+        for (idx, comp) in recipe.resources.components.iter().enumerate() {
+            script.push_str("#SBATCH hetjob\n");
+            script.push_str(&format!("#SBATCH --nodes={}\n", comp.nodes.unwrap_or(1)));
+            script.push_str(&format!("#SBATCH --cpus-per-task={}\n", comp.cpus));
+            script.push_str(&format!("#SBATCH --mem={}\n", comp.mem));
+            if let Some(partition) = comp.partition.as_ref().or(cluster.slurm.partition.as_ref()) {
+                script.push_str(&format!("#SBATCH --partition={partition}\n"));
+            }
+            if comp.gpus > 0 {
+                let syntax = cluster
+                    .slurm
+                    .gres_gpu_syntax
+                    .as_deref()
+                    .unwrap_or("gpu:{n}")
+                    .replace("{n}", &comp.gpus.to_string());
+                script.push_str(&format!("#SBATCH --gres={syntax}\n"));
+            }
+            for extra in &comp.sbatch_extra {
+                let trimmed = extra.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.starts_with('#') {
+                    bail!(
+                        "resources.components[{idx}].sbatch_extra entries must be bare flags \
+                         (e.g. \"--exclusive\"); labctl prepends the #SBATCH prefix. Got: {extra:?}"
+                    );
+                }
+                script.push_str(&format!("#SBATCH {trimmed}\n"));
+            }
+        }
     } else {
         script.push_str("#!/usr/bin/env bash\n");
     }
@@ -1948,4 +1984,116 @@ fn safe_job_name(name: &str) -> String {
         })
         .take(64)
         .collect()
+}
+
+#[cfg(test)]
+mod het_tests {
+    use super::*;
+
+    fn cluster() -> ClusterConfig {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/clusters/single-user.toml");
+        let text = std::fs::read_to_string(path).expect("read example cluster");
+        toml::from_str(&text).expect("parse example cluster")
+    }
+
+    fn render(recipe_toml: &str) -> String {
+        let recipe: Recipe = toml::from_str(recipe_toml).expect("parse recipe");
+        render_script(
+            &cluster(),
+            &recipe,
+            "run_test",
+            Path::new("/tmp/labctl-test/run"),
+            Path::new("/tmp/labctl-test/src"),
+            &[],
+            &BTreeMap::new(),
+            &[],
+            None,
+        )
+        .expect("render script")
+    }
+
+    const BASE: &str = r#"
+name    = "t"
+repo    = "myrepo"
+command = ["true"]
+
+[resources]
+gpus = 0
+cpus = 48
+mem  = "256GB"
+time = "12:00:00"
+"#;
+
+    #[test]
+    fn no_components_emits_no_hetjob_separator() {
+        let script = render(BASE);
+        assert!(
+            !script.contains("hetjob"),
+            "plain recipes must stay het-free:\n{script}"
+        );
+    }
+
+    #[test]
+    fn components_emit_one_separator_and_own_directives() {
+        let script = render(&format!(
+            "{BASE}\n[[resources.components]]\ngpus = 4\ncpus = 16\nmem = \"128GB\"\nnodes = 1\n"
+        ));
+        assert_eq!(
+            script.matches("#SBATCH hetjob").count(),
+            1,
+            "one separator per extra component:\n{script}"
+        );
+        assert!(
+            script.contains("#SBATCH --gres=gpu:4"),
+            "component gres missing:\n{script}"
+        );
+        assert!(
+            script.contains("#SBATCH --cpus-per-task=16"),
+            "component cpus missing:\n{script}"
+        );
+        assert!(
+            script.contains("#SBATCH --mem=128GB"),
+            "component mem missing:\n{script}"
+        );
+        assert!(
+            script.contains("#SBATCH --nodes=1"),
+            "component nodes missing:\n{script}"
+        );
+        // Job-wide directives belong to component 0 only.
+        assert_eq!(
+            script.matches("#SBATCH --time=").count(),
+            1,
+            "time must not repeat:\n{script}"
+        );
+        // Component 0's own resources survive.
+        assert!(
+            script.contains("#SBATCH --cpus-per-task=48"),
+            "component 0 cpus missing:\n{script}"
+        );
+    }
+
+    #[test]
+    fn component_sbatch_extra_rejects_hash_prefix() {
+        let recipe: Recipe = toml::from_str(&format!(
+            "{BASE}\n[[resources.components]]\ngpus = 1\ncpus = 2\nmem = \"8GB\"\nsbatch_extra = [\"#SBATCH --exclusive\"]\n"
+        ))
+        .expect("parse recipe");
+        let err = render_script(
+            &cluster(),
+            &recipe,
+            "run_test",
+            Path::new("/tmp/labctl-test/run"),
+            Path::new("/tmp/labctl-test/src"),
+            &[],
+            &BTreeMap::new(),
+            &[],
+            None,
+        )
+        .expect_err("should reject a #SBATCH-prefixed entry");
+        assert!(
+            format!("{err}").contains("bare flags"),
+            "unexpected error: {err}"
+        );
+    }
 }

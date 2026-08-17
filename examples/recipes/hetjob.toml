@@ -1,0 +1,34 @@
+# Heterogeneous job: one recipe, two co-scheduled SLURM components.
+#
+# Component 0 (the fields in [resources]) runs the batch script body and is
+# where `command` executes. Component 1 is declared under
+# [[resources.components]] and is reached with `srun --het-group=1`.
+#
+# Use this when a job needs two different machine shapes that must live and
+# die together — e.g. a CPU node serving environment VMs alongside the GPU
+# node training against them. Co-scheduling avoids the GPUs idling while the
+# CPU side queues, and SLURM tears both down when the script exits.
+
+name    = "hetjob_example"
+repo    = "myrepo"
+command = [
+  "bash", "-c",
+  "srun --het-group=0 python scripts/env_fleet.py & srun --het-group=1 python scripts/train.py --out {outputs.checkpoint.dir}; wait",
+]
+
+[resources]
+gpus = 0
+cpus = 48
+mem  = "256GB"
+time = "12:00:00"
+
+[[resources.components]]
+gpus  = 4
+cpus  = 16
+mem   = "128GB"
+nodes = 1
+
+[outputs.checkpoint]
+type   = "checkpoint_stream"
+marker = "manifest.ocdbt"
+alias  = "hetjob_{run.id}"

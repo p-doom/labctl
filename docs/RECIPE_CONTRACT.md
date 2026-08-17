@@ -153,6 +153,51 @@ project = "fit"
 group   = "qwen3vl-replay"
 ```
 
+## Heterogeneous jobs
+
+Some work needs two machine shapes at once — e.g. a CPU node serving
+environment VMs alongside the GPU node training against them. Declaring the
+second shape as a *separate* run costs you the two things that make the
+pairing work: co-scheduling (the GPUs would idle while the CPU side queues)
+and coupled teardown (a crashed trainer would leave the fleet holding a node).
+
+`[[resources.components]]` allocates them as one SLURM heterogeneous job:
+
+```toml
+[resources]          # component 0
+gpus = 0
+cpus = 48
+mem  = "256GB"
+time = "12:00:00"
+
+[[resources.components]]   # component 1
+gpus  = 4
+cpus  = 16
+mem   = "128GB"
+nodes = 1
+```
+
+Each entry emits a `#SBATCH hetjob` separator and its own directive block.
+Job-wide settings — `time`, `qos`, `account`, dependencies and log paths —
+are taken from component 0 and deliberately not repeated, per SLURM's
+semantics.
+
+Note what SLURM does with the batch script: **the body runs on component 0
+only**. Your `command` is therefore responsible for placing work on the other
+components with `srun --het-group=N`:
+
+```toml
+command = [
+  "bash", "-c",
+  "srun --het-group=0 python scripts/fleet.py & srun --het-group=1 python scripts/train.py; wait",
+]
+```
+
+Run state needs no special handling: `sacct -j <job_id>` reports one row per
+component, which labctl aggregates the same way it already aggregates array
+elements (any failure trumps; running outranks succeeded), and
+`scancel <job_id>` cancels every component.
+
 ## Escape hatches
 
 - **Custom env**: anything not covered by `[tracking.*]` belongs in `[env]`.
