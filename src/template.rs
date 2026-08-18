@@ -57,11 +57,22 @@ pub fn render_value(template: &str, ctx: &RenderContext<'_>) -> Result<String> {
 /// substitution. We deliberately only match the labctl token shape — bare
 /// ``{`` and ``}`` characters from inline JSON or other content are
 /// allowed through. Returns the first such token, or None.
+///
+/// ``${VAR}`` is shell parameter expansion, not a labctl token, and is
+/// skipped: since `command` and `[env]` started being rendered, the two
+/// syntaxes share a document, and a script writing ``${HOME}`` must not
+/// fail at submit. Other expansion forms (``${VAR:-default}``,
+/// ``${#arr[@]}``) already fall out of the token scan on their
+/// non-identifier bytes.
 fn find_unresolved_token(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        if i > 0 && bytes[i - 1] == b'$' {
             i += 1;
             continue;
         }
@@ -144,5 +155,44 @@ mod tests {
         let c = ctx("r", &args, &params, &outputs, &[]);
         assert!(render_value("{args.does_not_exist}", &c).is_err());
         assert!(render_value("{recipe.unknown}", &c).is_err());
+    }
+
+    /// `${VAR}` is shell parameter expansion, not a labctl token. Since
+    /// `command` and `[env]` are rendered, a script using it must still
+    /// submit.
+    #[test]
+    fn shell_parameter_expansion_is_not_a_token() {
+        let (args, params, outputs) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let c = ctx("r", &args, &params, &outputs, &[]);
+        for script in [
+            "echo ${LABCTL_RUN_ID}",
+            "cd ${HOME} && ./run.sh",
+            "echo ${VAR:-default}",
+            "echo ${#items[@]}",
+            "out=${1}; echo ${out}/metrics.json",
+        ] {
+            assert_eq!(render_value(script, &c).unwrap(), script, "{script}");
+        }
+    }
+
+    /// The `$` exemption is positional, not a blanket escape: a real
+    /// token elsewhere in the same string must still be caught.
+    #[test]
+    fn unknown_token_beside_shell_expansion_still_errors() {
+        let (args, params, outputs) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let c = ctx("r", &args, &params, &outputs, &[]);
+        assert!(render_value("echo ${HOME} {outputs.typo.path}", &c).is_err());
+    }
+
+    /// A labctl token still renders when a shell expansion sits next to
+    /// it — the guard skips `${…}`, it doesn't stop substitution.
+    #[test]
+    fn token_renders_alongside_shell_expansion() {
+        let (args, params, outputs) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let c = ctx("r", &args, &params, &outputs, &[]);
+        assert_eq!(
+            render_value("${HOME}/{run.id}", &c).unwrap(),
+            "${HOME}/run_abc"
+        );
     }
 }
