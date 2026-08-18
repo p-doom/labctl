@@ -119,6 +119,72 @@ submit. Bind the alias to a unique key (e.g. `{run.id}`,
 - nonzero → status `failed`, no outputs registered (markers may exist
   partially; labctl skips them).
 
+### Browsable rollouts
+
+The UI's rollout viewer replays GUI trajectories straight off disk, but only
+for an output declared `type = "eval_result"` **with** a `marker`. labctl
+parses that marker file as JSON and stores it verbatim as the artifact's
+`metadata.result`; everything the viewer knows comes from that blob. No
+marker, no `result`, no rollout.
+
+A result counts as browsable when it carries `traj_path`, or `gif_path`, or a
+non-empty `runs` array. Two layouts resolve to actual files:
+
+- **Multi** — `result.runs` is an array of objects, one per episode, each
+  with a `subdir` relative to the artifact path. Episode *i* is read from
+  `<artifact_path>/<runs[i].subdir>/trajectory.jsonl` and
+  `<artifact_path>/<runs[i].subdir>/steps/`. Each entry labels its tab with
+  `instruction`, falling back to `slug`; keep `index` equal to the entry's
+  position in the array, since the tab sends `index` and the server resolves
+  by position.
+- **Single** — `result.traj_path` is an *absolute* path to the trajectory
+  file; frames are read from a `steps/` directory beside it. `task` is
+  ignored. (`gif_path` alone marks a point browsable but resolves to
+  nothing — pair it with `traj_path`.)
+
+Two filenames are hardcoded, and they are the easy mistake:
+
+- In the multi shape the trajectory must be named exactly
+  **`trajectory.jsonl`**. Nothing else is looked for. (The single shape may
+  name it anything, because you hand over the full path.)
+- Frames must be named **`step_%03d.png`** — `step_000.png`, `step_001.png`,
+  … The viewer builds the path from the frame index rather than listing or
+  sorting the directory, so any other name is unreachable and a gap in the
+  numbering is a hole it cannot skip past.
+
+`frame_count`, by contrast, is a count of *every* `*.png` under `steps/`, so
+it matches the fetchable index space only when `steps/` holds exactly one PNG
+per step and nothing else. A job that also writes `step_000_after.png` (as
+today's OSWorld eval does) reports roughly double its real step count, and
+the back half of the scrubber 404s.
+
+The trajectory is JSON-lines — one object per step, in frame order (blank
+lines are skipped, unparseable ones silently dropped). Four fields are read:
+
+| Field      | Meaning                                                       |
+|------------|---------------------------------------------------------------|
+| `step_num` | Frame this row jumps to when clicked; keep it = line position. |
+| `action`   | Action string, shown per-frame and in the trajectory table.    |
+| `response` | Model output; the literal `"<reset>"` renders as a dash.       |
+| `reward`   | Number, colour-coded zero / partial / full.                    |
+
+A multi-shape example in production — the OSWorld CUA eval, whose
+`eval_result` artifact carries `marker = "completed.json"`:
+
+```
+<artifact_path>/completed.json     # marker; its JSON becomes metadata.result
+<artifact_path>/task_000_multi.chrome.wikipedia_transformers_article/
+    trajectory.jsonl               # 65 lines, step_num 0…64
+    steps/step_000.png … step_064.png   # + step_NNN_after.png, hence the
+                                        #   inflated frame_count above
+```
+
+with `result.runs[0] = {"index": 0, "subdir":
+"task_000_multi.chrome.wikipedia_transformers_article", "slug": <same>,
+"instruction": "Open Chrome and search for the Wikipedia article on
+transformers, …"}` — `subdir` is the only field the server needs; `slug` and
+`instruction` are the tab label.
+
 ## Minimal example
 
 ```toml
