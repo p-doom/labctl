@@ -462,7 +462,6 @@ pub struct Resources {
     pub mem: String,
     pub time: String,
     /// `--nodes`. Defaults to 1 when unset, which emits no directive at all.
-    #[serde(default)]
     pub nodes: Option<u32>,
     pub partition: Option<String>,
     pub qos: Option<String>,
