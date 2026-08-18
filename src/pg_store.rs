@@ -1462,10 +1462,24 @@ impl PgStore {
         user: &str,
         created_at: i64,
     ) -> Result<()> {
+        // `id` is a hash of the artifact's canonical path (see
+        // `Store::insert_artifact`), so re-producing the same path is the
+        // same artifact by construction — re-running a recipe whose output
+        // path isn't run-scoped is the common case. Registration must
+        // therefore be idempotent: a plain INSERT raises a unique violation
+        // that permanently blocks the artifact from ever being registered
+        // (and, before the fault isolation in `runner::reconcile`, aborted
+        // the caller's whole reconcile pass). Refresh the mutable columns
+        // so the row reflects the run that most recently produced the path;
+        // `path`, `user` and `created_at` are identity/first-seen and stay.
         sqlx::query(
             "INSERT INTO artifacts
              (id, kind, path, producer_run_id, metadata_json, created_at, \"user\")
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (id) DO UPDATE SET
+                 kind = EXCLUDED.kind,
+                 producer_run_id = EXCLUDED.producer_run_id,
+                 metadata_json = EXCLUDED.metadata_json",
         )
         .bind(id)
         .bind(kind)
@@ -2239,6 +2253,98 @@ mod tests {
             .execute(pg.pool())
             .await
             .expect("cleanup user");
+    }
+
+    /// Artifact identity is the canonical output path (migration 0001:
+    /// `id = sha256(canonical_path)[..16]`, plus `artifacts_path_unique`),
+    /// so re-producing a path is the *same* artifact — which happens on
+    /// every re-run of a recipe whose output path isn't run-scoped.
+    /// Registration must therefore be idempotent rather than raising a
+    /// unique violation that permanently blocks the artifact.
+    #[tokio::test]
+    #[ignore = "requires running PG"]
+    async fn insert_artifact_is_idempotent_on_repeat_registration() {
+        use crate::store::Store;
+
+        let cluster = live_cluster().expect("cluster.toml present");
+        let store = Store::connect(&cluster).await.expect("connect");
+        let pg = store.pg();
+        let now = crate::util::now_ts();
+        let user_name = insert_test_user(&store).await;
+
+        // Two runs standing in for an original production and a re-run.
+        let mut run_ids = Vec::new();
+        for _ in 0..2 {
+            let run_id = format!("run_{}", uuid::Uuid::now_v7().simple());
+            store
+                .insert_run(
+                    crate::store::NewRun {
+                        id: &run_id,
+                        recipe: &dummy_recipe(),
+                        recipe_hash: &dummy_recipe_hash(),
+                        status: "created",
+                        run_dir: std::path::Path::new("/tmp/labctl-test"),
+                        source_path: std::path::Path::new("/tmp/labctl-test/source"),
+                        context_json: &serde_json::json!({"schema_version": 1}),
+                        submitted_by: Some(&user_name),
+                        cache_key: None,
+                    },
+                    &[],
+                )
+                .await
+                .expect("insert_run");
+            run_ids.push(run_id);
+        }
+
+        let path = std::path::PathBuf::from(format!("/tmp/labctl-test/{user_name}/artifact"));
+        let id = format!(
+            "artifact_{}",
+            &crate::util::sha256_bytes(path.display().to_string().as_bytes())[..16]
+        );
+
+        pg.insert_artifact(
+            &id,
+            "eval_result",
+            &path,
+            Some(&run_ids[0]),
+            &serde_json::json!({"pass": 1}),
+            &user_name,
+            now,
+        )
+        .await
+        .expect("first registration");
+
+        // Same path, later run: must succeed and refresh the mutable
+        // columns rather than raising `artifacts_pkey`.
+        pg.insert_artifact(
+            &id,
+            "eval_result",
+            &path,
+            Some(&run_ids[1]),
+            &serde_json::json!({"pass": 2}),
+            &user_name,
+            now + 60,
+        )
+        .await
+        .expect("re-registration must not raise a unique violation");
+
+        let row = pg
+            .get_artifact(&id)
+            .await
+            .expect("get_artifact")
+            .expect("artifact present");
+        assert_eq!(row.producer_run_id.as_deref(), Some(run_ids[1].as_str()));
+        assert_eq!(row.metadata_json, serde_json::json!({"pass": 2}));
+        assert_eq!(row.path, path);
+        // created_at is first-seen and must survive re-registration.
+        assert_eq!(row.created_at, now);
+
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(&id)
+            .execute(pg.pool())
+            .await
+            .expect("cleanup artifact");
+        cleanup_user(&pg, &user_name).await;
     }
 
     /// The partial unique index `runs_cache_key_inflight_unique`
