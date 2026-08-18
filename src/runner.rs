@@ -483,142 +483,194 @@ async fn submit_recipe_inner(
         });
     }
 
-    // Materialize each output's directory so the recipe's command can write
-    // into it without having to mkdir -p itself. Refuse only if the marker
-    // file is already present AND we couldn't satisfy it via cache hit —
-    // that's the explicit success signal of a prior run whose cache_key
-    // differs from ours (e.g. recipe or inputs changed; user must
-    // explicitly delete to re-run). An empty or partially-populated
-    // directory (failed run, or labctl-pre-created shell) is safe to
-    // reuse: re-submission of a failed recipe should "just work" without
-    // forcing the operator to rm output dirs by hand. For checkpoint_stream
-    // outputs, the marker lives one step deeper (under <stream>/<step>/<marker>),
-    // so the top-level directory existing means nothing — let it through.
-    for resolution in outputs.values() {
-        if resolution.kind != "checkpoint_stream"
-            && let Some(m) = &resolution.marker
-        {
-            let marker_path = resolution.path.join(m);
-            if marker_path.exists() {
-                bail!(
-                    "output marker already present: {} (role={:?}, alias={:?}, kind={:?}) and \
-                         no matching cache_key in registry. The path holds a stale artifact from a \
-                         different recipe/input combination. Delete the path explicitly or template \
-                         the alias with {{run.id}} for per-submission uniqueness.",
-                    marker_path.display(),
-                    resolution.role,
-                    resolution.alias,
-                    resolution.kind,
-                );
+    // Everything below runs while the singleflight claim is held: the
+    // row inserted above is `created` with `job_id = NULL`, which is
+    // exactly the predicate `runs_cache_key_inflight_unique` treats as
+    // in-flight for this `cache_key`. Any failure between here and the
+    // `set_submitted` at the bottom — marker collision, source copy,
+    // script render, sbatch — has to hand the claim back, so the whole
+    // stretch runs inside an async block and a single error arm covers
+    // it.
+    let submitted: Result<SubmittedRun> = async {
+        // Materialize each output's directory so the recipe's command can write
+        // into it without having to mkdir -p itself. Refuse only if the marker
+        // file is already present AND we couldn't satisfy it via cache hit —
+        // that's the explicit success signal of a prior run whose cache_key
+        // differs from ours (e.g. recipe or inputs changed; user must
+        // explicitly delete to re-run). An empty or partially-populated
+        // directory (failed run, or labctl-pre-created shell) is safe to
+        // reuse: re-submission of a failed recipe should "just work" without
+        // forcing the operator to rm output dirs by hand. For checkpoint_stream
+        // outputs, the marker lives one step deeper (under <stream>/<step>/<marker>),
+        // so the top-level directory existing means nothing — let it through.
+        for resolution in outputs.values() {
+            if resolution.kind != "checkpoint_stream"
+                && let Some(m) = &resolution.marker
+            {
+                let marker_path = resolution.path.join(m);
+                if marker_path.exists() {
+                    bail!(
+                        "output marker already present: {} (role={:?}, alias={:?}, kind={:?}) and \
+                             no matching cache_key in registry. The path holds a stale artifact from a \
+                             different recipe/input combination. Delete the path explicitly or template \
+                             the alias with {{run.id}} for per-submission uniqueness.",
+                        marker_path.display(),
+                        resolution.role,
+                        resolution.alias,
+                        resolution.kind,
+                    );
+                }
             }
+            fs::create_dir_all(&resolution.path).with_context(|| {
+                format!(
+                    "failed to create output dir {} for role {:?}",
+                    resolution.path.display(),
+                    resolution.role,
+                )
+            })?;
         }
-        fs::create_dir_all(&resolution.path).with_context(|| {
+
+        // Paths-only view used for {outputs.X.path} substitution in [args] and
+        // by render_script. The richer OutputResolution map is what we persist
+        // in context.json for register_outputs to read at reconcile time.
+        let output_paths_map: BTreeMap<String, PathBuf> = outputs
+            .iter()
+            .map(|(role, res)| (role.clone(), res.path.clone()))
+            .collect();
+
+        util::copy_dir_filtered(repo_path, &source_path).with_context(|| {
             format!(
-                "failed to create output dir {} for role {:?}",
-                resolution.path.display(),
-                resolution.role,
+                "failed to create execution snapshot {} from {}",
+                source_path.display(),
+                repo_path.display()
             )
         })?;
-    }
 
-    // Paths-only view used for {outputs.X.path} substitution in [args] and
-    // by render_script. The richer OutputResolution map is what we persist
-    // in context.json for register_outputs to read at reconcile time.
-    let output_paths_map: BTreeMap<String, PathBuf> = outputs
-        .iter()
-        .map(|(role, res)| (role.clone(), res.path.clone()))
-        .collect();
+        let source_hash = util::dir_content_hash(&source_path)?;
+        let ctx = json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "run_dir": run_dir,
+            "recipe_name": recipe.name,
+            "recipe_hash": recipe_hash,
+            "repo": recipe.repo,
+            "source_path": source_path,
+            "source_hash": source_hash,
+            "inputs": inputs,
+            "outputs": outputs,
+            "params": recipe.params,
+            "provenance": repo_provenance,
+            "stage_name": stage_ctx.map(|c| c.stage_name),
+            "parent_job_ids": parent_job_ids,
+        });
+        util::atomic_write(
+            &lab_dir.join(fs_layout::CONTEXT_JSON),
+            &serde_json::to_vec_pretty(&ctx)?,
+        )?;
 
-    util::copy_dir_filtered(repo_path, &source_path).with_context(|| {
-        format!(
-            "failed to create execution snapshot {} from {}",
-            source_path.display(),
-            repo_path.display()
-        )
-    })?;
-
-    let source_hash = util::dir_content_hash(&source_path)?;
-    let ctx = json!({
-        "schema_version": 1,
-        "run_id": run_id,
-        "run_dir": run_dir,
-        "recipe_name": recipe.name,
-        "recipe_hash": recipe_hash,
-        "repo": recipe.repo,
-        "source_path": source_path,
-        "source_hash": source_hash,
-        "inputs": inputs,
-        "outputs": outputs,
-        "params": recipe.params,
-        "provenance": repo_provenance,
-        "stage_name": stage_ctx.map(|c| c.stage_name),
-        "parent_job_ids": parent_job_ids,
-    });
-    util::atomic_write(
-        &lab_dir.join(fs_layout::CONTEXT_JSON),
-        &serde_json::to_vec_pretty(&ctx)?,
-    )?;
-
-    let script = render_script(
-        cluster,
-        recipe,
-        &run_id,
-        &run_dir,
-        &source_path,
-        &inputs,
-        &output_paths_map,
-        parent_job_ids,
-        array_sweep,
-    )?;
-    let script_path = lab_dir.join(fs_layout::SUBMIT_SH);
-    util::atomic_write(&script_path, script.as_bytes())?;
-
-    store
-        .insert_run(
-            NewRun {
-                id: &run_id,
-                recipe,
-                recipe_hash: &recipe_hash,
-                status: "created",
-                run_dir: &run_dir,
-                source_path: &source_path,
-                context_json: &ctx,
-                submitted_by: Some(submitted_by),
-                cache_key: Some(&cache_key),
-            },
+        let script = render_script(
+            cluster,
+            recipe,
+            &run_id,
+            &run_dir,
+            &source_path,
             &inputs,
-        )
-        .await?;
+            &output_paths_map,
+            parent_job_ids,
+            array_sweep,
+        )?;
+        let script_path = lab_dir.join(fs_layout::SUBMIT_SH);
+        util::atomic_write(&script_path, script.as_bytes())?;
 
-    // Tracker row written at submission time. URL is fully derivable here
-    // because we've forced WANDB_RUN_ID = labctl run id in the sbatch env.
-    if let Some(wandb) = &recipe.tracking.wandb {
-        let url = format!(
-            "https://wandb.ai/{}/{}/runs/{}",
-            wandb.entity, wandb.project, run_id
-        );
         store
-            .set_tracking(
-                &run_id,
-                &wandb.entity,
-                &wandb.project,
-                &url,
-                wandb.group.as_deref(),
-                "schema",
+            .insert_run(
+                NewRun {
+                    id: &run_id,
+                    recipe,
+                    recipe_hash: &recipe_hash,
+                    status: "created",
+                    run_dir: &run_dir,
+                    source_path: &source_path,
+                    context_json: &ctx,
+                    submitted_by: Some(submitted_by),
+                    cache_key: Some(&cache_key),
+                },
+                &inputs,
             )
             .await?;
+
+        // Tracker row written at submission time. URL is fully derivable here
+        // because we've forced WANDB_RUN_ID = labctl run id in the sbatch env.
+        if let Some(wandb) = &recipe.tracking.wandb {
+            let url = format!(
+                "https://wandb.ai/{}/{}/runs/{}",
+                wandb.entity, wandb.project, run_id
+            );
+            store
+                .set_tracking(
+                    &run_id,
+                    &wandb.entity,
+                    &wandb.project,
+                    &url,
+                    wandb.group.as_deref(),
+                    "schema",
+                )
+                .await?;
+        }
+
+        let job_id = submit_script(cluster, &script_path, &run_id).await?;
+        store.set_submitted(&run_id, &job_id).await?;
+
+        Ok(SubmittedRun {
+            run_id: run_id.clone(),
+            job_id,
+            run_dir,
+            cache_hit: false,
+            follower_of: None,
+        })
     }
+    .await;
 
-    let job_id = submit_script(cluster, &script_path, &run_id).await?;
-    store.set_submitted(&run_id, &job_id).await?;
+    match submitted {
+        Ok(run) => Ok(run),
+        Err(err) => Err(release_claim_on_failed_submit(store, &run_id, &cache_key, err).await),
+    }
+}
 
-    Ok(SubmittedRun {
-        run_id,
-        job_id,
-        run_dir,
-        cache_hit: false,
-        follower_of: None,
-    })
+/// Give back the singleflight claim `run_id` is holding after its
+/// submission failed, and return the failure unchanged.
+///
+/// A claim is a `created` row with `job_id = NULL` owning `cache_key`.
+/// Nothing ages it out: if the submission dies in the window between
+/// `try_claim_or_follow` and `set_submitted` and the row is left as it
+/// is, every later submission of the same recipe attaches as a follower
+/// of a leader that will never run, and only hand-written SQL clears
+/// it. Flipping the row terminal frees the key for the next submitter
+/// while keeping the row itself, which is the record of what went
+/// wrong. `finished_at` is mandatory for a terminal status
+/// (`runs_terminal_finished_at`) and `update_status` supplies it.
+///
+/// The original error is returned as-is — the cleanup must never mask
+/// the failure that caused it. A cleanup that itself fails is logged
+/// and swallowed for the same reason.
+async fn release_claim_on_failed_submit(
+    store: &Store,
+    run_id: &str,
+    cache_key: &str,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    if let Err(cleanup_err) = store
+        .update_status(run_id, "failed", Some(util::now_ts()))
+        .await
+    {
+        tracing::error!(
+            "submit {run_id}: failed while holding the singleflight claim for \
+             cache_key={cache_key} ({err:#}); releasing the claim also failed: \
+             {cleanup_err:#} — the claim is stranded and blocks resubmission of \
+             this recipe until the row is marked terminal by hand"
+        );
+    }
+    err
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2221,5 +2273,119 @@ alias  = "t_{run.id}"
         ))
         .expect("json braces must not trip the token guard");
         assert!(script.contains("ok"), "command missing:\n{script}");
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    //! PG-gated: exercises `submit_recipe_inner` against the live
+    //! registry configured in the user's cluster.toml, the same way
+    //! `pg_store`'s singleflight tests do. Every filesystem path the
+    //! submission touches is redirected into a tempdir, and the PG rows
+    //! are deleted on the way out.
+    use super::*;
+    use crate::pg_store::tests::{cleanup_user, dummy_recipe, insert_test_user, live_cluster};
+
+    /// A submission that dies *after* `try_claim_or_follow` must leave
+    /// its row terminal. While the row sits at `created` with
+    /// `job_id = NULL` it is the singleflight leader for its
+    /// `cache_key`, so every later submission of the same recipe
+    /// attaches as a follower of a leader that will never run — a state
+    /// no CLI command can clear.
+    ///
+    /// The failure is the marker-collision `bail!`, which is the first
+    /// thing that can fail after the claim; the test therefore never
+    /// reaches source-copy or sbatch.
+    #[tokio::test]
+    #[ignore = "requires running PG"]
+    async fn failed_submit_releases_singleflight_claim() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tmp.path().join("repo");
+        let output_root = tmp.path().join("outputs");
+        fs::create_dir_all(&repo_dir).expect("repo dir");
+
+        let mut cluster = live_cluster().expect("cluster.toml present");
+        cluster.filesystem.runs_base = tmp.path().join("runs");
+        cluster
+            .filesystem
+            .output_roots
+            .insert("test_output".to_string(), output_root.clone());
+        cluster
+            .repos
+            .insert("labctl_selftest".to_string(), repo_dir.clone());
+
+        let store = Store::connect(&cluster).await.expect("connect");
+        let pg = store.pg();
+        let user = insert_test_user(&store).await;
+
+        // Nonce in `params` + the alias keeps this run's cache_key
+        // unique, so the cache-hit scan before the claim never fires.
+        let nonce = uuid::Uuid::now_v7().simple().to_string();
+        let alias = format!("__test_out_{nonce}");
+        let mut recipe = dummy_recipe();
+        recipe.repo = "labctl_selftest".to_string();
+        recipe
+            .params
+            .insert("nonce".to_string(), Value::String(nonce.clone()));
+        recipe.outputs.insert(
+            "out".to_string(),
+            crate::config::OutputSpec {
+                kind: "test_output".to_string(),
+                marker: Some("done.json".to_string()),
+                alias: alias.clone(),
+            },
+        );
+
+        // Pre-plant the marker the submit will trip over.
+        let out_dir = fs_layout::artifact_dir(&output_root, &user, &alias);
+        fs::create_dir_all(&out_dir).expect("output dir");
+        fs::write(out_dir.join("done.json"), b"{}").expect("plant marker");
+
+        let run_id = util::new_id("run");
+        let err = submit_recipe_inner(
+            &cluster,
+            &store,
+            &recipe,
+            None,
+            None,
+            &[],
+            Some(&run_id),
+            &user,
+            None,
+        )
+        .await
+        .expect_err("submit must fail on the pre-planted marker");
+        assert!(
+            format!("{err:#}").contains("output marker already present"),
+            "expected the marker collision to be the failure, got: {err:#}"
+        );
+
+        // Observe first, clean up second, assert last: the registry is
+        // shared, so a failing assertion must not strand this test's
+        // rows in it.
+        let row = store.get_run(&run_id).await.expect("claim row kept");
+        let cache_key = row.cache_key.clone().expect("claim row carries cache_key");
+        let still_claimed = pg
+            .find_inflight_for_cache_key(&cache_key)
+            .await
+            .expect("inflight lookup");
+        cleanup_user(&pg, &user).await;
+
+        // The row survives (it is the debugging record) but is terminal.
+        assert_eq!(
+            row.status, "failed",
+            "claim row must be terminal after a failed submit"
+        );
+        assert!(
+            row.finished_at.is_some(),
+            "runs_terminal_finished_at requires finished_at on a terminal row"
+        );
+        assert!(row.job_id.is_none(), "nothing was ever submitted to SLURM");
+        // ...and the key it was holding is free for the next submitter.
+        assert_eq!(
+            still_claimed, None,
+            "cache_key {cache_key} is still claimed; the next submission of this \
+             recipe would become a follower of a run that will never start"
+        );
     }
 }
