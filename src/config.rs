@@ -461,6 +461,12 @@ pub struct Resources {
     pub cpus: u32,
     pub mem: String,
     pub time: String,
+    /// `--nodes`. Defaults to 1 when unset, matching
+    /// [`HetComponent::nodes`] — a het recipe's fleet component is
+    /// declared here, and needed a `sbatch_extra` escape hatch before
+    /// this existed while its trainer component had a typed field.
+    #[serde(default)]
+    pub nodes: Option<u32>,
     pub partition: Option<String>,
     pub qos: Option<String>,
     pub account: Option<String>,
@@ -469,7 +475,7 @@ pub struct Resources {
     /// waiting for SLURM's drain detection.
     pub exclude_nodes: Option<String>,
     /// Escape hatch for sbatch directives the typed schema doesn't cover
-    /// (e.g. `--array`, `--nodes`, `--mail-type`, `--gpu-bind`). Each entry
+    /// (e.g. `--array`, `--mail-type`, `--gpu-bind`). Each entry
     /// is rendered verbatim as a separate `#SBATCH` line, *after* the
     /// typed directives. Use this only for things labctl can't model —
     /// don't override `--cpus-per-task` or `--time` here, those have
@@ -518,6 +524,7 @@ impl Default for Resources {
             cpus: 1,
             mem: "4GB".to_string(),
             time: "00:10:00".to_string(),
+            nodes: None,
             partition: None,
             qos: None,
             account: None,

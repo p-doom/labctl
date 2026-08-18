@@ -1583,6 +1583,9 @@ fn render_script(
         if let Some(qos) = recipe.resources.qos.as_ref().or(cluster.slurm.qos.as_ref()) {
             script.push_str(&format!("#SBATCH --qos={qos}\n"));
         }
+        if let Some(nodes) = recipe.resources.nodes {
+            script.push_str(&format!("#SBATCH --nodes={nodes}\n"));
+        }
         if let Some(exclude) = recipe.resources.exclude_nodes.as_ref() {
             script.push_str(&format!("#SBATCH --exclude={exclude}\n"));
         }
@@ -2112,6 +2115,36 @@ time = "12:00:00"
         assert!(
             !script.contains("hetjob"),
             "plain recipes must stay het-free:\n{script}"
+        );
+    }
+
+    #[test]
+    fn base_resources_nodes_is_typed() {
+        let script = render(&format!("{BASE}nodes = 2\n"));
+        assert!(
+            script.contains("#SBATCH --nodes=2"),
+            "base nodes missing:\n{script}"
+        );
+        // Unset stays unset rather than defaulting to an explicit 1, so
+        // single-node recipes emit the same script as before.
+        let plain = render(BASE);
+        assert!(
+            !plain.contains("#SBATCH --nodes"),
+            "unset nodes must not emit a directive:\n{plain}"
+        );
+    }
+
+    #[test]
+    fn base_and_component_nodes_are_independent() {
+        let script = render(&format!(
+            "{BASE}nodes = 2\n\n[[resources.components]]\ngpus = 4\ncpus = 16\nmem = \"128GB\"\nnodes = 1\n"
+        ));
+        assert!(script.contains("#SBATCH --nodes=2"), "fleet nodes:\n{script}");
+        assert!(script.contains("#SBATCH --nodes=1"), "trainer nodes:\n{script}");
+        assert_eq!(
+            script.matches("#SBATCH --nodes=").count(),
+            2,
+            "one per component:\n{script}"
         );
     }
 
