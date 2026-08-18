@@ -2049,17 +2049,21 @@ fn row_to_artifact(r: sqlx::postgres::PgRow) -> Result<ArtifactRow> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Tests run against the live PG instance configured in the user's
     //! cluster.toml (see docs/POSTGRES_DEPLOY.md). They're tagged
     //! `#[ignore]` so `cargo test` doesn't accidentally hit a real PG;
     //! invoke as `cargo test --test pg_smoke -- --ignored` after the
     //! instance is up and the importer has populated data.
+    //!
+    //! The `pub(crate)` helpers below are shared with `runner`'s
+    //! PG-gated tests, which drive a real submission against the same
+    //! registry and need the same throwaway user + recipe fixtures.
     use super::*;
     use crate::config::ClusterConfig;
     use std::path::PathBuf;
 
-    fn live_cluster() -> Option<ClusterConfig> {
+    pub(crate) fn live_cluster() -> Option<ClusterConfig> {
         let p = PathBuf::from(
             std::env::var("HOME").unwrap_or_default() + "/.config/labctl/cluster.toml",
         );
@@ -2190,7 +2194,7 @@ mod tests {
 
     /// Helper: build a minimal `NewRun`-shaped recipe + 64-hex
     /// recipe_hash for the singleflight / cache tests below.
-    fn dummy_recipe() -> crate::config::Recipe {
+    pub(crate) fn dummy_recipe() -> crate::config::Recipe {
         crate::config::Recipe {
             name: "test_recipe".to_string(),
             repo: "labctl".to_string(),
@@ -2213,7 +2217,7 @@ mod tests {
 
     /// Helper: insert a user so a run can FK-attach. Returns the user
     /// name (caller cleans up).
-    async fn insert_test_user(store: &crate::store::Store) -> String {
+    pub(crate) async fn insert_test_user(store: &crate::store::Store) -> String {
         let suffix = uuid::Uuid::now_v7().simple().to_string();
         let user_name = format!("__test_user_{suffix}");
         let now = crate::util::now_ts();
@@ -2225,7 +2229,7 @@ mod tests {
     }
 
     /// Helper: bulk-clean the rows a singleflight test wrote.
-    async fn cleanup_user(pg: &PgStore, user_name: &str) {
+    pub(crate) async fn cleanup_user(pg: &PgStore, user_name: &str) {
         // Order matters: events/inputs cascade via runs ON DELETE
         // CASCADE; we just need to delete all runs for the user, then
         // the user.
