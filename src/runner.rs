@@ -2125,8 +2125,7 @@ time = "12:00:00"
             script.contains("#SBATCH --nodes=2"),
             "base nodes missing:\n{script}"
         );
-        // Unset stays unset rather than defaulting to an explicit 1, so
-        // single-node recipes emit the same script as before.
+        // Unset stays unset, so existing recipes render unchanged.
         let plain = render(BASE);
         assert!(
             !plain.contains("#SBATCH --nodes"),
@@ -2139,8 +2138,14 @@ time = "12:00:00"
         let script = render(&format!(
             "{BASE}nodes = 2\n\n[[resources.components]]\ngpus = 4\ncpus = 16\nmem = \"128GB\"\nnodes = 1\n"
         ));
-        assert!(script.contains("#SBATCH --nodes=2"), "fleet nodes:\n{script}");
-        assert!(script.contains("#SBATCH --nodes=1"), "trainer nodes:\n{script}");
+        assert!(
+            script.contains("#SBATCH --nodes=2"),
+            "fleet nodes:\n{script}"
+        );
+        assert!(
+            script.contains("#SBATCH --nodes=1"),
+            "trainer nodes:\n{script}"
+        );
         assert_eq!(
             script.matches("#SBATCH --nodes=").count(),
             2,
