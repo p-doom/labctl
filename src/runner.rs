@@ -67,6 +67,9 @@ pub struct SubmittedRun {
 pub struct ReconcileReport {
     pub runs_reconciled: usize,
     pub artifacts_registered: usize,
+    /// Runs whose reconcile raised. Logged and skipped rather than
+    /// aborting the pass; surfaced here so callers can report them.
+    pub runs_failed: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1112,16 +1115,27 @@ pub struct ReconcileStep {
 pub async fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<ReconcileReport> {
     let mut runs_reconciled = 0;
     let mut artifacts_registered = 0;
+    let mut runs_failed = 0;
     // Scope to the invoking user's own runs. `labctl reconcile` is a
     // user action — folding the user's own SLURM state back into the
     // registry — and must never touch another user's run rows.
     let submitted_by = crate::store::current_user()?;
+    // Isolate per-run failures, matching what the agent's dispatch loop
+    // already does: one unreconcilable run must not abort the pass and
+    // strand every run behind it.
     for run in store.list_active_runs(&submitted_by).await? {
-        let step = reconcile_one(cluster, store, &run).await?;
-        if step.status_changed {
-            runs_reconciled += 1;
+        match reconcile_one(cluster, store, &run).await {
+            Ok(step) => {
+                if step.status_changed {
+                    runs_reconciled += 1;
+                }
+                artifacts_registered += step.artifacts_registered;
+            }
+            Err(e) => {
+                runs_failed += 1;
+                tracing::error!("reconcile: run {} failed: {e:#}", run.id);
+            }
         }
-        artifacts_registered += step.artifacts_registered;
     }
     // try_submit_pending_children inside reconcile_one only fires when
     // this pass observed the parent's status transition. Restart between
@@ -1138,6 +1152,7 @@ pub async fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<Reconci
     Ok(ReconcileReport {
         runs_reconciled,
         artifacts_registered,
+        runs_failed,
     })
 }
 
