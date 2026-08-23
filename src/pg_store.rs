@@ -32,6 +32,7 @@ use sqlx::{
 };
 
 use crate::config::{ClusterConfig, InputSpec, PgConfig, Recipe};
+use crate::fs_layout::{self, ArtifactSidecar};
 use crate::store::{
     ArtifactRow, ClaimOutcome, EvalRequestSlot, EvalSeriesRow, EventRow, InputResolution, NewRun,
     PipelineRow, PolicySummaryRow, RunRow, RunSummaryRow, RunView, TrackingRow, is_terminal,
@@ -1451,11 +1452,128 @@ impl PgStore {
         Ok(())
     }
 
-    /// Insert an artifact row. Returns whether a row was inserted. Only
-    /// an id retry is ignored; other unique-constraint failures remain
-    /// errors. The caller owns the sidecar and other FS work.
+    /// Complete a first registration atomically in Postgres. The sidecar
+    /// is written before commit, so any later database failure rolls the
+    /// row, input rehydration, and event back together. An exact completed
+    /// retry has no side effects.
     #[allow(clippy::too_many_arguments)]
-    pub async fn insert_artifact(
+    pub async fn complete_artifact_registration(
+        &self,
+        id: &str,
+        kind: &str,
+        path: &Path,
+        producer_run_id: Option<&str>,
+        metadata: &Value,
+        user: &str,
+        created_at: i64,
+        sidecar_target: &Path,
+        sidecar: ArtifactSidecar,
+    ) -> Result<ArtifactRow> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("complete_artifact_registration: begin")?;
+        let result = sqlx::query(
+            "INSERT INTO artifacts
+             (id, kind, path, producer_run_id, metadata_json, created_at, \"user\")
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(path.display().to_string())
+        .bind(producer_run_id)
+        .bind(sqlx::types::Json(metadata))
+        .bind(created_at)
+        .bind(user)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("complete_artifact_registration({id}): insert"))?;
+        if result.rows_affected() == 0 {
+            let row = sqlx::query(&format!("{ARTIFACT_SELECT_BASE} WHERE id = $1"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .with_context(|| format!("complete_artifact_registration({id}): read retry"))?
+                .with_context(|| format!("artifact conflict row disappeared: {id}"))?;
+            let existing = row_to_artifact(row)?;
+            if existing.kind != kind
+                || existing.path.as_path() != path
+                || existing.producer_run_id.as_deref() != producer_run_id
+                || existing.metadata_json != *metadata
+            {
+                bail!(
+                    "artifact {id} is already registered with different kind, path, \
+                     producer_run_id, or metadata"
+                );
+            }
+            tx.commit()
+                .await
+                .with_context(|| format!("complete_artifact_registration({id}): retry commit"))?;
+            return Ok(existing);
+        }
+
+        let completion: Result<()> = async {
+            let target = sidecar_target.to_path_buf();
+            tokio::task::spawn_blocking(move || fs_layout::atomic_write_json(&target, &sidecar))
+                .await
+                .context("artifact sidecar write join")??;
+
+            sqlx::query(
+                "UPDATE run_inputs SET artifact_id = $1 \
+                 WHERE resolved_path = $2 AND artifact_id IS NULL",
+            )
+            .bind(id)
+            .bind(path.display().to_string())
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("rehydrate_inputs_by_path({})", path.display()))?;
+
+            if let Some(run_id) = producer_run_id {
+                let payload = json!({
+                    "artifact_id": id,
+                    "kind": kind,
+                    "path": path,
+                });
+                sqlx::query(
+                    "INSERT INTO events (run_id, event_type, payload_json, created_at) \
+                     VALUES ($1, 'artifact_registered', $2, $3)",
+                )
+                .bind(run_id)
+                .bind(sqlx::types::Json(payload))
+                .bind(created_at)
+                .execute(&mut *tx)
+                .await
+                .context("append artifact_registered event")?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = completion {
+            return match tx.rollback().await {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "complete_artifact_registration({id}): rollback failed: {rollback}"
+                ))),
+            };
+        }
+        tx.commit()
+            .await
+            .with_context(|| format!("complete_artifact_registration({id}): commit"))?;
+        Ok(ArtifactRow {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            path: path.to_path_buf(),
+            producer_run_id: producer_run_id.map(str::to_string),
+            metadata_json: metadata.clone(),
+            created_at,
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_artifact(
         &self,
         id: &str,
         kind: &str,
@@ -2561,6 +2679,258 @@ pub(crate) mod tests {
             .expect("cleanup artifact");
         cleanup_user(&pg, &user_name).await;
         std::fs::remove_dir_all(root.join(&user_name)).expect("cleanup artifact path");
+    }
+
+    struct ArtifactRegistrationFixture {
+        store: crate::store::Store,
+        pg: std::sync::Arc<PgStore>,
+        user_name: String,
+        run_id: String,
+        path: PathBuf,
+        id: String,
+        metadata: Value,
+    }
+
+    async fn artifact_registration_fixture() -> ArtifactRegistrationFixture {
+        use crate::store::{InputResolution, NewRun, Store};
+
+        let cluster = artifact_test_cluster();
+        let store = Store::connect(&cluster).await.expect("connect");
+        let pg = store.pg();
+        let user_name = insert_test_user(&store).await;
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let run_id = format!("run_{suffix}");
+        let root = cluster
+            .filesystem
+            .artifact_roots
+            .get("dataset")
+            .expect("dataset artifact root");
+        let path = root.join(&user_name).join(format!("artifact_{suffix}"));
+        std::fs::create_dir_all(&path).expect("create artifact path");
+        store
+            .insert_run(
+                NewRun {
+                    id: &run_id,
+                    recipe: &dummy_recipe(),
+                    recipe_hash: &dummy_recipe_hash(),
+                    status: "created",
+                    run_dir: std::path::Path::new("/tmp/labctl-artifact-transaction"),
+                    source_path: std::path::Path::new("/tmp/labctl-artifact-transaction/source"),
+                    context_json: &serde_json::json!({"schema_version": 1}),
+                    submitted_by: Some(&user_name),
+                    cache_key: None,
+                },
+                &[InputResolution {
+                    role: "source".to_string(),
+                    artifact_id: None,
+                    resolved_path: path.clone(),
+                }],
+            )
+            .await
+            .expect("insert run");
+        let canonical = path.canonicalize().expect("canonical artifact path");
+        let id = format!(
+            "artifact_{}",
+            &crate::util::sha256_bytes(canonical.display().to_string().as_bytes())[..16]
+        );
+        ArtifactRegistrationFixture {
+            store,
+            pg,
+            user_name,
+            run_id,
+            path,
+            id,
+            metadata: serde_json::json!({"role": "output"}),
+        }
+    }
+
+    async fn assert_registration_rolled_back(f: &ArtifactRegistrationFixture) {
+        assert!(
+            f.pg.get_artifact(&f.id)
+                .await
+                .expect("artifact lookup")
+                .is_none(),
+            "failed registration left an artifact row"
+        );
+        assert!(
+            f.store.run_inputs(&f.run_id).await.expect("run inputs")[0]
+                .artifact_id
+                .is_none(),
+            "failed registration rehydrated an input"
+        );
+        assert_eq!(artifact_registered_event_count(&f.pg, &f.run_id).await, 0);
+    }
+
+    async fn assert_registration_retry_succeeds(f: &ArtifactRegistrationFixture) {
+        let artifact = f
+            .store
+            .insert_artifact("dataset", &f.path, Some(&f.run_id), &f.metadata)
+            .await
+            .expect("retry registration");
+        assert_eq!(artifact.id, f.id);
+        assert_eq!(
+            f.store.run_inputs(&f.run_id).await.expect("run inputs")[0]
+                .artifact_id
+                .as_deref(),
+            Some(f.id.as_str())
+        );
+        assert_eq!(artifact_registered_event_count(&f.pg, &f.run_id).await, 1);
+    }
+
+    async fn cleanup_artifact_registration_fixture(f: ArtifactRegistrationFixture) {
+        sqlx::query("UPDATE run_inputs SET artifact_id = NULL WHERE run_id = $1")
+            .bind(&f.run_id)
+            .execute(f.pg.pool())
+            .await
+            .expect("unlink input");
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(&f.id)
+            .execute(f.pg.pool())
+            .await
+            .expect("cleanup artifact");
+        sqlx::query("DELETE FROM runs WHERE submitted_by = $1")
+            .bind(&f.user_name)
+            .execute(f.pg.pool())
+            .await
+            .expect("cleanup run");
+        sqlx::query("DELETE FROM users WHERE name = $1")
+            .bind(&f.user_name)
+            .execute(f.pg.pool())
+            .await
+            .expect("cleanup user");
+        std::fs::remove_dir_all(f.path.parent().expect("artifact path has a user directory"))
+            .expect("cleanup artifact path");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch PG; set LABCTL_TEST_CLUSTER"]
+    async fn sidecar_failure_rolls_back_registration() {
+        let f = artifact_registration_fixture().await;
+        let sidecar = f.path.join(crate::fs_layout::ARTIFACT_META);
+        std::fs::create_dir(&sidecar).expect("block sidecar rename");
+
+        f.store
+            .insert_artifact("dataset", &f.path, Some(&f.run_id), &f.metadata)
+            .await
+            .expect_err("sidecar failure must fail registration");
+        assert_registration_rolled_back(&f).await;
+
+        std::fs::remove_dir(&sidecar).expect("remove sidecar blocker");
+        assert_registration_retry_succeeds(&f).await;
+        cleanup_artifact_registration_fixture(f).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch PG; set LABCTL_TEST_CLUSTER"]
+    async fn rehydration_failure_rolls_back_registration() {
+        let f = artifact_registration_fixture().await;
+        let suffix = f.run_id.strip_prefix("run_").expect("run id prefix");
+        let function = format!("fail_rehydrate_{suffix}");
+        let trigger = format!("fail_rehydrate_{suffix}");
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN IF NEW.run_id = '{}' THEN RAISE EXCEPTION 'injected rehydration failure'; \
+             END IF; RETURN NEW; END $$",
+            f.run_id
+        ))
+        .execute(f.pg.pool())
+        .await
+        .expect("create rehydration failure function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger} BEFORE UPDATE OF artifact_id ON run_inputs \
+             FOR EACH ROW EXECUTE FUNCTION {function}()"
+        ))
+        .execute(f.pg.pool())
+        .await
+        .expect("create rehydration failure trigger");
+
+        f.store
+            .insert_artifact("dataset", &f.path, Some(&f.run_id), &f.metadata)
+            .await
+            .expect_err("rehydration failure must fail registration");
+        assert_registration_rolled_back(&f).await;
+
+        sqlx::query(&format!("DROP TRIGGER {trigger} ON run_inputs"))
+            .execute(f.pg.pool())
+            .await
+            .expect("drop rehydration failure trigger");
+        sqlx::query(&format!("DROP FUNCTION {function}()"))
+            .execute(f.pg.pool())
+            .await
+            .expect("drop rehydration failure function");
+        assert_registration_retry_succeeds(&f).await;
+        cleanup_artifact_registration_fixture(f).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch PG; set LABCTL_TEST_CLUSTER"]
+    async fn event_failure_rolls_back_registration() {
+        let f = artifact_registration_fixture().await;
+        let suffix = f.run_id.strip_prefix("run_").expect("run id prefix");
+        let function = format!("fail_event_{suffix}");
+        let trigger = format!("fail_event_{suffix}");
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN IF NEW.run_id = '{}' AND NEW.event_type = 'artifact_registered' \
+             THEN RAISE EXCEPTION 'injected event failure'; END IF; RETURN NEW; END $$",
+            f.run_id
+        ))
+        .execute(f.pg.pool())
+        .await
+        .expect("create event failure function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger} BEFORE INSERT ON events \
+             FOR EACH ROW EXECUTE FUNCTION {function}()"
+        ))
+        .execute(f.pg.pool())
+        .await
+        .expect("create event failure trigger");
+
+        f.store
+            .insert_artifact("dataset", &f.path, Some(&f.run_id), &f.metadata)
+            .await
+            .expect_err("event failure must fail registration");
+        assert_registration_rolled_back(&f).await;
+
+        sqlx::query(&format!("DROP TRIGGER {trigger} ON events"))
+            .execute(f.pg.pool())
+            .await
+            .expect("drop event failure trigger");
+        sqlx::query(&format!("DROP FUNCTION {function}()"))
+            .execute(f.pg.pool())
+            .await
+            .expect("drop event failure function");
+        assert_registration_retry_succeeds(&f).await;
+        cleanup_artifact_registration_fixture(f).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch PG; set LABCTL_TEST_CLUSTER"]
+    async fn concurrent_exact_registrations_publish_once() {
+        let f = artifact_registration_fixture().await;
+        let first = f
+            .store
+            .insert_artifact("dataset", &f.path, Some(&f.run_id), &f.metadata);
+        let second = f
+            .store
+            .insert_artifact("dataset", &f.path, Some(&f.run_id), &f.metadata);
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.expect("first registration").id, f.id);
+        assert_eq!(second.expect("concurrent retry").id, f.id);
+        assert_eq!(artifact_registered_event_count(&f.pg, &f.run_id).await, 1);
+        assert_eq!(
+            f.store.run_inputs(&f.run_id).await.expect("run inputs")[0]
+                .artifact_id
+                .as_deref(),
+            Some(f.id.as_str())
+        );
+        let row_count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE id = $1")
+            .bind(&f.id)
+            .fetch_one(f.pg.pool())
+            .await
+            .expect("artifact count");
+        assert_eq!(row_count, 1);
+        cleanup_artifact_registration_fixture(f).await;
     }
 
     async fn artifact_registered_event_count(pg: &PgStore, run_id: &str) -> i64 {

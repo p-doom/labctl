@@ -401,37 +401,6 @@ impl Store {
 
         let now = util::now_ts();
         let alias = _alias;
-        let inserted = self
-            .pg
-            .insert_artifact(
-                &id,
-                kind,
-                staging_path,
-                producer_run_id,
-                metadata,
-                &user,
-                now,
-            )
-            .await?;
-        if !inserted {
-            let existing = self
-                .pg
-                .get_artifact(&id)
-                .await?
-                .with_context(|| format!("artifact conflict row disappeared: {id}"))?;
-            if existing.kind != kind
-                || existing.path.as_path() != staging_path
-                || existing.producer_run_id.as_deref() != producer_run_id
-                || existing.metadata_json != *metadata
-            {
-                anyhow::bail!(
-                    "artifact {id} is already registered with different kind, path, \
-                     producer_run_id, or metadata"
-                );
-            }
-            return Ok(existing);
-        }
-
         let sidecar = ArtifactSidecar {
             id: id.clone(),
             kind: kind.to_string(),
@@ -441,29 +410,19 @@ impl Store {
             metadata: metadata.clone(),
             created_at: now,
         };
-        // Small JSON write to NFS — offload so we don't pin a worker on
-        // slow filesystems.
-        {
-            let target = staging_path.join(fs_layout::ARTIFACT_META);
-            tokio::task::spawn_blocking(move || fs_layout::atomic_write_json(&target, &sidecar))
-                .await
-                .context("artifact sidecar write join")??;
-        }
-
         self.pg
-            .rehydrate_inputs_by_path(&staging_path.display().to_string(), &id)
-            .await?;
-        if let Some(run_id) = producer_run_id {
-            let payload = serde_json::json!({
-                "artifact_id": id,
-                "kind": kind,
-                "path": staging_path,
-            });
-            self.pg
-                .append_event(Some(run_id), "artifact_registered", &payload, now)
-                .await?;
-        }
-        self.get_artifact(&id).await
+            .complete_artifact_registration(
+                &id,
+                kind,
+                staging_path,
+                producer_run_id,
+                metadata,
+                &user,
+                now,
+                &staging_path.join(fs_layout::ARTIFACT_META),
+                sidecar,
+            )
+            .await
     }
 
     /// Look up an artifact by `(kind, path)`. The PG `find_artifact_by_path`
