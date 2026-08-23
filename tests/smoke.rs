@@ -4,8 +4,9 @@ fn labctl_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_labctl"))
 }
 
-fn validate(path: &str) {
+fn validate(cluster: &std::path::Path, path: &str) {
     let out = Command::new(labctl_bin())
+        .args(["--cluster", &cluster.to_string_lossy()])
         .args(["validate", path])
         .output()
         .expect("failed to invoke labctl");
@@ -17,28 +18,64 @@ fn validate(path: &str) {
     );
 }
 
+/// Copy an example cluster into `tmp` with every `[repos]` value pointed
+/// at `tmp` itself. The shipped examples are documentation templates
+/// whose repo paths (`/path/to/your/repo`) intentionally do not exist,
+/// and `validate` now reads those pins off the filesystem.
+fn example_cluster(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
+    let src = std::fs::read_to_string(format!("examples/clusters/{name}.toml")).unwrap();
+    let mut in_repos = false;
+    let mut out = String::new();
+    for line in src.lines() {
+        if line.trim_start().starts_with('[') {
+            in_repos = line.trim() == "[repos]";
+        }
+        match line.split_once('=') {
+            Some((key, _)) if in_repos => {
+                out.push_str(&format!("{key}= \"{}\"\n", tmp.path().display()))
+            }
+            _ => out.push_str(&format!("{line}\n")),
+        }
+    }
+    // Mirror the examples/ layout (clusters/ beside policies/) so a
+    // relative `[dispatch].policies_dir` still resolves.
+    std::fs::create_dir_all(tmp.path().join("clusters")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("policies")).unwrap();
+    let path = tmp.path().join("clusters").join(format!("{name}.toml"));
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
 #[test]
 fn example_clusters_parse() {
     for name in ["single-user", "multi-tenant", "with-remote"] {
-        validate(&format!("examples/clusters/{name}.toml"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cluster = example_cluster(&tmp, name);
+        validate(&cluster, &cluster.to_string_lossy());
     }
 }
 
 #[test]
 fn example_recipes_parse() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cluster = example_cluster(&tmp, "single-user");
     for name in ["train", "eval", "sweep", "eval_from", "hetjob"] {
-        validate(&format!("examples/recipes/{name}.toml"));
+        validate(&cluster, &format!("examples/recipes/{name}.toml"));
     }
 }
 
 #[test]
 fn example_policy_parses() {
-    validate("examples/policies/eval_per_checkpoint.toml");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cluster = example_cluster(&tmp, "single-user");
+    validate(&cluster, "examples/policies/eval_per_checkpoint.toml");
 }
 
 #[test]
 fn example_pipelines_parse() {
-    validate("examples/pipelines/from-pinned.toml");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cluster = example_cluster(&tmp, "single-user");
+    validate(&cluster, "examples/pipelines/from-pinned.toml");
 }
 
 fn run_init_in_tempdir(args: &[&str]) -> (tempfile::TempDir, PathBuf) {
