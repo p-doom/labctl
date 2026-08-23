@@ -39,7 +39,7 @@ use tower_http::trace::TraceLayer;
 use crate::{
     config::ClusterConfig,
     pg_store::PgStore,
-    store::{ArtifactRow, RunRow, is_terminal},
+    store::{ArtifactRow, RunRow, RunSummaryRow, is_terminal},
 };
 
 #[derive(rust_embed::RustEmbed)]
@@ -300,7 +300,7 @@ fn not_found(msg: impl Into<String>) -> ApiError {
 
 /// Compact run shape for the list view. Avoids the hot fields that bloat
 /// payload (recipe_json, context_json) — those load lazily on detail.
-fn run_summary(r: &RunRow) -> Value {
+fn run_summary(r: &RunSummaryRow) -> Value {
     json!({
         "id": r.id,
         "recipe_name": r.recipe_name,
@@ -320,7 +320,7 @@ fn run_summary(r: &RunRow) -> Value {
 }
 
 fn run_full(r: &RunRow) -> Value {
-    let mut v = run_summary(r);
+    let mut v = run_summary(&r.summary());
     let map = v.as_object_mut().unwrap();
     map.insert("recipe".to_string(), r.recipe_json.clone());
     map.insert("context".to_string(), r.context_json.clone());
@@ -349,7 +349,12 @@ fn artifact_summary(a: &ArtifactRow) -> Value {
 
 async fn list_runs(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
     let pg = &state.pg;
-    let runs: Vec<Value> = pg.list_runs().await?.iter().map(run_summary).collect();
+    let runs: Vec<Value> = pg
+        .list_run_summaries(None)
+        .await?
+        .iter()
+        .map(run_summary)
+        .collect();
     Ok(axum::Json(json!({ "runs": runs })))
 }
 
@@ -707,7 +712,7 @@ async fn build_metric_pivot(pg: &PgStore, runs: &[crate::store::RunRow]) -> Valu
     // Run summaries indexed by id for fast lookup as we shape the response.
     let mut run_summary_map: BTreeMap<String, Value> = BTreeMap::new();
     for r in runs {
-        run_summary_map.insert(r.id.clone(), run_summary(r));
+        run_summary_map.insert(r.id.clone(), run_summary(&r.summary()));
     }
     let mut run_meta_map: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
     for r in runs {
@@ -789,7 +794,7 @@ async fn build_metric_pivot(pg: &PgStore, runs: &[crate::store::RunRow]) -> Valu
         .iter()
         .filter_map(|s| s.get("metric_name").cloned())
         .collect();
-    let runs_summary: Vec<Value> = runs.iter().map(run_summary).collect();
+    let runs_summary: Vec<Value> = runs.iter().map(|r| run_summary(&r.summary())).collect();
 
     json!({
         "runs": runs_summary,
@@ -1171,7 +1176,7 @@ async fn get_pipeline(
     let stages: Vec<Value> = runs
         .iter()
         .map(|r| {
-            let mut v = run_summary(r);
+            let mut v = run_summary(&r.summary());
             let m = v.as_object_mut().unwrap();
             m.insert(
                 "dependency_on".into(),
@@ -1221,7 +1226,7 @@ async fn get_artifact(
     let mut consumer_runs: Vec<Value> = Vec::with_capacity(consumers.len());
     for (run_id, role) in consumers {
         if let Ok(Some(r)) = pg.get_run(&run_id).await {
-            let mut v = run_summary(&r);
+            let mut v = run_summary(&r.summary());
             v.as_object_mut()
                 .unwrap()
                 .insert("input_role".into(), Value::String(role));
@@ -1234,7 +1239,7 @@ async fn get_artifact(
             .await
             .ok()
             .flatten()
-            .map(|r| run_summary(&r)),
+            .map(|r| run_summary(&r.summary())),
         None => None,
     };
     let mut s = artifact_summary(&artifact);
@@ -1282,7 +1287,7 @@ async fn get_artifact_lineage(
         nodes.insert(a.id.clone(), s);
     }
     fn push_run(r: &RunRow, nodes: &mut std::collections::BTreeMap<String, Value>) {
-        nodes.insert(r.id.clone(), run_summary(r));
+        nodes.insert(r.id.clone(), run_summary(&r.summary()));
     }
 
     push_artifact(pg, &root, &mut artifact_nodes, true).await;
@@ -1634,7 +1639,7 @@ async fn build_metric_pivot_for_policy(
         .iter()
         .filter_map(|s| s.get("metric_name").cloned())
         .collect();
-    let runs_summary: Vec<Value> = runs.iter().map(run_summary).collect();
+    let runs_summary: Vec<Value> = runs.iter().map(|r| run_summary(&r.summary())).collect();
 
     json!({
         "runs": runs_summary,

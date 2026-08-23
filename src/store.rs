@@ -64,6 +64,44 @@ pub struct RunRow {
     pub cache_key: Option<String>,
 }
 
+/// Scalar fields used by run listings; JSON payloads remain on detail reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunSummaryRow {
+    pub id: String,
+    pub recipe_name: String,
+    pub recipe_hash: String,
+    pub status: String,
+    pub job_id: Option<String>,
+    pub run_dir: PathBuf,
+    pub repo: String,
+    pub source_path: PathBuf,
+    pub created_at: i64,
+    pub finished_at: Option<i64>,
+    pub pipeline_id: Option<String>,
+    pub stage_name: Option<String>,
+    pub submitted_by: Option<String>,
+}
+
+impl RunRow {
+    pub fn summary(&self) -> RunSummaryRow {
+        RunSummaryRow {
+            id: self.id.clone(),
+            recipe_name: self.recipe_name.clone(),
+            recipe_hash: self.recipe_hash.clone(),
+            status: self.status.clone(),
+            job_id: self.job_id.clone(),
+            run_dir: self.run_dir.clone(),
+            repo: self.repo.clone(),
+            source_path: self.source_path.clone(),
+            created_at: self.created_at,
+            finished_at: self.finished_at,
+            pipeline_id: self.pipeline_id.clone(),
+            stage_name: self.stage_name.clone(),
+            submitted_by: self.submitted_by.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRow {
     pub id: String,
@@ -293,8 +331,9 @@ impl Store {
         self.pg.runs_by_recipe(recipe_name).await
     }
 
-    pub async fn list_runs(&self) -> Result<Vec<RunRow>> {
-        self.pg.list_runs().await
+    /// Newest-first run listing. `None` returns every row.
+    pub async fn list_run_summaries(&self, limit: Option<i64>) -> Result<Vec<RunSummaryRow>> {
+        self.pg.list_run_summaries(limit).await
     }
 
     /// Active runs owned by `submitted_by`. Scoped so a daemon never

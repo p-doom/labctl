@@ -34,7 +34,7 @@ use sqlx::{
 use crate::config::{ClusterConfig, InputSpec, PgConfig, Recipe};
 use crate::store::{
     ArtifactRow, ClaimOutcome, EvalRequestSlot, EvalSeriesRow, EventRow, InputResolution, NewRun,
-    PipelineRow, PolicySummaryRow, RunRow, RunView, TrackingRow, is_terminal,
+    PipelineRow, PolicySummaryRow, RunRow, RunSummaryRow, RunView, TrackingRow, is_terminal,
 };
 
 /// Embedded migration set. Resolved at compile time from `migrations/`;
@@ -60,6 +60,7 @@ impl PgStore {
                 cluster.name,
             )
         })?;
+        probe_unix_socket(pg)?;
         let opts = build_connect_options(pg)?;
         let pool = PgPoolOptions::new()
             .max_connections(pg.max_connections)
@@ -84,12 +85,13 @@ impl PgStore {
 
     // ---------- read paths ----------
 
-    pub async fn list_runs(&self) -> Result<Vec<RunRow>> {
-        let rows = sqlx::query(RUN_SELECT_ALL)
+    pub async fn list_run_summaries(&self, limit: Option<i64>) -> Result<Vec<RunSummaryRow>> {
+        let rows = sqlx::query(RUN_SUMMARY_SELECT)
+            .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .context("list_runs query")?;
-        rows.into_iter().map(row_to_run).collect()
+            .context("list_run_summaries query")?;
+        rows.into_iter().map(row_to_run_summary).collect()
     }
 
     pub async fn get_run(&self, id: &str) -> Result<Option<RunRow>> {
@@ -1975,6 +1977,39 @@ fn is_inflight_unique_violation(err: &anyhow::Error) -> bool {
     })
 }
 
+fn probe_unix_socket(pg: &PgConfig) -> Result<()> {
+    if !pg.host.starts_with('/') {
+        return Ok(());
+    }
+    let host = hostname();
+    if host.starts_with("hai-login2") {
+        return Ok(());
+    }
+    let path = format!("{}/.s.PGSQL.{}", pg.host, pg.port);
+    if let Err(error) = std::os::unix::net::UnixStream::connect(&path) {
+        if error.kind() == std::io::ErrorKind::ConnectionRefused {
+            bail!(
+                "labctl's Postgres is reachable only from its login-node host; \
+                 you are on {host} — run from hai-login2"
+            );
+        }
+        bail!("cannot connect to labctl's Postgres socket {path} on {host}: {error}");
+    }
+    Ok(())
+}
+
+fn hostname() -> String {
+    let mut buf = [0 as libc::c_char; 256];
+    // len - 1 because POSIX allows gethostname to omit the NUL on truncation.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len() - 1) };
+    if rc != 0 {
+        return "an unidentified host".to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn build_connect_options(pg: &PgConfig) -> Result<PgConnectOptions> {
     // host = absolute path → Unix socket dir; else TCP. The port is
     // passed in both cases — under sockets it encodes the socket
@@ -2012,12 +2047,13 @@ const RUN_SELECT_BASE: &str = "
     FROM runs
 ";
 
-const RUN_SELECT_ALL: &str = "
+const RUN_SUMMARY_SELECT: &str = "
     SELECT id, recipe_name, recipe_hash, status, job_id, run_dir, repo,
-           source_path, recipe_json, context_json, created_at, finished_at,
-           pipeline_id, stage_name, dependency_on, submitted_by, cache_key
+           source_path, created_at, finished_at, pipeline_id, stage_name,
+           submitted_by
     FROM runs
-    ORDER BY created_at DESC
+    ORDER BY created_at DESC, id DESC
+    LIMIT $1
 ";
 
 const ARTIFACT_SELECT_BASE: &str = "
@@ -2047,6 +2083,24 @@ fn row_to_run(r: sqlx::postgres::PgRow) -> Result<RunRow> {
         dependency_on: dependency_on.map(|j| j.0),
         submitted_by: r.try_get("submitted_by")?,
         cache_key: r.try_get("cache_key")?,
+    })
+}
+
+fn row_to_run_summary(r: sqlx::postgres::PgRow) -> Result<RunSummaryRow> {
+    Ok(RunSummaryRow {
+        id: r.try_get("id")?,
+        recipe_name: r.try_get("recipe_name")?,
+        recipe_hash: r.try_get("recipe_hash")?,
+        status: r.try_get("status")?,
+        job_id: r.try_get("job_id")?,
+        run_dir: PathBuf::from(r.try_get::<String, _>("run_dir")?),
+        repo: r.try_get("repo")?,
+        source_path: PathBuf::from(r.try_get::<String, _>("source_path")?),
+        created_at: r.try_get("created_at")?,
+        finished_at: r.try_get("finished_at")?,
+        pipeline_id: r.try_get("pipeline_id")?,
+        stage_name: r.try_get("stage_name")?,
+        submitted_by: r.try_get("submitted_by")?,
     })
 }
 
@@ -2089,7 +2143,10 @@ pub(crate) mod tests {
     async fn connect_and_count() {
         let cluster = live_cluster().expect("cluster.toml present");
         let store = PgStore::connect(&cluster).await.expect("connect");
-        let runs = store.list_runs().await.expect("list_runs");
+        let runs = store
+            .list_run_summaries(None)
+            .await
+            .expect("list_run_summaries");
         let artifacts = store.list_artifacts().await.expect("list_artifacts");
         let pipelines = store.list_pipelines().await.expect("list_pipelines");
         tracing::info!(
@@ -2100,6 +2157,15 @@ pub(crate) mod tests {
         );
         assert!(!runs.is_empty(), "expected imported runs");
         assert!(!artifacts.is_empty(), "expected imported artifacts");
+    }
+
+    #[test]
+    fn run_listing_query_stays_narrow_and_bounded() {
+        assert!(!RUN_SUMMARY_SELECT.contains("recipe_json"));
+        assert!(!RUN_SUMMARY_SELECT.contains("context_json"));
+        assert!(!RUN_SUMMARY_SELECT.contains("dependency_on"));
+        assert!(RUN_SUMMARY_SELECT.contains("ORDER BY created_at DESC, id DESC"));
+        assert!(RUN_SUMMARY_SELECT.contains("LIMIT $1"));
     }
 
     /// End-to-end exercise of the async Store path against a live PG.

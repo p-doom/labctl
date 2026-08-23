@@ -26,6 +26,8 @@ use clap::{Parser, Subcommand};
 /// build.rs so `labctl --version` identifies the exact build.
 const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("LABCTL_GIT_SHA"), ")");
 
+const STATUS_DEFAULT_LIMIT: i64 = 50;
+
 #[derive(Parser)]
 #[command(name = "labctl")]
 #[command(version = BUILD_VERSION)]
@@ -87,7 +89,12 @@ enum Command {
         path: PathBuf,
     },
     Reconcile,
-    Status,
+    /// List runs, newest first.
+    Status {
+        /// Include every run instead of the most recent 50.
+        #[arg(long)]
+        all: bool,
+    },
     Show {
         id: String,
     },
@@ -532,8 +539,11 @@ async fn main() -> Result<()> {
             let report = runner::reconcile(&cluster, &store).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Command::Status => {
-            for run in store.list_runs().await? {
+        Command::Status { all } => {
+            let runs = store
+                .list_run_summaries((!all).then_some(STATUS_DEFAULT_LIMIT))
+                .await?;
+            for run in runs {
                 println!(
                     "{:<28} {:<12} {:<10} {}",
                     run.id,
