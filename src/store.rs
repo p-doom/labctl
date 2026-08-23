@@ -362,7 +362,8 @@ impl Store {
     /// lives there permanently — no content-addressed relocation, no
     /// hash computation. Identity is path-canonical: `artifact_<sha256
     /// of the canonical path, first 16 hex>`. Re-registering the same
-    /// path therefore yields the same id.
+    /// path therefore yields the same id. An exact retry returns the
+    /// existing row; changed registration data is a conflict.
     pub async fn insert_artifact(
         &self,
         kind: &str,
@@ -400,6 +401,37 @@ impl Store {
 
         let now = util::now_ts();
         let alias = _alias;
+        let inserted = self
+            .pg
+            .insert_artifact(
+                &id,
+                kind,
+                staging_path,
+                producer_run_id,
+                metadata,
+                &user,
+                now,
+            )
+            .await?;
+        if !inserted {
+            let existing = self
+                .pg
+                .get_artifact(&id)
+                .await?
+                .with_context(|| format!("artifact conflict row disappeared: {id}"))?;
+            if existing.kind != kind
+                || existing.path.as_path() != staging_path
+                || existing.producer_run_id.as_deref() != producer_run_id
+                || existing.metadata_json != *metadata
+            {
+                anyhow::bail!(
+                    "artifact {id} is already registered with different kind, path, \
+                     producer_run_id, or metadata"
+                );
+            }
+            return Ok(existing);
+        }
+
         let sidecar = ArtifactSidecar {
             id: id.clone(),
             kind: kind.to_string(),
@@ -418,17 +450,6 @@ impl Store {
                 .context("artifact sidecar write join")??;
         }
 
-        self.pg
-            .insert_artifact(
-                &id,
-                kind,
-                staging_path,
-                producer_run_id,
-                metadata,
-                &user,
-                now,
-            )
-            .await?;
         self.pg
             .rehydrate_inputs_by_path(&staging_path.display().to_string(), &id)
             .await?;
