@@ -4,6 +4,9 @@ set -e
 
 cd "$(git rev-parse --show-toplevel)"
 
+echo "→ retention report regression tests"
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests/test_retention_report.py
+
 # --all-features turns on `ui`, which rust-embeds ui/dist/. Build it
 # if missing so the failure mode is a test, not an opaque embed error.
 if [ ! -d ui/dist ]; then

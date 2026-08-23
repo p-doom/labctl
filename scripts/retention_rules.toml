@@ -1,0 +1,123 @@
+# Rules for retention_report.py. Editing this file changes what the report
+# PROPOSES. It cannot change what the tool does to the estate, which is
+# nothing: the tool has no delete path.
+
+[scan]
+# Each entry's <root>/<user>/<name> directories are the retention unit. A
+# checkpoint_stream run registers one artifact per step subdir, but a step is
+# not independently disposable in practice -- a human accepts or rejects the
+# whole training run -- so <name> is the unit and any reference to any step
+# inside it references the whole unit.
+checkpoint_roots = ["/fast/project/HFMI_SynergyUnit/p-doom_shared/labctl/checkpoints"]
+
+# Checkpoint trees outside the labctl artifact roots, whose immediate children
+# are the units. Seeded from the paths the 2026-08-04 manual purge had to name
+# by hand because they are invisible to the registry.
+extra_group_dirs = [
+    "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/tmp_vision_shardmap",
+    "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/memdebug_grad_accum",
+    "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/audit_operand/ckpt",
+    "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/onpolicy_distill/checkpoints",
+]
+
+owner = "franz.srambical"
+colleagues = ["yll.kryeziu", "alfred.nguyen", "mihir.mahajan"]
+# Not user namespaces: `aliases` holds symlinks into the real units and
+# `_objects` is the content-addressed store.
+skip_namespaces = ["aliases", "_objects"]
+
+[registry]
+psql = "/fast/service/apps/software/PostgreSQL/16.4-GCCcore-13.3.0/bin/psql"
+pghost = "/fast/project/HFMI_SynergyUnit/p-doom_shared/labctl/postgres/run"
+pgport = "5432"
+pgdatabase = "labctl"
+
+[references]
+# Method (a) also reads each run's generated submit.sh, because
+# context.json/run_inputs under-declare warm-start bases: a checkpoint reached
+# only through --model_id / --checkpoint_path / --base_snapshot has no
+# run_inputs row at all. The 2026-08-04 audit found this the hard way.
+run_dir_marker = ".lab/submit.sh"
+
+# Method (b).
+recipe_roots = ["/home/franz.srambical/slurm"]
+recipe_suffixes = [".toml"]
+
+# Method (c).
+doc_roots = [
+    "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/overhaul_artifacts_20260820",
+    "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/crowdcast_checkpoint_cleanup_20260804",
+    "/fast/project/HFMI_SynergyUnit/p-doom_shared/franz/crowdcast_microeval_20260804",
+]
+doc_suffixes = [".md", ".tsv", ".txt", ".json", ".csv"]
+
+[lineage]
+# The leaf dictionary from the 2026-08-04 audit, which classified every leaf by
+# hand rather than by regex. A leaf is matched by substring against the
+# resolved path. Order does not matter; a path matching both lists is reported
+# as a conflict rather than silently resolved.
+crowdcast_markers = [
+    "ccast0618d",
+    "crowdcast_nativerel_v1",
+    "data_thinking_sft_w12_snap390d",
+    "qwen3vl8b_lora_ds_v3_goals_canonical_fps_1_cua_v1_seqlen_16k_truncate_run_019f85ca",
+    "crowd_cast_bc",
+    "ccast_relfmt",
+    "ccast_microtype",
+    "crowdcast_microeval",
+    "chat_microtype",
+]
+not_crowdcast_markers = [
+    "videocua",
+    "onpolicy_distill",
+    "audit_operand",
+    "osworld_parity",
+    "smoltalk2",
+    "roundtrip_ifeval",
+    "phaseb",
+    "phase_b",
+    "yll_annotation_pilot",
+    "synthetic_",
+    "relative_factorial",
+    "relative_mouse_",
+    "typing_prose_serialization",
+    "compact_scale_ablation",
+    "finevision",
+]
+# Leaves that carry no training-data signal: off-the-shelf weights, and the
+# source checkouts every run declares as an input. Reaching one ends a lineage
+# branch without contributing a class.
+no_signal_markers = [
+    "Qwen/Qwen3-VL",
+    "Qwen/Qwen3.5",
+    "models--Qwen--",
+    "/huggingface/hub/",
+    "/fast/home/franz.srambical/omegalax",
+    "/fast/home/franz.srambical/juergen",
+    "/fast/home/franz.srambical/.tmp_suite/",
+    "/fast/home/franz.srambical/slurm",
+    "/reinforcement-learning/prime-rl",
+    "/.local/share/uv/",
+    "/.venv",
+    "/venvs/",
+    "jax_cache",
+    ".log",
+]
+max_depth = 16
+
+[policy]
+recent_days = 14
+name_crowdcast_pattern = "(?i)(crowd[_-]?cast|ccast)"
+
+# Applied in this order, first match wins, and anything that matches no rule is
+# KEEP. The protective rules come first on purpose: "referenced by an eval or a
+# doc" outranks every DELETE rule, so a mixture checkpoint some eval still
+# points at is kept, not proposed.
+enabled_rules = [
+    "not_ours",
+    "recent",
+    "referenced",
+    "crowdcast_mixture",
+    "name_only_crowdcast",
+    "crowdcast_pure_unreferenced",
+]
