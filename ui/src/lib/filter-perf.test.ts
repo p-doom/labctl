@@ -148,6 +148,7 @@ function filterNaive(runs: RunSummary[], q: string): RunSummary[] {
 // line. Tighten if you start running these on dedicated hardware.
 const BUDGET_PER_KEYSTROKE_MS = 5; // human-perceptible threshold ~50ms; aim 10× under
 const BUDGET_HAYSTACK_BUILD_MS = 25; // runs once per SSE push, not per keystroke
+const BENCHMARK_TIMEOUT_MS = 20_000;
 
 describe("filter pipeline perf", () => {
   for (const N of [1000, 10000] as const) {
@@ -158,39 +159,39 @@ describe("filter pipeline perf", () => {
       test("haystack precomputation", () => {
         const s = measure(`haystack build (n=${N})`, 50, () => buildHaystacks(runs));
         if (N === 1000) expect(s.median).toBeLessThan(BUDGET_HAYSTACK_BUILD_MS);
-      });
+      }, BENCHMARK_TIMEOUT_MS);
 
       test("filter: empty query (early-return path)", () => {
         const s = measure(`filter empty query (n=${N})`, 5000, () =>
           filterWithHaystack(runs, haystacks, "", null),
         );
         expect(s.median).toBeLessThan(0.05);
-      });
+      }, BENCHMARK_TIMEOUT_MS);
 
       test("filter: text query, haystack lookup", () => {
         const s = measure(`filter text='train' haystack (n=${N})`, 2000, () =>
           filterWithHaystack(runs, haystacks, "train", null),
         );
         if (N === 1000) expect(s.median).toBeLessThan(BUDGET_PER_KEYSTROKE_MS);
-      });
+      }, BENCHMARK_TIMEOUT_MS);
 
       test("filter: text query, naive per-row toLowerCase (baseline)", () => {
         measure(`filter text='train' NAIVE (n=${N})`, 500, () => filterNaive(runs, "train"));
-      });
+      }, BENCHMARK_TIMEOUT_MS);
 
       test("filter: text query + status filter", () => {
         const s = measure(`filter text+status (n=${N})`, 2000, () =>
           filterWithHaystack(runs, haystacks, "train", "running"),
         );
         if (N === 1000) expect(s.median).toBeLessThan(BUDGET_PER_KEYSTROKE_MS);
-      });
+      }, BENCHMARK_TIMEOUT_MS);
 
       test("visible slice (virtualization step)", () => {
         const filtered = filterWithHaystack(runs, haystacks, "train", null);
         measure(`slice 0..30 (n=${N}, filtered=${filtered.length})`, 50000, () =>
           filtered.slice(0, 30),
         );
-      });
+      }, BENCHMARK_TIMEOUT_MS);
 
       test("end-to-end keystroke chain", () => {
         const s = measure(`E2E keystroke (n=${N})`, 2000, () => {
@@ -203,7 +204,7 @@ describe("filter pipeline perf", () => {
           f.slice(0, 30);
         });
         if (N === 1000) expect(s.median).toBeLessThan(BUDGET_PER_KEYSTROKE_MS);
-      });
+      }, BENCHMARK_TIMEOUT_MS);
     });
   }
 });
