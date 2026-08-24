@@ -379,12 +379,12 @@ impl Store {
             .get(kind)
             .with_context(|| format!("kind {kind:?} not in cluster.filesystem.artifact_roots"))?
             .clone();
-        // Canonicalize off the runtime — symlink resolution stats the FS.
         let canonical = {
-            let p = staging_path.to_path_buf();
-            tokio::task::spawn_blocking(move || p.canonicalize().unwrap_or_else(|_| p.clone()))
+            let root = root.clone();
+            let path = staging_path.to_path_buf();
+            tokio::task::spawn_blocking(move || util::canonical_artifact_path(&root, &path))
                 .await
-                .context("canonicalize join")?
+                .context("canonical artifact path join")??
         };
         let path_hash = util::sha256_bytes(canonical.display().to_string().as_bytes());
         let id = format!("artifact_{}", &path_hash[..16]);
@@ -392,19 +392,19 @@ impl Store {
         // schema FK from artifacts."user" → users(name) requires a
         // real user, and a placeholder would FK-violate at INSERT.
         // Fail loudly at the boundary instead of writing junk.
-        let (user, _alias) = decompose_artifact_path(staging_path, &root).with_context(|| {
+        let (user, _alias) = decompose_artifact_path(&canonical, &root).with_context(|| {
             format!(
                 "insert_artifact: staging path {} not under <root>/<user>/<alias>/ \
                      (root={}); the writer is producing artifacts outside the canonical \
                      per-user layout",
-                staging_path.display(),
+                canonical.display(),
                 root.display(),
             )
         })?;
 
         if let Some(existing) = self.pg.get_artifact_optional(&id).await? {
             if existing.kind != kind
-                || existing.path.as_path() != staging_path
+                || existing.path != canonical
                 || existing.producer_run_id.as_deref() != producer_run_id
                 || existing.metadata_json != *metadata
             {
@@ -413,39 +413,70 @@ impl Store {
                      producer_run_id, or metadata"
                 );
             }
+            self.verified_artifact_content_hash(&existing)
+                .await?
+                .with_context(|| format!("artifact {id} is not content-sealed"))?;
             return Ok(existing);
         }
 
         let content_hash = {
-            let path = staging_path.to_path_buf();
+            let path = canonical.clone();
             tokio::task::spawn_blocking(move || util::artifact_content_hash(&path))
                 .await
                 .context("artifact content hash join")??
         };
 
-        let now = util::now_ts();
         let alias = _alias;
-        let sidecar = ArtifactSidecar {
+        let sidecar_target = canonical.join(fs_layout::ARTIFACT_META);
+        let candidate_sidecar = ArtifactSidecar {
             id: id.clone(),
             kind: kind.to_string(),
             user: user.clone(),
-            alias,
+            alias: alias.clone(),
             content_hash: content_hash.clone(),
             producer_run_id: producer_run_id.map(str::to_string),
             metadata: metadata.clone(),
-            created_at: now,
+            created_at: util::now_ts(),
         };
+        let sidecar = {
+            let target = sidecar_target.clone();
+            let existing =
+                tokio::task::spawn_blocking(move || fs_layout::read_artifact_sidecar(&target))
+                    .await
+                    .context("artifact sidecar read join")??;
+            match existing {
+                Some(existing)
+                    if existing.id == candidate_sidecar.id
+                        && existing.kind == candidate_sidecar.kind
+                        && existing.user == candidate_sidecar.user
+                        && existing.alias == candidate_sidecar.alias
+                        && existing.content_hash == candidate_sidecar.content_hash
+                        && existing.producer_run_id == candidate_sidecar.producer_run_id
+                        && existing.metadata == candidate_sidecar.metadata =>
+                {
+                    existing
+                }
+                Some(_) => {
+                    bail!(
+                        "existing artifact sidecar conflicts: {}",
+                        sidecar_target.display()
+                    )
+                }
+                None => candidate_sidecar,
+            }
+        };
+        let created_at = sidecar.created_at;
         self.pg
             .complete_artifact_registration(
                 &id,
                 kind,
-                staging_path,
+                &canonical,
                 producer_run_id,
                 metadata,
                 &content_hash,
                 &user,
-                now,
-                &staging_path.join(fs_layout::ARTIFACT_META),
+                created_at,
+                &sidecar_target,
                 sidecar,
             )
             .await
@@ -462,9 +493,13 @@ impl Store {
             return Ok(None);
         };
         let path = artifact.path.clone();
-        let actual = tokio::task::spawn_blocking(move || util::artifact_content_hash(&path))
-            .await
-            .context("artifact content verification join")??;
+        let actual = tokio::task::spawn_blocking(move || {
+            let actual = util::artifact_content_hash(&path)?;
+            util::verify_artifact_tree_sealed(&path)?;
+            Ok::<_, anyhow::Error>(actual)
+        })
+        .await
+        .context("artifact content verification join")??;
         if actual != expected {
             bail!(
                 "artifact {} content hash mismatch: registry={}, actual={}",

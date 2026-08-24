@@ -1,8 +1,14 @@
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, fs::PermissionsExt},
-    path::Path,
+    os::{
+        fd::AsRawFd,
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        },
+    },
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -100,40 +106,144 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 }
 
 pub fn dir_content_hash(path: &Path) -> Result<String> {
-    tree_content_hash(path, "dir_content_hash/v2", false)
+    tree_content_hash(path, InventoryKind::Source, |_| {})
 }
 
 pub fn artifact_content_hash(path: &Path) -> Result<String> {
-    tree_content_hash(path, "artifact_content_hash/v1", true)
+    tree_content_hash(path, InventoryKind::Artifact, |_| {})
 }
 
 pub fn seal_artifact_tree(path: &Path) -> Result<()> {
+    let root_before = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat artifact root {}", path.display()))?;
+    if root_before.file_type().is_symlink() || !root_before.is_dir() {
+        bail!(
+            "content-sealed artifact root must be a real directory: {}",
+            path.display()
+        );
+    }
+    let canonical_root = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize artifact root {}", path.display()))?;
+    if canonical_root != path {
+        bail!(
+            "artifact root changed or is not canonical: {}",
+            path.display()
+        );
+    }
+    let (root, _root_opened) = open_verified(path, &root_before, &canonical_root, true)?;
     for entry in WalkDir::new(path).follow_links(false).contents_first(true) {
         let entry = entry?;
-        if entry.file_type().is_symlink() {
+        let before = fs::symlink_metadata(entry.path())?;
+        if before.file_type().is_symlink() {
             bail!(
                 "content-sealed artifact cannot contain symlink {}",
                 entry.path().display()
             );
         }
-        let metadata = entry.metadata()?;
+        let directory = before.is_dir();
+        if !directory && !before.is_file() {
+            bail!("unsupported file type in {}", entry.path().display());
+        }
+        let (opened, metadata) = open_verified(entry.path(), &before, &canonical_root, directory)?;
         let mut permissions = metadata.permissions();
         permissions.set_mode(permissions.mode() & !0o222);
-        fs::set_permissions(entry.path(), permissions)
+        opened
+            .set_permissions(permissions)
             .with_context(|| format!("failed to seal artifact path {}", entry.path().display()))?;
+        if opened.metadata()?.permissions().mode() & 0o222 != 0 {
+            bail!(
+                "artifact path remained writable: {}",
+                entry.path().display()
+            );
+        }
+    }
+    verify_root_object(path, &root_before, &root)?;
+    if root.metadata()?.permissions().mode() & 0o222 != 0 {
+        bail!("artifact root remained writable: {}", path.display());
     }
     Ok(())
 }
 
-fn tree_content_hash(path: &Path, version: &str, exclude_artifact_sidecar: bool) -> Result<String> {
-    if !path.is_dir() {
+pub fn verify_artifact_tree_sealed(path: &Path) -> Result<()> {
+    let root_before = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat artifact root {}", path.display()))?;
+    if root_before.file_type().is_symlink() || !root_before.is_dir() {
         bail!(
-            "content-sealed artifact must be a directory: {}",
+            "content-sealed artifact root must be a real directory: {}",
             path.display()
         );
     }
+    let canonical_root = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize artifact root {}", path.display()))?;
+    if canonical_root != path {
+        bail!(
+            "artifact root changed or is not canonical: {}",
+            path.display()
+        );
+    }
+    let (root, _root_opened) = open_verified(path, &root_before, &canonical_root, true)?;
+    for entry in WalkDir::new(path).follow_links(false) {
+        let entry = entry?;
+        let before = fs::symlink_metadata(entry.path())?;
+        if before.file_type().is_symlink() {
+            bail!(
+                "content-sealed artifact cannot contain symlink {}",
+                entry.path().display()
+            );
+        }
+        let directory = before.is_dir();
+        if !directory && !before.is_file() {
+            bail!("unsupported file type in {}", entry.path().display());
+        }
+        let (_opened, metadata) = open_verified(entry.path(), &before, &canonical_root, directory)?;
+        if metadata.permissions().mode() & 0o222 != 0 {
+            bail!("artifact path is writable: {}", entry.path().display());
+        }
+    }
+    verify_root_object(path, &root_before, &root)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InventoryKind {
+    Source,
+    Artifact,
+}
+
+impl InventoryKind {
+    fn version(self) -> &'static [u8] {
+        match self {
+            Self::Source => b"dir_content_hash/v3",
+            Self::Artifact => b"artifact_content_hash/v2",
+        }
+    }
+}
+
+fn tree_content_hash<F>(path: &Path, kind: InventoryKind, mut before_open: F) -> Result<String>
+where
+    F: FnMut(&Path),
+{
+    let root_before = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat inventory root {}", path.display()))?;
+    if root_before.file_type().is_symlink() || !root_before.is_dir() {
+        bail!(
+            "inventory root must be a real directory: {}",
+            path.display()
+        );
+    }
+    let canonical_root = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize inventory root {}", path.display()))?;
+    if kind == InventoryKind::Artifact && canonical_root != path {
+        bail!(
+            "artifact root changed or is not canonical: {}",
+            path.display()
+        );
+    }
+    let (root, root_opened) = open_verified(path, &root_before, &canonical_root, true)?;
     let mut hasher = Sha256::new();
-    hasher.update(version.as_bytes());
+    hasher.update(kind.version());
     hasher.update(b"\0");
     for entry in WalkDir::new(path).follow_links(false).sort_by_file_name() {
         let entry = entry?;
@@ -141,48 +251,210 @@ fn tree_content_hash(path: &Path, version: &str, exclude_artifact_sidecar: bool)
             continue;
         }
         let rel = entry.path().strip_prefix(path)?;
-        if exclude_artifact_sidecar
+        let before = fs::symlink_metadata(entry.path())?;
+        if kind == InventoryKind::Artifact
             && entry.depth() == 1
             && rel == Path::new(crate::fs_layout::ARTIFACT_META)
         {
-            continue;
+            if before.is_file() {
+                continue;
+            }
+            bail!(
+                "artifact sidecar must be a regular file: {}",
+                entry.path().display()
+            );
         }
         let rel_bytes = rel.as_os_str().as_bytes();
         hasher.update((rel_bytes.len() as u64).to_be_bytes());
         hasher.update(rel_bytes);
-        let file_type = entry.file_type();
-        if file_type.is_file() {
-            hasher.update(b"f");
-            let executable = entry.metadata()?.permissions().mode() & 0o111 != 0;
-            hasher.update([u8::from(executable)]);
-            let mut file = fs::File::open(entry.path())?;
+        before_open(entry.path());
+        if before.is_file() {
+            let (mut file, opened_before) =
+                open_verified(entry.path(), &before, &canonical_root, false)?;
+            let mut file_hasher = Sha256::new();
+            let mut size = 0_u64;
             let mut buffer = [0_u8; 1024 * 1024];
             loop {
                 let read = file.read(&mut buffer)?;
                 if read == 0 {
                     break;
                 }
-                hasher.update(&buffer[..read]);
+                size = size
+                    .checked_add(read as u64)
+                    .context("inventory file size overflow")?;
+                file_hasher.update(&buffer[..read]);
             }
-        } else if file_type.is_symlink() {
-            if exclude_artifact_sidecar {
+            let opened_after = file.metadata()?;
+            if !same_stable_metadata(&opened_before, &opened_after) || size != opened_before.len() {
+                bail!("file changed while hashing: {}", entry.path().display());
+            }
+            let digest = file_hasher.finalize();
+            hasher.update(b"f");
+            hasher.update((opened_before.mode() & 0o111).to_be_bytes());
+            hasher.update(size.to_be_bytes());
+            hasher.update((digest.len() as u64).to_be_bytes());
+            hasher.update(digest);
+        } else if before.file_type().is_symlink() {
+            if kind == InventoryKind::Artifact {
                 bail!(
                     "content-sealed artifact cannot contain symlink {}",
                     entry.path().display()
                 );
             }
-            hasher.update(b"l");
             let target = fs::read_link(entry.path())?;
+            let after = fs::symlink_metadata(entry.path())?;
+            if !same_stable_metadata(&before, &after) {
+                bail!("symlink changed while hashing: {}", entry.path().display());
+            }
             let target_bytes = target.as_os_str().as_bytes();
+            hasher.update(b"l");
             hasher.update((target_bytes.len() as u64).to_be_bytes());
             hasher.update(target_bytes);
-        } else if file_type.is_dir() {
+        } else if before.is_dir() {
+            let (_directory, opened) = open_verified(entry.path(), &before, &canonical_root, true)?;
             hasher.update(b"d");
+            hasher.update((opened.mode() & 0o111).to_be_bytes());
         } else {
             bail!("unsupported file type in {}", entry.path().display());
         }
     }
+    verify_root_stable(path, &root_before, &root, &root_opened)?;
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn open_verified(
+    path: &Path,
+    expected: &fs::Metadata,
+    canonical_root: &Path,
+    directory: bool,
+) -> Result<(fs::File, fs::Metadata)> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(
+        libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if directory {
+                libc::O_DIRECTORY
+            } else {
+                libc::O_NONBLOCK
+            },
+    );
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open inventory entry {}", path.display()))?;
+    let opened = file.metadata()?;
+    if !same_stable_metadata(expected, &opened)
+        || directory != opened.is_dir()
+        || (!directory && !opened.is_file())
+    {
+        bail!("inventory entry changed before open: {}", path.display());
+    }
+    let descriptor_path = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .with_context(|| {
+            format!(
+                "failed to resolve opened inventory entry {}",
+                path.display()
+            )
+        })?;
+    let current_path = path
+        .canonicalize()
+        .with_context(|| format!("inventory entry disappeared after open: {}", path.display()))?;
+    if descriptor_path != current_path || !descriptor_path.starts_with(canonical_root) {
+        bail!(
+            "opened inventory entry escaped its root: {}",
+            path.display()
+        );
+    }
+    Ok((file, opened))
+}
+
+fn verify_root_stable(
+    path: &Path,
+    expected: &fs::Metadata,
+    root: &fs::File,
+    opened: &fs::Metadata,
+) -> Result<()> {
+    let current_path = fs::symlink_metadata(path)?;
+    let current_opened = root.metadata()?;
+    if !same_object(expected, &current_path) || !same_stable_metadata(opened, &current_opened) {
+        bail!(
+            "inventory root changed during traversal: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn verify_root_object(path: &Path, expected: &fs::Metadata, root: &fs::File) -> Result<()> {
+    let current_path = fs::symlink_metadata(path)?;
+    if !same_object(expected, &current_path) || !same_object(expected, &root.metadata()?) {
+        bail!(
+            "inventory root changed during traversal: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn same_object(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    first.dev() == second.dev()
+        && first.ino() == second.ino()
+        && first.mode() & libc::S_IFMT == second.mode() & libc::S_IFMT
+}
+
+fn same_stable_metadata(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    same_object(first, second)
+        && first.len() == second.len()
+        && first.mtime() == second.mtime()
+        && first.mtime_nsec() == second.mtime_nsec()
+        && first.ctime() == second.ctime()
+        && first.ctime_nsec() == second.ctime_nsec()
+}
+
+pub fn canonical_artifact_path(root: &Path, candidate: &Path) -> Result<PathBuf> {
+    if !root.is_absolute() || !candidate.is_absolute() {
+        bail!("artifact root and path must be absolute");
+    }
+    let root_metadata = fs::symlink_metadata(root)
+        .with_context(|| format!("failed to stat artifact root {}", root.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        bail!("artifact root must be a real directory: {}", root.display());
+    }
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize artifact root {}", root.display()))?;
+    if canonical_root != root {
+        bail!("artifact root is not canonical: {}", root.display());
+    }
+    let candidate_metadata = fs::symlink_metadata(candidate)
+        .with_context(|| format!("failed to stat artifact path {}", candidate.display()))?;
+    if candidate_metadata.file_type().is_symlink() || !candidate_metadata.is_dir() {
+        bail!(
+            "artifact path must be a real directory: {}",
+            candidate.display()
+        );
+    }
+    let canonical_candidate = candidate.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize artifact path {}",
+            candidate.display()
+        )
+    })?;
+    if canonical_candidate != candidate || !canonical_candidate.starts_with(&canonical_root) {
+        bail!(
+            "artifact path must be canonical and contained by {}: {}",
+            canonical_root.display(),
+            candidate.display()
+        );
+    }
+    Ok(canonical_candidate)
+}
+
+#[cfg(test)]
+fn artifact_content_hash_with_hook<F>(path: &Path, before_open: F) -> Result<String>
+where
+    F: FnMut(&Path),
+{
+    tree_content_hash(path, InventoryKind::Artifact, before_open)
 }
 
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
@@ -573,6 +845,86 @@ mod tests {
     }
 
     #[test]
+    fn inventory_rows_frame_file_content_unambiguously() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut encoded_second_entry = (1_u64).to_be_bytes().to_vec();
+        encoded_second_entry.extend_from_slice(b"b");
+        encoded_second_entry.extend_from_slice(b"f");
+        encoded_second_entry.push(0);
+        encoded_second_entry.extend_from_slice(b"payload");
+        fs::write(first.path().join("a"), encoded_second_entry).unwrap();
+        fs::write(second.path().join("a"), b"").unwrap();
+        fs::write(second.path().join("b"), b"payload").unwrap();
+
+        assert_ne!(
+            artifact_content_hash(first.path()).unwrap(),
+            artifact_content_hash(second.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn artifact_hash_rejects_symlink_swap_before_open() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), b"outside").unwrap();
+        let payload = dir.path().join("payload.bin");
+        fs::write(&payload, b"inside").unwrap();
+        let mut swapped = false;
+
+        let error = artifact_content_hash_with_hook(dir.path(), |entry| {
+            if entry == payload && !swapped {
+                fs::remove_file(entry).unwrap();
+                symlink(outside.path(), entry).unwrap();
+                swapped = true;
+            }
+        })
+        .expect_err("symlink swap must fail");
+        assert!(
+            format!("{error:#}").contains("failed to open inventory entry")
+                || format!("{error:#}").contains("changed before open")
+        );
+    }
+
+    #[test]
+    fn artifact_hash_rejects_mutation_between_stat_and_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("payload.bin");
+        fs::write(&payload, b"first").unwrap();
+        let mut changed = false;
+
+        let error = artifact_content_hash_with_hook(dir.path(), |entry| {
+            if entry == payload && !changed {
+                fs::write(entry, b"second-longer").unwrap();
+                changed = true;
+            }
+        })
+        .expect_err("mutation must fail");
+        assert!(format!("{error:#}").contains("changed before open"));
+    }
+
+    #[test]
+    fn canonical_artifact_path_rejects_missing_and_symlinked_paths() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("user/missing");
+        let missing_error =
+            canonical_artifact_path(root.path(), &missing).expect_err("missing artifact must fail");
+        assert!(format!("{missing_error:#}").contains("failed to stat artifact path"));
+
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let linked = root.path().join("linked");
+        symlink(&real, &linked).unwrap();
+        let link_error =
+            canonical_artifact_path(root.path(), &linked).expect_err("symlink artifact must fail");
+        assert!(format!("{link_error:#}").contains("must be a real directory"));
+    }
+
+    #[test]
     fn seal_artifact_tree_removes_write_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested");
@@ -593,6 +945,14 @@ mod tests {
             fs::metadata(&payload).unwrap().permissions().mode() & 0o222,
             0
         );
+        verify_artifact_tree_sealed(dir.path()).unwrap();
+
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = verify_artifact_tree_sealed(dir.path())
+            .expect_err("writable artifact entry must fail verification");
+        assert!(format!("{error:#}").contains("is writable"));
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

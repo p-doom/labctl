@@ -31,6 +31,8 @@
 
 use std::{
     fs,
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
@@ -98,17 +100,57 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 pub fn publish_artifact_sidecar(path: &Path, sidecar: &ArtifactSidecar) -> Result<()> {
-    if path.exists() {
-        let bytes = fs::read(path)
-            .with_context(|| format!("failed to read existing sidecar {}", path.display()))?;
-        let existing: ArtifactSidecar = serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid existing sidecar {}", path.display()))?;
+    if let Some(existing) = read_artifact_sidecar(path)? {
         if existing != *sidecar {
             bail!("existing artifact sidecar conflicts: {}", path.display());
         }
         return Ok(());
     }
     atomic_write_json(path, sidecar)
+}
+
+pub fn read_artifact_sidecar(path: &Path) -> Result<Option<ArtifactSidecar>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to stat artifact sidecar {}", path.display()));
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!(
+            "artifact sidecar must be a regular file: {}",
+            path.display()
+        );
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open artifact sidecar {}", path.display()))?;
+    let opened_before = file.metadata()?;
+    if metadata.dev() != opened_before.dev()
+        || metadata.ino() != opened_before.ino()
+        || metadata.len() != opened_before.len()
+        || metadata.ctime() != opened_before.ctime()
+        || metadata.ctime_nsec() != opened_before.ctime_nsec()
+    {
+        bail!("artifact sidecar changed before open: {}", path.display());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read artifact sidecar {}", path.display()))?;
+    let opened_after = file.metadata()?;
+    if opened_before.len() != opened_after.len()
+        || opened_before.ctime() != opened_after.ctime()
+        || opened_before.ctime_nsec() != opened_after.ctime_nsec()
+    {
+        bail!("artifact sidecar changed while reading: {}", path.display());
+    }
+    let sidecar = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid existing sidecar {}", path.display()))?;
+    Ok(Some(sidecar))
 }
 
 /// Mode bits for the shared-multi-user setup: group rwx + setgid (so

@@ -1517,6 +1517,22 @@ impl PgStore {
                      producer_run_id, or metadata"
                 );
             }
+            let retry_path = existing.path.clone();
+            let expected_hash = content_hash.to_string();
+            tokio::task::spawn_blocking(move || {
+                let actual = crate::util::artifact_content_hash(&retry_path)?;
+                crate::util::verify_artifact_tree_sealed(&retry_path)?;
+                if actual != expected_hash {
+                    bail!(
+                        "artifact content changed during concurrent registration: registry={}, actual={}",
+                        expected_hash,
+                        actual
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .context("artifact concurrent retry verification join")??;
             tx.commit()
                 .await
                 .with_context(|| format!("complete_artifact_registration({id}): retry commit"))?;
@@ -1526,9 +1542,19 @@ impl PgStore {
         let completion: Result<()> = async {
             let target = sidecar_target.to_path_buf();
             let artifact_path = path.to_path_buf();
+            let expected_hash = content_hash.to_string();
             tokio::task::spawn_blocking(move || {
                 fs_layout::publish_artifact_sidecar(&target, &sidecar)?;
-                crate::util::seal_artifact_tree(&artifact_path)
+                crate::util::seal_artifact_tree(&artifact_path)?;
+                let actual = crate::util::artifact_content_hash(&artifact_path)?;
+                if actual != expected_hash {
+                    bail!(
+                        "artifact changed during sealing: expected={}, actual={}",
+                        expected_hash,
+                        actual
+                    );
+                }
+                Ok(())
             })
             .await
             .context("artifact seal join")??;
@@ -2661,7 +2687,8 @@ pub(crate) mod tests {
         assert!(
             path_conflict
                 .to_string()
-                .contains("already registered with different")
+                .contains("must be a real directory"),
+            "unexpected symlink-path error: {path_conflict:#}"
         );
 
         let conflict = store
@@ -2756,11 +2783,23 @@ pub(crate) mod tests {
         std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o644))
             .expect("force owner mutation permissions");
         std::fs::write(&payload, b"second").expect("mutate payload");
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o444))
+            .expect("restore sealed payload permissions");
         let error = store
             .verified_artifact_content_hash(&artifact)
             .await
             .expect_err("mutated artifact must fail verification");
         assert!(format!("{error:#}").contains("content hash mismatch"));
+        let retry_error = store
+            .insert_artifact(
+                "dataset",
+                &path,
+                None,
+                &serde_json::json!({"role": "input"}),
+            )
+            .await
+            .expect_err("changed existing registration must fail");
+        assert!(format!("{retry_error:#}").contains("content hash mismatch"));
 
         sqlx::query("DELETE FROM artifacts WHERE id = $1")
             .bind(&artifact.id)
