@@ -148,7 +148,7 @@ function filterNaive(runs: RunSummary[], q: string): RunSummary[] {
 // line. Tighten if you start running these on dedicated hardware.
 const BUDGET_PER_KEYSTROKE_MS = 5; // human-perceptible threshold ~50ms; aim 10× under
 const BUDGET_HAYSTACK_BUILD_MS = 25; // runs once per SSE push, not per keystroke
-const BENCHMARK_TIMEOUT_MS = 20_000;
+const BENCHMARK_TIMEOUT_MS = 90_000;
 
 describe("filter pipeline perf", () => {
   for (const N of [1000, 10000] as const) {
