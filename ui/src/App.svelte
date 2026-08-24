@@ -85,24 +85,24 @@
       <TopBar {cluster} />
     {/if}
     <div class="content">
-      <!-- All four list views are always mounted; we only toggle which one
-           is visible. This preserves scroll, cursor, and filter state when
-           the user moves between views. The lineage view is full-viewport
-           and only mounted on demand. -->
-      <div class="view" data-active={router.view === "runs"}>
-        <RunsView />
-        {#if router.view === "runs" && router.selected}<RunPanel runId={router.selected} />{/if}
-      </div>
-      <div class="view" data-active={router.view === "pipelines"}>
-        <PipelinesView />
-      </div>
-      <div class="view" data-active={router.view === "artifacts"}>
-        <ArtifactsView />
-      </div>
-      <div class="view" data-active={router.view === "policies" && !router.selected}>
-        <PoliciesView />
-      </div>
-      {#if router.view === "policies" && router.selected}
+      {#if router.view === "runs"}
+        <div class="view" data-active="true">
+          <RunsView />
+          {#if router.selected}<RunPanel runId={router.selected} />{/if}
+        </div>
+      {:else if router.view === "pipelines"}
+        <div class="view" data-active="true">
+          <PipelinesView />
+        </div>
+      {:else if router.view === "artifacts"}
+        <div class="view" data-active="true">
+          <ArtifactsView />
+        </div>
+      {:else if router.view === "policies" && !router.selected}
+        <div class="view" data-active="true">
+          <PoliciesView />
+        </div>
+      {:else if router.view === "policies" && router.selected}
         <div class="view" data-active="true">
           <PolicyDetailView policyName={router.selected} />
         </div>
