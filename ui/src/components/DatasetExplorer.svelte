@@ -497,9 +497,10 @@
 
 <!-- ── Maximized overlay ──────────────────────────────────────────── -->
 {#if maximized}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="backdrop" onclick={closeExplorer}>
-    <div class="overlay" role="dialog" aria-label="Dataset explorer" onclick={(e) => e.stopPropagation()}>
+  <dialog open class="backdrop" aria-label="Dataset explorer" onclick={(e) => {
+    if (e.target === e.currentTarget) closeExplorer();
+  }}>
+    <div class="overlay">
       <button class="close-btn" onclick={closeExplorer} aria-label="close">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
           <path d="M1 1L13 13M13 1L1 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
@@ -510,7 +511,7 @@
         <!-- ── TABLE MODE (tabbed browse, full width) ───────────────── -->
         <div class="table-mode">
           <header class="ov-head">
-            <nav class="tabs" role="tablist">
+            <div class="tabs" role="tablist">
               <button role="tab" aria-selected={tab === "segments"} class:active={tab === "segments"} onclick={() => setTab("segments")}>
                 Segments <span class="count mono">{segmentsFiltered.length}</span>
               </button>
@@ -520,7 +521,7 @@
               <button role="tab" aria-selected={tab === "timeline"} class:active={tab === "timeline"} onclick={() => setTab("timeline")}>
                 Timeline
               </button>
-            </nav>
+            </div>
             <div class="filters">
               <label>
                 <span>from</span>
@@ -764,7 +765,7 @@
         {/if}
       {/if}
     </div>
-  </div>
+  </dialog>
 {/if}
 
 <style>
@@ -802,6 +803,8 @@
      like the popup "blinking" on every tab click. */
   .backdrop {
     position: fixed; inset: 0; z-index: 9999;
+    width: auto; height: auto; max-width: none; margin: 0; border: 0;
+    box-sizing: border-box; color: inherit;
     background: rgba(0, 0, 0, 0.72);
     display: flex; align-items: center; justify-content: center;
     padding: 24px;
@@ -889,7 +892,6 @@
   }
   .seg-table tr[role="button"] { cursor: pointer; }
   .seg-table tr[role="button"]:hover td { background: theme("colors.bg.2"); }
-  .seg-table tr.active td { background: theme("colors.accent.soft"); }
   .seg-table .num { text-align: right; font-variant-numeric: tabular-nums; }
   .seg-table .dim { color: theme("colors.fg.2"); }
   .seg-table .split {

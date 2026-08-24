@@ -1,12 +1,17 @@
 <script lang="ts">
-  import { Handle, Position, type NodeProps } from "@xyflow/svelte";
+  import { Handle, Position, type Node, type NodeProps } from "@xyflow/svelte";
   import type { ArtifactSummary } from "../lib/types";
 
-  type Props = NodeProps<{
-    artifact: ArtifactSummary & { is_root?: boolean };
-    aliases: string[];
-    direction?: "TB" | "LR";
-  }>;
+  type Props = NodeProps<
+    Node<
+      {
+        artifact: ArtifactSummary & { is_root?: boolean };
+        aliases: string[];
+        direction?: "TB" | "LR";
+      },
+      "artifact"
+    >
+  >;
   let { data }: Props = $props();
   let dir = $derived(data.direction ?? "LR");
   let displayName = $derived(data.aliases[0] ?? data.artifact.id);
@@ -91,6 +96,7 @@
     word-break: break-all;
     overflow: hidden;
     display: -webkit-box;
+    line-clamp: 2;
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
   }

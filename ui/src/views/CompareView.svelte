@@ -6,9 +6,10 @@
   import { store, loadCompareView } from "../lib/store.svelte";
   import { router } from "../lib/router.svelte";
   import { compareSelection } from "../lib/compare.svelte";
-  import type { MetricSeries, MetricSeriesPoint } from "../lib/types";
+  import type { EvalSeriesPoint, MetricSeries } from "../lib/types";
 
-  import MetricChart, { type ChartSeries } from "../components/MetricChart.svelte";
+  import MetricChart from "../components/MetricChart.svelte";
+  import type { ChartSeries } from "../lib/chart-utils";
   import Pill from "../components/Pill.svelte";
   import RelativeTime from "../components/RelativeTime.svelte";
   import Hash from "../components/Hash.svelte";
@@ -63,6 +64,8 @@
         state: p.state,
         checkpoint_artifact_id: p.checkpoint_artifact_id,
         metric_name: activeMetric,
+        eval_result_artifact_id: null,
+        has_rollout: false,
       })),
     }));
   });
@@ -75,7 +78,7 @@
   }
 
   function close() { router.go("runs"); }
-  function onPointClick(_seriesId: string, p: MetricSeriesPoint) {
+  function onPointClick(_seriesId: string, p: EvalSeriesPoint) {
     if (p.eval_run_id) router.go("runs", p.eval_run_id);
   }
   function removeFromCompare(id: string) {

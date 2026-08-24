@@ -1,10 +1,10 @@
 <script lang="ts">
-  import { Handle, Position, type NodeProps } from "@xyflow/svelte";
+  import { Handle, Position, type Node, type NodeProps } from "@xyflow/svelte";
   import Duration from "./Duration.svelte";
   import { statusGroup, shortStatus } from "../lib/format";
   import type { RunSummary } from "../lib/types";
 
-  type Props = NodeProps<{ run: RunSummary; stageName: string }>;
+  type Props = NodeProps<Node<{ run: RunSummary; stageName: string }, "stage">>;
   let { data }: Props = $props();
   let group = $derived(statusGroup(data.run.status));
 </script>

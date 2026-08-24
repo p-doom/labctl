@@ -196,9 +196,10 @@
 
 <!-- ── Maximized overlay ──────────────────────────────────────────── -->
 {#if maximized && data}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="backdrop" onclick={() => maximized = false}>
-    <div class="overlay" role="dialog" aria-label="Rollout viewer" onclick={(e) => e.stopPropagation()}>
+  <dialog open class="backdrop" aria-label="Rollout viewer" onclick={(e) => {
+    if (e.target === e.currentTarget) maximized = false;
+  }}>
+    <div class="overlay">
 
       <!-- close button -->
       <button class="close-btn" onclick={() => maximized = false} aria-label="close">
@@ -282,7 +283,7 @@
       </div>
 
     </div>
-  </div>
+  </dialog>
 {/if}
 
 <style>
@@ -427,6 +428,8 @@
   /* ── Maximized overlay ────────────────────────────────────────── */
   .backdrop {
     position: fixed; inset: 0; z-index: 9999;
+    width: auto; height: auto; max-width: none; margin: 0; border: 0;
+    box-sizing: border-box; color: inherit;
     background: rgba(0, 0, 0, 0.72);
     display: flex; align-items: center; justify-content: center;
     padding: 24px;

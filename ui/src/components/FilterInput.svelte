@@ -12,7 +12,7 @@
   // or later). User sees their character immediately; the list catches
   // up one frame behind without ever being on the keystroke's critical
   // path.
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { postTask } from "../lib/post-task";
   import Icon from "./Icon.svelte";
 
@@ -34,13 +34,14 @@
   // What the input element actually shows. Owned by this component; the
   // parent's `value` prop is treated as the initial value plus a hook
   // for programmatic resets (which we surface via `lastEmitted`).
-  let displayed = $state(value);
+  const initialValue = untrack(() => value);
+  let displayed = $state(initialValue);
   let pending = "";
   let taskPending = false;
   // Last value we sent to the parent. Lets us distinguish parent-driven
   // resets (which should sync into `displayed`) from our own emits
   // (which shouldn't override mid-typing).
-  let lastEmitted = value;
+  let lastEmitted = initialValue;
 
   $effect(() => {
     // External reset path: parent set value to something we didn't emit

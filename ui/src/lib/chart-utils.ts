@@ -52,7 +52,7 @@ export function chartEmptyReason(series: ChartSeries[]): ChartEmptyReason {
 export function buildChartData(series: ChartSeries[]): {
   xs: number[];
   ys: (number | null)[][];
-  data: (number | null)[][];
+  data: [number[], ...(number | null)[][]];
 } {
   const allX = new Set<number>();
   for (const s of series) {

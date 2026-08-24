@@ -13,10 +13,13 @@ import type { EvalSeriesPoint } from "./types";
 function pt(step: number | null, value: number | null): EvalSeriesPoint {
   return {
     step,
-    value: value as number, // tests deliberately pass null sometimes
+    value,
+    metric_name: null,
     eval_run_id: null,
     state: "succeeded",
     checkpoint_artifact_id: "artifact_x",
+    eval_result_artifact_id: null,
+    has_rollout: false,
   };
 }
 
@@ -33,7 +36,7 @@ describe("buildChartData", () => {
   });
 
   it("returns empty xs when every series has no plottable points", () => {
-    const out = buildChartData([series("a", [pt(null, 1), pt(2, null as unknown as number)])]);
+    const out = buildChartData([series("a", [pt(null, 1), pt(2, null)])]);
     expect(out.xs).toEqual([]);
     expect(out.data[0]).toEqual([]);
   });
@@ -75,7 +78,7 @@ describe("buildChartData", () => {
       series("a", [
         pt(10, 0.1),
         pt(null, 0.5),
-        pt(20, null as unknown as number),
+        pt(20, null),
         pt(30, 0.3),
       ]),
     ]);
@@ -105,7 +108,7 @@ describe("chartEmptyReason", () => {
   it("returns no-steps when points exist but all lack step or value", () => {
     expect(
       chartEmptyReason([
-        series("a", [pt(null, 0.1), pt(20, null as unknown as number)]),
+        series("a", [pt(null, 0.1), pt(20, null)]),
       ]),
     ).toEqual({ kind: "no-steps" });
   });

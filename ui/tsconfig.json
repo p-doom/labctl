@@ -10,6 +10,7 @@
     "isolatedModules": true,
     "moduleResolution": "bundler",
     "strict": true,
+    "types": ["vite/client"],
     "noUncheckedIndexedAccess": false
   },
   "include": ["src/**/*.ts", "src/**/*.svelte"]

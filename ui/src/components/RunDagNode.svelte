@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { Handle, Position, type NodeProps } from "@xyflow/svelte";
+  import { Handle, Position, type Node, type NodeProps } from "@xyflow/svelte";
   import { statusGroup } from "../lib/format";
   import type { RunSummary } from "../lib/types";
 
-  type Props = NodeProps<{ run: RunSummary; direction?: "TB" | "LR" }>;
+  type Props = NodeProps<Node<{ run: RunSummary; direction?: "TB" | "LR" }, "run">>;
   let { data }: Props = $props();
   let dir = $derived(data.direction ?? "LR");
   let group = $derived(statusGroup(data.run.status));
