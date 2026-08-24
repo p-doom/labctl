@@ -185,9 +185,14 @@ pub fn status(unit_name: &str) -> Result<()> {
         .args(["--user", "status", unit_name])
         .status()
         .context("failed to invoke systemctl")?;
-    // `systemctl status` returns nonzero when the unit is dead/inactive,
-    // which is informational — not an error from our perspective.
-    let _ = exit;
+    require_successful_status(unit_name, exit)?;
+    Ok(())
+}
+
+fn require_successful_status(unit_name: &str, exit: std::process::ExitStatus) -> Result<()> {
+    if !exit.success() {
+        bail!("systemctl --user status {unit_name} exited with {exit}");
+    }
     Ok(())
 }
 
@@ -302,7 +307,18 @@ pub fn systemd_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
+
+    #[test]
+    fn nonzero_service_status_is_an_error() {
+        let error = require_successful_status(
+            "labctl-agent.service",
+            std::process::ExitStatus::from_raw(3 << 8),
+        )
+        .expect_err("inactive service status must fail");
+        assert!(error.to_string().contains("exited with exit status: 3"));
+    }
 
     #[test]
     fn agent_unit_omits_bind_and_uses_agent_subcommand() {
