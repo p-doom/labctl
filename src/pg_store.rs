@@ -22,6 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -37,6 +38,8 @@ use crate::store::{
     ArtifactRow, ClaimOutcome, EvalRequestSlot, EvalSeriesRow, EventRow, InputResolution, NewRun,
     PipelineRow, PolicySummaryRow, RunRow, RunSummaryRow, RunView, TrackingRow, is_terminal,
 };
+
+const PG_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Embedded migration set. Resolved at compile time from `migrations/`;
 /// applied to every PG instance the first time `PgStore::connect` runs
@@ -61,10 +64,12 @@ impl PgStore {
                 cluster.name,
             )
         })?;
+        let max_connections = checked_max_connections(pg.max_connections)?;
         probe_unix_socket(pg)?;
         let opts = build_connect_options(pg)?;
         let pool = PgPoolOptions::new()
-            .max_connections(pg.max_connections)
+            .max_connections(max_connections)
+            .acquire_timeout(PG_ACQUIRE_TIMEOUT)
             .connect_with(opts)
             .await
             .with_context(|| {
@@ -2145,6 +2150,13 @@ fn build_connect_options(pg: &PgConfig) -> Result<PgConnectOptions> {
     Ok(opts)
 }
 
+fn checked_max_connections(max_connections: u32) -> Result<u32> {
+    if max_connections == 0 {
+        bail!("[postgres].max_connections must be greater than zero");
+    }
+    Ok(max_connections)
+}
+
 // Column lists kept in sync with migrations/0001_initial_schema.sql.
 const RUN_SELECT_BASE: &str = "
     SELECT id, recipe_name, recipe_hash, status, job_id, run_dir, repo,
@@ -2278,6 +2290,67 @@ pub(crate) mod tests {
         assert!(!RUN_SUMMARY_SELECT.contains("dependency_on"));
         assert!(RUN_SUMMARY_SELECT.contains("ORDER BY created_at DESC, id DESC"));
         assert!(RUN_SUMMARY_SELECT.contains("LIMIT $1"));
+    }
+
+    #[test]
+    fn postgres_pool_contract_rejects_zero_and_bounds_acquisition() {
+        assert!(checked_max_connections(0).is_err());
+        assert_eq!(checked_max_connections(8).expect("valid pool size"), 8);
+        assert_eq!(PG_ACQUIRE_TIMEOUT, std::time::Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch PG; set LABCTL_TEST_CLUSTER"]
+    async fn exhausted_pool_times_out_and_recovers_after_connection_replacement() {
+        async fn expect_timeout(pool: &PgPool) {
+            let started = std::time::Instant::now();
+            let error =
+                tokio::time::timeout(PG_ACQUIRE_TIMEOUT + Duration::from_secs(2), pool.acquire())
+                    .await
+                    .expect("pool acquisition exceeded its configured deadline")
+                    .expect_err("pool acquisition succeeded while its only connection was held");
+            assert!(started.elapsed() >= PG_ACQUIRE_TIMEOUT - Duration::from_secs(1));
+            assert!(error.to_string().contains("timed out"));
+        }
+
+        let mut cluster = artifact_test_cluster();
+        cluster
+            .postgres
+            .as_mut()
+            .expect("scratch cluster has postgres")
+            .max_connections = 1;
+        let pg = PgStore::connect(&cluster).await.expect("connect");
+
+        let mut first = pg.pool().acquire().await.expect("acquire only connection");
+        let first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *first)
+            .await
+            .expect("read first backend pid");
+        expect_timeout(pg.pool()).await;
+        drop(first);
+
+        let recovered = tokio::time::timeout(Duration::from_secs(1), pg.pool().acquire())
+            .await
+            .expect("reacquisition blocked after returning connection")
+            .expect("reacquire returned connection");
+        recovered.close().await.expect("close recovered connection");
+
+        let mut replacement = tokio::time::timeout(Duration::from_secs(1), pg.pool().acquire())
+            .await
+            .expect("replacement acquisition blocked")
+            .expect("acquire replacement connection");
+        let replacement_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *replacement)
+            .await
+            .expect("read replacement backend pid");
+        assert_ne!(replacement_pid, first_pid);
+        expect_timeout(pg.pool()).await;
+        drop(replacement);
+
+        tokio::time::timeout(Duration::from_secs(1), pg.pool().acquire())
+            .await
+            .expect("final reacquisition blocked")
+            .expect("final reacquisition failed");
     }
 
     /// End-to-end exercise of the async Store path against a live PG.
