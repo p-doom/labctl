@@ -31,16 +31,16 @@ use crate::util;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoProvenance {
     pub repo_path: PathBuf,
-    pub git_head: Option<String>,
-    pub git_status_porcelain: Option<String>,
+    pub git_head: String,
+    pub git_status_porcelain: String,
     /// Raw `git diff HEAD` text — also written to `tracked.patch` in
     /// the provenance dir. Stored on the struct for audit / context.json
     /// inspection; the cache key uses `diff_hash` (a hash of the
     /// persisted file) instead.
-    pub git_diff_head: Option<String>,
-    /// sha256 of `tracked.patch` file bytes. `None` when there are no
-    /// tracked modifications (or git is unavailable).
-    pub diff_hash: Option<String>,
+    pub git_diff_head: String,
+    /// sha256 of `tracked.patch` file bytes, including the stable hash
+    /// of an empty patch for a clean worktree.
+    pub diff_hash: String,
     pub uv_lock_hash: Option<String>,
     pub uv_lock_path: Option<PathBuf>,
     /// sha256 of `untracked.patch` file bytes — the concatenation of
@@ -54,27 +54,15 @@ pub struct RepoProvenance {
 
 pub fn capture_repo(repo_path: &Path, bundle_dir: &Path) -> Result<RepoProvenance> {
     fs::create_dir_all(bundle_dir)?;
-    let git_head = git(repo_path, &["rev-parse", "HEAD"]).ok();
-    let status = git(repo_path, &["status", "--porcelain"]).ok();
-    let diff = git(repo_path, &["diff", "HEAD"]).ok();
+    let git_head = git(repo_path, &["rev-parse", "HEAD"])?;
+    let status = git(repo_path, &["status", "--porcelain"])?;
+    let diff = git(repo_path, &["diff", "HEAD"])?;
 
-    if let Some(head) = &git_head {
-        fs::write(bundle_dir.join("git_head.txt"), head)?;
-    }
-    if let Some(status) = &status {
-        fs::write(bundle_dir.join("git_status_porcelain.txt"), status)?;
-    }
-    // Write tracked.patch first, then hash the file bytes. Symmetric
-    // with the untracked path below — both hashes derive from on-disk
-    // artifacts, so they survive source-snapshot GC and are recompu-
-    // table from the durable bundle alone.
-    let diff_hash = if let Some(d) = &diff {
-        let target = bundle_dir.join("tracked.patch");
-        fs::write(&target, d)?;
-        Some(util::sha256_file(&target)?)
-    } else {
-        None
-    };
+    fs::write(bundle_dir.join("git_head.txt"), &git_head)?;
+    fs::write(bundle_dir.join("git_status_porcelain.txt"), &status)?;
+    let tracked_patch = bundle_dir.join("tracked.patch");
+    fs::write(&tracked_patch, &diff)?;
+    let diff_hash = util::sha256_file(&tracked_patch)?;
 
     let uv_lock = find_up(repo_path, "uv.lock");
     let (uv_lock_hash, uv_lock_path) = if let Some(lock) = uv_lock {
@@ -86,7 +74,7 @@ pub fn capture_repo(repo_path: &Path, bundle_dir: &Path) -> Result<RepoProvenanc
         (None, None)
     };
 
-    let untracked_files_hash = write_untracked_patch(repo_path, bundle_dir).ok().flatten();
+    let untracked_files_hash = write_untracked_patch(repo_path, bundle_dir)?;
 
     let prov = RepoProvenance {
         repo_path: repo_path.to_path_buf(),
@@ -265,18 +253,24 @@ mod tests {
         let repo = init_repo();
         let bundle = tempdir().unwrap();
         let prov = capture_repo(repo.path(), bundle.path()).unwrap();
-        assert!(prov.git_head.is_some());
-        // git diff HEAD on a clean tree returns empty string ("") which
-        // capture_repo writes to tracked.patch and hashes — sha256("")
-        // is a valid hash, but for clean trees the .ok() in capture_repo
-        // means a successful empty-string `git diff HEAD` results in
-        // Some(""). The hash of an empty patch is therefore Some(...).
-        // What matters is the hash is stable across calls.
+        assert!(!prov.git_head.is_empty());
         let prov2 = capture_repo(repo.path(), bundle.path()).unwrap();
         assert_eq!(prov.diff_hash, prov2.diff_hash);
         assert_eq!(prov.untracked_files_hash, prov2.untracked_files_hash);
         // No untracked files → no untracked.patch.
         assert!(!bundle.path().join("untracked.patch").exists());
+    }
+
+    #[test]
+    fn capture_repo_rejects_missing_git_identity() {
+        let repo = tempdir().unwrap();
+        let bundle = tempdir().unwrap();
+        let err = capture_repo(repo.path(), bundle.path()).expect_err("non-git repo must fail");
+        assert!(
+            format!("{err:#}").contains("command failed"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!bundle.path().join("provenance.json").exists());
     }
 
     #[test]
