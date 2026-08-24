@@ -10,24 +10,9 @@ use serde_json::json;
 
 use crate::util;
 
-/// Per-run snapshot of the source repository's identity at submit
-/// time. Two halves:
-///
-///   * **Audit / replay** — `git_head`, `git_status_porcelain`, and the
-///     raw `git_diff_head` text are kept so an operator can read the
-///     bundle and reconstruct what was submitted.
-///   * **Cache key** — the two hash fields (`diff_hash`,
-///     `untracked_files_hash`) and the simple-value fields (`git_head`,
-///     `uv_lock_hash`) feed `compute_cache_key`. Both dirtiness hashes
-///     are derived from persisted files in the provenance bundle on
-///     disk (`tracked.patch`, `untracked.patch`), not from in-memory
-///     strings or from live disk state. That symmetry buys us:
-///       1. Future cache_key schema migrations recompute deterministically
-///          from the bundle — no need for the source snapshot, which
-///          `gc_terminal_sources` removes shortly after the run finishes.
-///       2. The bundle alone is a sufficient reproducibility artifact
-///          (`git checkout <head> && git apply tracked.patch && git apply
-///          untracked.patch` reconstructs the working tree that ran).
+/// Git audit metadata captured alongside the retained execution snapshot.
+/// Cache identity comes from the materialized snapshot hash, not these
+/// fields; a commit object may disappear from the source repository later.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoProvenance {
     pub repo_path: PathBuf,
@@ -35,8 +20,7 @@ pub struct RepoProvenance {
     pub git_status_porcelain: String,
     /// Raw `git diff HEAD` text — also written to `tracked.patch` in
     /// the provenance dir. Stored on the struct for audit / context.json
-    /// inspection; the cache key uses `diff_hash` (a hash of the
-    /// persisted file) instead.
+    /// inspection.
     pub git_diff_head: String,
     /// sha256 of `tracked.patch` file bytes, including the stable hash
     /// of an empty patch for a clean worktree.
@@ -45,10 +29,8 @@ pub struct RepoProvenance {
     pub uv_lock_path: Option<PathBuf>,
     /// sha256 of `untracked.patch` file bytes — the concatenation of
     /// `git diff --no-index --binary /dev/null <file>` for every
-    /// untracked-but-not-ignored file, sorted by path. Without this,
-    /// a new untracked file shipped into the execution snapshot by
-    /// `copy_dir_filtered` is invisible to the cache key. `None` when
-    /// there are no untracked files.
+    /// untracked-but-not-ignored file, sorted by path. `None` when there
+    /// are no untracked files.
     pub untracked_files_hash: Option<String>,
 }
 

@@ -1,4 +1,10 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    io::Read,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    path::Path,
+    process::Command,
+};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -94,16 +100,44 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 }
 
 pub fn dir_content_hash(path: &Path) -> Result<String> {
-    let mut entries = Vec::new();
+    let mut hasher = Sha256::new();
+    hasher.update(b"dir_content_hash/v2\0");
     for entry in WalkDir::new(path).follow_links(false).sort_by_file_name() {
         let entry = entry?;
-        if entry.file_type().is_file() {
-            let rel = entry.path().strip_prefix(path)?;
-            let hash = sha256_file(entry.path())?;
-            entries.push(format!("{}\t{}", rel.display(), hash));
+        if entry.depth() == 0 {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(path)?;
+        let rel_bytes = rel.as_os_str().as_bytes();
+        hasher.update((rel_bytes.len() as u64).to_be_bytes());
+        hasher.update(rel_bytes);
+        let file_type = entry.file_type();
+        if file_type.is_file() {
+            hasher.update(b"f");
+            let executable = entry.metadata()?.permissions().mode() & 0o111 != 0;
+            hasher.update([u8::from(executable)]);
+            let mut file = fs::File::open(entry.path())?;
+            let mut buffer = [0_u8; 1024 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+        } else if file_type.is_symlink() {
+            hasher.update(b"l");
+            let target = fs::read_link(entry.path())?;
+            let target_bytes = target.as_os_str().as_bytes();
+            hasher.update((target_bytes.len() as u64).to_be_bytes());
+            hasher.update(target_bytes);
+        } else if file_type.is_dir() {
+            hasher.update(b"d");
+        } else {
+            bail!("unsupported file type in {}", entry.path().display());
         }
     }
-    Ok(sha256_bytes(entries.join("\n").as_bytes()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
@@ -155,6 +189,9 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
             .with_context(|| format!("failed to remove existing snapshot {}", dst.display()))?;
     }
     fs::create_dir_all(dst)?;
+    let source_root = src
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize source root {}", src.display()))?;
 
     let mut cmd = Command::new("git");
     cmd.args([
@@ -199,9 +236,10 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
         };
 
         if meta.is_dir() {
-            // Submodule gitlinks list as a single directory entry. Skipping is fine
-            // for the current cluster (no submodules); revisit if that changes.
-            continue;
+            bail!(
+                "git submodule at {} cannot be materialized into an exact source snapshot",
+                src_path.display()
+            );
         }
 
         if let Some(parent) = dst_path.parent() {
@@ -212,6 +250,32 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
         if ft.is_symlink() {
             let target = fs::read_link(&src_path)
                 .with_context(|| format!("read_link {}", src_path.display()))?;
+            if target.is_absolute() {
+                bail!(
+                    "absolute symlink in source snapshot is not allowed: {} -> {}",
+                    src_path.display(),
+                    target.display()
+                );
+            }
+            let resolved = src_path
+                .parent()
+                .context("source symlink has no parent")?
+                .join(&target)
+                .canonicalize()
+                .with_context(|| {
+                    format!(
+                        "source symlink target is missing: {} -> {}",
+                        src_path.display(),
+                        target.display()
+                    )
+                })?;
+            if !resolved.starts_with(&source_root) {
+                bail!(
+                    "source symlink escapes repository: {} -> {}",
+                    src_path.display(),
+                    target.display()
+                );
+            }
             unix_symlink(&target, &dst_path).with_context(|| {
                 format!("symlink {} -> {}", dst_path.display(), target.display())
             })?;
@@ -232,6 +296,24 @@ pub fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
             })?;
         }
     }
+    let snapshot_root = dst.canonicalize()?;
+    for entry in WalkDir::new(dst).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            let resolved = entry.path().canonicalize().with_context(|| {
+                format!(
+                    "source snapshot contains dangling symlink {}",
+                    entry.path().display()
+                )
+            })?;
+            if !resolved.starts_with(&snapshot_root) {
+                bail!(
+                    "source snapshot symlink escapes snapshot: {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -249,6 +331,31 @@ pub fn shell_quote(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_snapshot_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q", "-b", "main"]);
+        run_git(
+            repo.path(),
+            &["config", "user.email", "test@labctl.invalid"],
+        );
+        run_git(repo.path(), &["config", "user.name", "labctl-test"]);
+        fs::write(repo.path().join("tracked.txt"), b"tracked\n").unwrap();
+        run_git(repo.path(), &["add", "tracked.txt"]);
+        run_git(repo.path(), &["commit", "-q", "-m", "initial"]);
+        repo
+    }
 
     #[test]
     fn canonical_value_hash_is_key_order_independent() {
@@ -320,5 +427,79 @@ mod tests {
         let _ = canonical_value_hash(&json!(0), "v1");
         let _ = canonical_value_hash(&json!(-1.5), "v1");
         let _ = canonical_value_hash(&json!("has \"quotes\" and \n newlines"), "v1");
+    }
+
+    #[test]
+    fn dir_content_hash_covers_file_bytes_executable_bit_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("run.sh");
+        fs::write(&file, b"exit 0\n").unwrap();
+        let initial = dir_content_hash(dir.path()).unwrap();
+
+        fs::write(&file, b"exit 1\n").unwrap();
+        let changed_bytes = dir_content_hash(dir.path()).unwrap();
+        assert_ne!(initial, changed_bytes);
+
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&file, permissions).unwrap();
+        let executable = dir_content_hash(dir.path()).unwrap();
+        assert_ne!(changed_bytes, executable);
+
+        let link = dir.path().join("entrypoint");
+        symlink("run.sh", &link).unwrap();
+        let first_link = dir_content_hash(dir.path()).unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink("other.sh", &link).unwrap();
+        let changed_link = dir_content_hash(dir.path()).unwrap();
+        assert_ne!(first_link, changed_link);
+    }
+
+    #[test]
+    fn source_snapshot_rejects_symlinks_outside_the_repo() {
+        use std::os::unix::fs::symlink;
+
+        let repo = init_snapshot_repo();
+        symlink("/etc/passwd", repo.path().join("absolute-link")).unwrap();
+        run_git(repo.path(), &["add", "absolute-link"]);
+        let destination = tempfile::tempdir().unwrap();
+        let snapshot = destination.path().join("source");
+        let err = copy_dir_filtered(repo.path(), &snapshot).expect_err("absolute link must fail");
+        assert!(format!("{err:#}").contains("absolute symlink"));
+
+        fs::remove_file(repo.path().join("absolute-link")).unwrap();
+        symlink("../", repo.path().join("escaping-link")).unwrap();
+        run_git(repo.path(), &["add", "-A"]);
+        let err = copy_dir_filtered(repo.path(), &snapshot).expect_err("escaping link must fail");
+        assert!(format!("{err:#}").contains("escapes repository"));
+    }
+
+    #[test]
+    fn source_snapshot_rejects_gitlinks() {
+        let repo = init_snapshot_repo();
+        let head = run_capture(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo.path()),
+        )
+        .unwrap();
+        run_git(
+            repo.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &head,
+                "vendor",
+            ],
+        );
+        fs::create_dir(repo.path().join("vendor")).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let snapshot = destination.path().join("source");
+        let err = copy_dir_filtered(repo.path(), &snapshot).expect_err("gitlink must fail");
+        assert!(format!("{err:#}").contains("git submodule"));
     }
 }
