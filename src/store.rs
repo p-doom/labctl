@@ -28,7 +28,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -109,6 +109,7 @@ pub struct ArtifactRow {
     pub path: PathBuf,
     pub producer_run_id: Option<String>,
     pub metadata_json: Value,
+    pub content_hash: Option<String>,
     pub created_at: i64,
 }
 
@@ -137,6 +138,8 @@ pub struct InputResolution {
     pub role: String,
     pub artifact_id: Option<String>,
     pub resolved_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 /// One enriched row from the eval-series query: an `eval_requests` row
@@ -359,8 +362,8 @@ impl Store {
 
     /// Register an artifact at the staging path written by the producer.
     /// The producer writes to `<root>/<user>/<alias>/` and the artifact
-    /// lives there permanently — no content-addressed relocation, no
-    /// hash computation. Identity is path-canonical: `artifact_<sha256
+    /// lives there permanently — no content-addressed relocation.
+    /// Identity is path-canonical: `artifact_<sha256
     /// of the canonical path, first 16 hex>`. Re-registering the same
     /// path therefore yields the same id. An exact retry returns the
     /// existing row; changed registration data is a conflict.
@@ -399,6 +402,27 @@ impl Store {
             )
         })?;
 
+        if let Some(existing) = self.pg.get_artifact_optional(&id).await? {
+            if existing.kind != kind
+                || existing.path.as_path() != staging_path
+                || existing.producer_run_id.as_deref() != producer_run_id
+                || existing.metadata_json != *metadata
+            {
+                bail!(
+                    "artifact {id} is already registered with different kind, path, \
+                     producer_run_id, or metadata"
+                );
+            }
+            return Ok(existing);
+        }
+
+        let content_hash = {
+            let path = staging_path.to_path_buf();
+            tokio::task::spawn_blocking(move || util::artifact_content_hash(&path))
+                .await
+                .context("artifact content hash join")??
+        };
+
         let now = util::now_ts();
         let alias = _alias;
         let sidecar = ArtifactSidecar {
@@ -406,6 +430,7 @@ impl Store {
             kind: kind.to_string(),
             user: user.clone(),
             alias,
+            content_hash: content_hash.clone(),
             producer_run_id: producer_run_id.map(str::to_string),
             metadata: metadata.clone(),
             created_at: now,
@@ -417,12 +442,38 @@ impl Store {
                 staging_path,
                 producer_run_id,
                 metadata,
+                &content_hash,
                 &user,
                 now,
                 &staging_path.join(fs_layout::ARTIFACT_META),
                 sidecar,
             )
             .await
+    }
+
+    /// Return the registry content identity after verifying the exact
+    /// directory inventory still matches it. Legacy unsealed rows return
+    /// `None`; a changed or unreadable sealed artifact is an error.
+    pub async fn verified_artifact_content_hash(
+        &self,
+        artifact: &ArtifactRow,
+    ) -> Result<Option<String>> {
+        let Some(expected) = artifact.content_hash.clone() else {
+            return Ok(None);
+        };
+        let path = artifact.path.clone();
+        let actual = tokio::task::spawn_blocking(move || util::artifact_content_hash(&path))
+            .await
+            .context("artifact content verification join")??;
+        if actual != expected {
+            bail!(
+                "artifact {} content hash mismatch: registry={}, actual={}",
+                artifact.id,
+                expected,
+                actual
+            );
+        }
+        Ok(Some(expected))
     }
 
     /// Look up an artifact by `(kind, path)`. The PG `find_artifact_by_path`

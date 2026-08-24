@@ -122,31 +122,33 @@ pub struct StageContext<'a> {
 /// inputs, and recipe args. Git metadata remains audit provenance; only
 /// the materialized source tree identifies the code that will execute.
 fn compute_cache_key(
+    run_id: &str,
     recipe_hash: &str,
     source_hash: &str,
     inputs: &[crate::store::InputResolution],
     params: &BTreeMap<String, Value>,
 ) -> Result<String> {
+    let reusable = inputs
+        .iter()
+        .all(|input| input.artifact_id.is_some() && input.content_hash.is_some());
     let mut input_keys: Vec<String> = inputs
         .iter()
-        .map(|i| {
-            format!(
-                "{}={}",
-                i.role,
-                i.artifact_id
-                    .clone()
-                    .unwrap_or_else(|| i.resolved_path.display().to_string())
-            )
+        .map(|i| match (&i.artifact_id, &i.content_hash) {
+            (Some(id), Some(content_hash)) => {
+                format!("{}={id}:{content_hash}", i.role)
+            }
+            _ => format!("{}=unsealed", i.role),
         })
         .collect();
     input_keys.sort();
     let params_canonical = serde_json::to_string(params)?;
     let payload = serde_json::json!({
-        "schema": "cache_key/v2",
+        "schema": "cache_key/v3",
         "recipe_hash": recipe_hash,
         "source_hash": source_hash,
         "inputs": input_keys,
         "params": params_canonical,
+        "run_scope": (!reusable).then_some(run_id),
     });
     Ok(util::sha256_bytes(&serde_json::to_vec(&payload)?))
 }
@@ -158,19 +160,51 @@ mod cache_key_tests {
     #[test]
     fn execution_snapshot_hash_changes_cache_identity() {
         let params = BTreeMap::new();
-        let first = compute_cache_key("recipe", "source-a", &[], &params).unwrap();
-        let second = compute_cache_key("recipe", "source-b", &[], &params).unwrap();
+        let first = compute_cache_key("run-a", "recipe", "source-a", &[], &params).unwrap();
+        let second = compute_cache_key("run-a", "recipe", "source-b", &[], &params).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn unsealed_inputs_are_scoped_to_one_run() {
+        let inputs = [crate::store::InputResolution {
+            role: "dataset".to_string(),
+            artifact_id: None,
+            resolved_path: PathBuf::from("/mutable/data"),
+            content_hash: None,
+        }];
+        let params = BTreeMap::new();
+        let first = compute_cache_key("run-a", "recipe", "source", &inputs, &params).unwrap();
+        let second = compute_cache_key("run-b", "recipe", "source", &inputs, &params).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn sealed_inputs_reuse_exact_registry_identity() {
+        let inputs = [crate::store::InputResolution {
+            role: "dataset".to_string(),
+            artifact_id: Some("artifact_1234".to_string()),
+            resolved_path: PathBuf::from("/data/location-is-not-identity"),
+            content_hash: Some("a".repeat(64)),
+        }];
+        let params = BTreeMap::new();
+        let first = compute_cache_key("run-a", "recipe", "source", &inputs, &params).unwrap();
+        let second = compute_cache_key("run-b", "recipe", "source", &inputs, &params).unwrap();
+        assert_eq!(first, second);
     }
 }
 
 /// Check that every artifact in `prior_outputs` is still materialized on
 /// disk with its marker file present. Cache-hit only valid when this
 /// returns true.
-fn cache_hit_outputs_valid(
+async fn cache_hit_outputs_valid(
+    store: &Store,
     prior_outputs: &[crate::store::ArtifactRow],
     outputs: &BTreeMap<String, OutputResolution>,
-) -> bool {
+) -> Result<bool> {
+    if prior_outputs.len() != outputs.len() {
+        return Ok(false);
+    }
     // Build a map of role -> expected marker so we can verify each artifact
     // still has its completion marker (in case someone scrubbed the content
     // but left a stray dir).
@@ -178,6 +212,7 @@ fn cache_hit_outputs_valid(
         .iter()
         .map(|(r, res)| (r.as_str(), res.marker.as_deref()))
         .collect();
+    let mut seen_roles = BTreeSet::new();
     for art in prior_outputs {
         // Find the role this artifact filled. The artifact's `metadata_json`
         // includes the role under "role".
@@ -188,18 +223,24 @@ fn cache_hit_outputs_valid(
             .unwrap_or("");
         let marker = match role_to_marker.get(role) {
             Some(m) => *m,
-            None => return false,
+            None => return Ok(false),
         };
+        if !seen_roles.insert(role) {
+            return Ok(false);
+        }
         if !art.path.exists() {
-            return false;
+            return Ok(false);
         }
         if let Some(m) = marker
             && !art.path.join(m).exists()
         {
-            return false;
+            return Ok(false);
+        }
+        if store.verified_artifact_content_hash(art).await?.is_none() {
+            return Ok(false);
         }
     }
-    !prior_outputs.is_empty()
+    Ok(!prior_outputs.is_empty())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -383,7 +424,8 @@ async fn submit_recipe_inner(
         )
     })?;
     let source_hash = util::dir_content_hash(&source_path)?;
-    let cache_key = compute_cache_key(&recipe_hash, &source_hash, &inputs, &recipe.params)?;
+    let cache_key =
+        compute_cache_key(&run_id, &recipe_hash, &source_hash, &inputs, &recipe.params)?;
 
     // Cache hit: a prior run with the same cache_key still has its outputs
     // on disk. Link them and skip the submit / sbatch path. Walk
@@ -395,7 +437,7 @@ async fn submit_recipe_inner(
         .await?
     {
         let prior_outputs = store.run_outputs(&prior_run.id).await?;
-        if cache_hit_outputs_valid(&prior_outputs, &outputs) {
+        if cache_hit_outputs_valid(store, &prior_outputs, &outputs).await? {
             return register_cache_hit(
                 cluster,
                 store,
@@ -1297,11 +1339,7 @@ async fn resolve_inputs(
         let resolved = match spec {
             InputSpec::Artifact { artifact } => {
                 let artifact = store.resolve_artifact_ref(artifact).await?;
-                InputResolution {
-                    role: role.clone(),
-                    artifact_id: Some(artifact.id),
-                    resolved_path: artifact.path,
-                }
+                registered_input(store, role, artifact).await?
             }
             InputSpec::External { path } => InputResolution {
                 role: role.clone(),
@@ -1309,17 +1347,14 @@ async fn resolve_inputs(
                 resolved_path: path
                     .canonicalize()
                     .with_context(|| format!("external input missing: {}", path.display()))?,
+                content_hash: None,
             },
             InputSpec::Checkpoint => {
                 let artifact_ref = overrides.input_artifacts.get(role).with_context(|| {
                     format!("input {role:?} requires an artifact override from evald")
                 })?;
                 let artifact = store.resolve_artifact_ref(artifact_ref).await?;
-                InputResolution {
-                    role: role.clone(),
-                    artifact_id: Some(artifact.id),
-                    resolved_path: artifact.path,
-                }
+                registered_input(store, role, artifact).await?
             }
             InputSpec::From { role: pinned_role } => {
                 let ctx = stage_ctx.with_context(|| {
@@ -1334,11 +1369,7 @@ async fn resolve_inputs(
                          pipeline's `from` run produced no output named {pinned_role:?}"
                     )
                 })?;
-                InputResolution {
-                    role: role.clone(),
-                    artifact_id: Some(artifact.id.clone()),
-                    resolved_path: artifact.path.clone(),
-                }
+                registered_input(store, role, artifact.clone()).await?
             }
             InputSpec::Stage {
                 stage,
@@ -1413,20 +1444,41 @@ async fn resolve_inputs(
                 let artifact_id = store
                     .run_output_artifact_id(parent_run_id, parent_role)
                     .await?;
-                let resolved_path = match &artifact_id {
-                    Some(aid) => store.get_artifact(aid).await?.path,
-                    None => fs_layout::artifact_dir(parent_root, submitted_by, &parent_alias),
-                };
-                InputResolution {
-                    role: role.clone(),
-                    artifact_id,
-                    resolved_path,
+                match artifact_id {
+                    Some(aid) => {
+                        let artifact = store.get_artifact(&aid).await?;
+                        registered_input(store, role, artifact).await?
+                    }
+                    None => InputResolution {
+                        role: role.clone(),
+                        artifact_id: None,
+                        resolved_path: fs_layout::artifact_dir(
+                            parent_root,
+                            submitted_by,
+                            &parent_alias,
+                        ),
+                        content_hash: None,
+                    },
                 }
             }
         };
         out.push(resolved);
     }
     Ok(out)
+}
+
+async fn registered_input(
+    store: &Store,
+    role: &str,
+    artifact: crate::store::ArtifactRow,
+) -> Result<InputResolution> {
+    let content_hash = store.verified_artifact_content_hash(&artifact).await?;
+    Ok(InputResolution {
+        role: role.to_string(),
+        artifact_id: Some(artifact.id),
+        resolved_path: artifact.path,
+        content_hash,
+    })
 }
 
 fn output_paths(
@@ -1939,6 +1991,12 @@ async fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<u
                 // PG round-trip.
                 if let Some(existing) = store.find_artifact_by_path("checkpoint", &step_dir).await?
                 {
+                    store
+                        .verified_artifact_content_hash(&existing)
+                        .await?
+                        .with_context(|| {
+                            format!("checkpoint artifact {} is not content-sealed", existing.id)
+                        })?;
                     store.link_run_output(&run.id, role, &existing.id).await?;
                     continue;
                 }

@@ -75,12 +75,13 @@ pub fn artifact_dir(artifact_root: &Path, user: &str, alias: &str) -> PathBuf {
 
 // ---------- on-disk types ----------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactSidecar {
     pub id: String,
     pub kind: String,
     pub user: String,
     pub alias: String,
+    pub content_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer_run_id: Option<String>,
     pub metadata: Value,
@@ -92,20 +93,22 @@ pub struct ArtifactSidecar {
 /// Write `bytes` to `path` atomically (tmp + rename in same dir). Creates
 /// missing parent directories. Pre-existing target is replaced.
 pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     let bytes = serde_json::to_vec_pretty(value)?;
-    let tmp = path.with_extension(match path.extension().and_then(|s| s.to_str()) {
-        Some(ext) => format!("{ext}.tmp"),
-        None => "tmp".to_string(),
-    });
-    fs::write(&tmp, &bytes)
-        .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
-    Ok(())
+    crate::util::atomic_write(path, &bytes)
+}
+
+pub fn publish_artifact_sidecar(path: &Path, sidecar: &ArtifactSidecar) -> Result<()> {
+    if path.exists() {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read existing sidecar {}", path.display()))?;
+        let existing: ArtifactSidecar = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid existing sidecar {}", path.display()))?;
+        if existing != *sidecar {
+            bail!("existing artifact sidecar conflicts: {}", path.display());
+        }
+        return Ok(());
+    }
+    atomic_write_json(path, sidecar)
 }
 
 /// Mode bits for the shared-multi-user setup: group rwx + setgid (so
@@ -228,6 +231,17 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         let back: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(back, value);
+    }
+
+    #[test]
+    fn atomic_write_json_removes_temp_file_after_publish_failure() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join(".meta.json");
+        fs::create_dir(&target).unwrap();
+
+        atomic_write_json(&target, &serde_json::json!({"id": "artifact"}))
+            .expect_err("directory target must reject rename");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

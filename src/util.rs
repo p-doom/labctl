@@ -1,7 +1,7 @@
 use std::{
     fs,
-    io::Read,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    io::{Read, Write},
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, fs::PermissionsExt},
     path::Path,
     process::Command,
 };
@@ -100,14 +100,53 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 }
 
 pub fn dir_content_hash(path: &Path) -> Result<String> {
+    tree_content_hash(path, "dir_content_hash/v2", false)
+}
+
+pub fn artifact_content_hash(path: &Path) -> Result<String> {
+    tree_content_hash(path, "artifact_content_hash/v1", true)
+}
+
+pub fn seal_artifact_tree(path: &Path) -> Result<()> {
+    for entry in WalkDir::new(path).follow_links(false).contents_first(true) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            bail!(
+                "content-sealed artifact cannot contain symlink {}",
+                entry.path().display()
+            );
+        }
+        let metadata = entry.metadata()?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() & !0o222);
+        fs::set_permissions(entry.path(), permissions)
+            .with_context(|| format!("failed to seal artifact path {}", entry.path().display()))?;
+    }
+    Ok(())
+}
+
+fn tree_content_hash(path: &Path, version: &str, exclude_artifact_sidecar: bool) -> Result<String> {
+    if !path.is_dir() {
+        bail!(
+            "content-sealed artifact must be a directory: {}",
+            path.display()
+        );
+    }
     let mut hasher = Sha256::new();
-    hasher.update(b"dir_content_hash/v2\0");
+    hasher.update(version.as_bytes());
+    hasher.update(b"\0");
     for entry in WalkDir::new(path).follow_links(false).sort_by_file_name() {
         let entry = entry?;
         if entry.depth() == 0 {
             continue;
         }
         let rel = entry.path().strip_prefix(path)?;
+        if exclude_artifact_sidecar
+            && entry.depth() == 1
+            && rel == Path::new(crate::fs_layout::ARTIFACT_META)
+        {
+            continue;
+        }
         let rel_bytes = rel.as_os_str().as_bytes();
         hasher.update((rel_bytes.len() as u64).to_be_bytes());
         hasher.update(rel_bytes);
@@ -126,6 +165,12 @@ pub fn dir_content_hash(path: &Path) -> Result<String> {
                 hasher.update(&buffer[..read]);
             }
         } else if file_type.is_symlink() {
+            if exclude_artifact_sidecar {
+                bail!(
+                    "content-sealed artifact cannot contain symlink {}",
+                    entry.path().display()
+                );
+            }
             hasher.update(b"l");
             let target = fs::read_link(entry.path())?;
             let target_bytes = target.as_os_str().as_bytes();
@@ -141,17 +186,44 @@ pub fn dir_content_hash(path: &Path) -> Result<String> {
 }
 
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    let parent = path
+        .parent()
+        .filter(|candidate| !candidate.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".labctl-{}.tmp", uuid::Uuid::now_v7().simple()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .with_context(|| format!("failed to create temp file {}", temporary.display()))?;
+    let write_result = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to durably write temp file {}", temporary.display()));
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
-    let tmp = path.with_extension(format!(
-        "{}tmp",
-        path.extension().and_then(|s| s.to_str()).unwrap_or("")
-    ));
-    fs::write(&tmp, contents)
-        .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let cleanup = fs::remove_file(&temporary);
+        return match cleanup {
+            Ok(()) => Err(error)
+                .with_context(|| format!("failed to atomically replace {}", path.display())),
+            Err(cleanup_error) => Err(error).with_context(|| {
+                format!(
+                    "failed to atomically replace {}; failed to remove {}: {cleanup_error}",
+                    path.display(),
+                    temporary.display()
+                )
+            }),
+        };
+    }
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to sync parent directory {}", parent.display()))?;
     Ok(())
 }
 
@@ -430,6 +502,21 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_replaces_with_private_file_and_no_temp_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("context.json");
+        atomic_write(&target, b"first").unwrap();
+        atomic_write(&target, b"second").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"second");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn dir_content_hash_covers_file_bytes_executable_bit_and_symlinks() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -455,6 +542,57 @@ mod tests {
         symlink("other.sh", &link).unwrap();
         let changed_link = dir_content_hash(dir.path()).unwrap();
         assert_ne!(first_link, changed_link);
+    }
+
+    #[test]
+    fn artifact_content_hash_ignores_sidecar_but_covers_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("payload.bin"), b"first").unwrap();
+        let initial = artifact_content_hash(dir.path()).unwrap();
+
+        fs::write(
+            dir.path().join(crate::fs_layout::ARTIFACT_META),
+            b"metadata",
+        )
+        .unwrap();
+        assert_eq!(initial, artifact_content_hash(dir.path()).unwrap());
+
+        fs::write(dir.path().join("payload.bin"), b"second").unwrap();
+        assert_ne!(initial, artifact_content_hash(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn artifact_content_hash_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("payload.bin"), b"payload").unwrap();
+        symlink("payload.bin", dir.path().join("mutable-link")).unwrap();
+        let err = artifact_content_hash(dir.path()).expect_err("symlink must be rejected");
+        assert!(format!("{err:#}").contains("cannot contain symlink"));
+    }
+
+    #[test]
+    fn seal_artifact_tree_removes_write_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let payload = nested.join("payload.bin");
+        fs::write(&payload, b"payload").unwrap();
+
+        seal_artifact_tree(dir.path()).unwrap();
+        assert_eq!(
+            fs::metadata(dir.path()).unwrap().permissions().mode() & 0o222,
+            0
+        );
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o222,
+            0
+        );
+        assert_eq!(
+            fs::metadata(&payload).unwrap().permissions().mode() & 0o222,
+            0
+        );
     }
 
     #[test]

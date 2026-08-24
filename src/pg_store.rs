@@ -135,6 +135,7 @@ impl PgStore {
                     role: r.try_get("role")?,
                     artifact_id: r.try_get("artifact_id")?,
                     resolved_path: PathBuf::from(r.try_get::<String, _>("resolved_path")?),
+                    content_hash: None,
                 })
             })
             .collect()
@@ -331,7 +332,7 @@ impl PgStore {
     pub async fn run_outputs(&self, run_id: &str) -> Result<Vec<ArtifactRow>> {
         let rows = sqlx::query(
             "SELECT a.id, a.kind, a.path, a.producer_run_id,
-                    a.metadata_json, a.created_at
+                    a.metadata_json, a.content_hash, a.created_at
              FROM artifacts a
              JOIN run_outputs ro ON ro.artifact_id = a.id
              WHERE ro.run_id = $1
@@ -1464,6 +1465,7 @@ impl PgStore {
         path: &Path,
         producer_run_id: Option<&str>,
         metadata: &Value,
+        content_hash: &str,
         user: &str,
         created_at: i64,
         sidecar_target: &Path,
@@ -1474,10 +1476,15 @@ impl PgStore {
             .begin()
             .await
             .context("complete_artifact_registration: begin")?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("complete_artifact_registration({id}): lock"))?;
         let result = sqlx::query(
             "INSERT INTO artifacts
-             (id, kind, path, producer_run_id, metadata_json, created_at, \"user\")
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             (id, kind, path, producer_run_id, metadata_json, content_hash, created_at, \"user\")
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(id)
@@ -1485,6 +1492,7 @@ impl PgStore {
         .bind(path.display().to_string())
         .bind(producer_run_id)
         .bind(sqlx::types::Json(metadata))
+        .bind(content_hash)
         .bind(created_at)
         .bind(user)
         .execute(&mut *tx)
@@ -1502,6 +1510,7 @@ impl PgStore {
                 || existing.path.as_path() != path
                 || existing.producer_run_id.as_deref() != producer_run_id
                 || existing.metadata_json != *metadata
+                || existing.content_hash.as_deref() != Some(content_hash)
             {
                 bail!(
                     "artifact {id} is already registered with different kind, path, \
@@ -1516,9 +1525,13 @@ impl PgStore {
 
         let completion: Result<()> = async {
             let target = sidecar_target.to_path_buf();
-            tokio::task::spawn_blocking(move || fs_layout::atomic_write_json(&target, &sidecar))
-                .await
-                .context("artifact sidecar write join")??;
+            let artifact_path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                fs_layout::publish_artifact_sidecar(&target, &sidecar)?;
+                crate::util::seal_artifact_tree(&artifact_path)
+            })
+            .await
+            .context("artifact seal join")??;
 
             sqlx::query(
                 "UPDATE run_inputs SET artifact_id = $1 \
@@ -1567,6 +1580,7 @@ impl PgStore {
             path: path.to_path_buf(),
             producer_run_id: producer_run_id.map(str::to_string),
             metadata_json: metadata.clone(),
+            content_hash: Some(content_hash.to_string()),
             created_at,
         })
     }
@@ -2021,7 +2035,7 @@ impl PgStore {
     ) -> Result<Vec<ArtifactRow>> {
         let rows = sqlx::query(
             "SELECT a.id, a.kind, a.path, a.producer_run_id,
-                    a.metadata_json, a.created_at
+                    a.metadata_json, a.content_hash, a.created_at
              FROM artifacts a
              JOIN runs r ON a.producer_run_id = r.id
              WHERE a.kind = $1 AND r.submitted_by = $2
@@ -2163,7 +2177,7 @@ const RUN_SUMMARY_SELECT: &str = "
 ";
 
 const ARTIFACT_SELECT_BASE: &str = "
-    SELECT id, kind, path, producer_run_id, metadata_json, created_at
+    SELECT id, kind, path, producer_run_id, metadata_json, content_hash, created_at
     FROM artifacts
 ";
 
@@ -2218,6 +2232,7 @@ fn row_to_artifact(r: sqlx::postgres::PgRow) -> Result<ArtifactRow> {
         path: PathBuf::from(r.try_get::<String, _>("path")?),
         producer_run_id: r.try_get("producer_run_id")?,
         metadata_json: metadata_json.0,
+        content_hash: r.try_get("content_hash")?,
         created_at: r.try_get("created_at")?,
     })
 }
@@ -2437,6 +2452,22 @@ pub(crate) mod tests {
             .expect("cleanup user");
     }
 
+    fn remove_sealed_test_tree(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !path.exists() {
+            return;
+        }
+        for entry in walkdir::WalkDir::new(path) {
+            let entry = entry.expect("walk sealed test tree");
+            if entry.file_type().is_dir() {
+                std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o700))
+                    .expect("make sealed test directory removable");
+            }
+        }
+        std::fs::remove_dir_all(path).expect("remove sealed test tree");
+    }
+
     /// The insert result distinguishes a new row from an id retry. The
     /// targeted conflict must not hide a collision on the separately
     /// unique stored path.
@@ -2559,6 +2590,7 @@ pub(crate) mod tests {
             role: "source".to_string(),
             artifact_id: None,
             resolved_path: path.clone(),
+            content_hash: None,
         }];
         store
             .insert_run(
@@ -2600,7 +2632,7 @@ pub(crate) mod tests {
         .await
         .expect("restore a waiting input");
         let sidecar = path.join(crate::fs_layout::ARTIFACT_META);
-        std::fs::write(&sidecar, b"retry-must-not-rewrite\n").expect("replace sidecar sentinel");
+        let original_sidecar = std::fs::read(&sidecar).expect("read original sidecar");
 
         let retry = store
             .insert_artifact("dataset", &path, Some(&run_id), &metadata)
@@ -2609,8 +2641,8 @@ pub(crate) mod tests {
         assert_eq!(retry.id, first.id);
         assert_eq!(retry.created_at, first.created_at);
         assert_eq!(
-            std::fs::read(&sidecar).expect("read sidecar sentinel"),
-            b"retry-must-not-rewrite\n"
+            std::fs::read(&sidecar).expect("read sidecar after retry"),
+            original_sidecar
         );
         assert!(
             store.run_inputs(&run_id).await.expect("retry inputs")[0]
@@ -2657,7 +2689,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             std::fs::read(&sidecar).expect("read sidecar after conflict"),
-            b"retry-must-not-rewrite\n"
+            original_sidecar
         );
         assert!(
             store.run_inputs(&run_id).await.expect("conflict inputs")[0]
@@ -2678,7 +2710,65 @@ pub(crate) mod tests {
             .await
             .expect("cleanup artifact");
         cleanup_user(&pg, &user_name).await;
-        std::fs::remove_dir_all(root.join(&user_name)).expect("cleanup artifact path");
+        remove_sealed_test_tree(&root.join(&user_name));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch PG; set LABCTL_TEST_CLUSTER"]
+    async fn registered_artifact_seal_detects_payload_mutation() {
+        use crate::store::Store;
+
+        let cluster = artifact_test_cluster();
+        let store = Store::connect(&cluster).await.expect("connect");
+        let pg = store.pg();
+        let user_name = insert_test_user(&store).await;
+        let suffix = uuid::Uuid::now_v7().simple().to_string();
+        let root = cluster
+            .filesystem
+            .artifact_roots
+            .get("dataset")
+            .expect("dataset artifact root");
+        let path = root.join(&user_name).join(format!("sealed_{suffix}"));
+        std::fs::create_dir_all(&path).expect("create artifact path");
+        let payload = path.join("payload.bin");
+        std::fs::write(&payload, b"first").expect("write payload");
+
+        let artifact = store
+            .insert_artifact(
+                "dataset",
+                &path,
+                None,
+                &serde_json::json!({"role": "input"}),
+            )
+            .await
+            .expect("register sealed artifact");
+        let expected = artifact.content_hash.clone().expect("new rows are sealed");
+        assert_eq!(
+            store
+                .verified_artifact_content_hash(&artifact)
+                .await
+                .expect("verify unchanged artifact")
+                .as_deref(),
+            Some(expected.as_str())
+        );
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o644))
+            .expect("force owner mutation permissions");
+        std::fs::write(&payload, b"second").expect("mutate payload");
+        let error = store
+            .verified_artifact_content_hash(&artifact)
+            .await
+            .expect_err("mutated artifact must fail verification");
+        assert!(format!("{error:#}").contains("content hash mismatch"));
+
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(&artifact.id)
+            .execute(pg.pool())
+            .await
+            .expect("cleanup artifact");
+        cleanup_user(&pg, &user_name).await;
+        remove_sealed_test_tree(&root.join(&user_name));
     }
 
     struct ArtifactRegistrationFixture {
@@ -2724,6 +2814,7 @@ pub(crate) mod tests {
                     role: "source".to_string(),
                     artifact_id: None,
                     resolved_path: path.clone(),
+                    content_hash: None,
                 }],
             )
             .await
@@ -2798,8 +2889,7 @@ pub(crate) mod tests {
             .execute(f.pg.pool())
             .await
             .expect("cleanup user");
-        std::fs::remove_dir_all(f.path.parent().expect("artifact path has a user directory"))
-            .expect("cleanup artifact path");
+        remove_sealed_test_tree(f.path.parent().expect("artifact path has a user directory"));
     }
 
     #[tokio::test]
