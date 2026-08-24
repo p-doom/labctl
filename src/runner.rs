@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use crate::{
     config::{ClusterConfig, InputSpec, LoadedPipeline, LoadedStage, Recipe, SchedulerKind},
     fs_layout, provenance,
-    store::{ArtifactRow, InputResolution, NewRun, Store, is_terminal},
+    store::{ArtifactRow, InputResolution, NewRun, Store},
     template::{RenderContext, render_value},
     util,
 };
@@ -1204,13 +1204,15 @@ pub async fn reconcile(cluster: &ClusterConfig, store: &Store) -> Result<Reconci
 
 pub async fn gc(
     _cluster: &ClusterConfig,
-    store: &Store,
+    _store: &Store,
     terminal_snapshots: bool,
 ) -> Result<usize> {
-    if !terminal_snapshots {
-        return Ok(0);
+    if terminal_snapshots {
+        bail!(
+            "terminal source snapshots are immutable run provenance and cannot be garbage-collected"
+        );
     }
-    gc_terminal_sources(store, 0).await
+    Ok(0)
 }
 
 /// Reap `<runs_base>/runs/<user>/<id>/` dirs that have no corresponding
@@ -1277,39 +1279,6 @@ pub async fn gc_orphan_run_dirs(
         tokio::fs::remove_dir_all(&path)
             .await
             .with_context(|| format!("gc_orphan_run_dirs: remove_dir_all {}", path.display()))?;
-        removed += 1;
-    }
-    Ok(removed)
-}
-
-/// Reap `source/` for terminal runs whose `finished_at` is older than
-/// `min_terminal_age_secs`. `.lab/provenance/<repo>/` (git HEAD + diff +
-/// uv.lock copy) is kept regardless, so reproducibility survives.
-///
-/// Used by the CLI (`gc()` wrapper, min_age=0) and by the agent's
-/// gc_loop (min_age>0, gives reconcile time to finalize artifacts
-/// before the working tree is removed).
-pub async fn gc_terminal_sources(store: &Store, min_terminal_age_secs: u64) -> Result<usize> {
-    let now = util::now_ts();
-    let cutoff = min_terminal_age_secs as i64;
-    let mut removed = 0;
-    for run in store.list_run_summaries(None).await? {
-        if !is_terminal(&run.status) {
-            continue;
-        }
-        if !run.source_path.exists() {
-            continue;
-        }
-        // If finished_at is missing (rare: pre-finished_at row, or
-        // sacct couldn't parse End), fall back to created_at. Either
-        // way the run is already terminal, so the bound is correct.
-        let stamp = run.finished_at.unwrap_or(run.created_at);
-        if now.saturating_sub(stamp) < cutoff {
-            continue;
-        }
-        tokio::fs::remove_dir_all(&run.source_path)
-            .await
-            .with_context(|| format!("failed to remove {}", run.source_path.display()))?;
         removed += 1;
     }
     Ok(removed)

@@ -47,13 +47,8 @@ pub struct DispatchConfig {
     /// Optional SLURM-side concurrency cap. Independent so users who
     /// don't want it can omit the whole block.
     pub throttle: Option<ThrottleConfig>,
-    /// Periodic GC of `<run_dir>/source/<repo>/` trees once a run has
-    /// reached a terminal state. The `.lab/provenance/<repo>/` bundle
-    /// (git HEAD + tracked.patch + uv.lock copy) is kept regardless, so
-    /// reaping the working-tree copy doesn't lose reproducibility — it
-    /// just frees disk that's typically O(GB) per run. Defaults are on
-    /// with a 10-minute grace; users can disable via `enabled = false`
-    /// or omit the block to inherit defaults.
+    /// Periodic cleanup of abandoned run directories that have no
+    /// registry row. Execution snapshots for registered runs are retained.
     #[serde(default)]
     pub gc: GcConfig,
 }
@@ -66,10 +61,8 @@ pub struct GcConfig {
     /// How often the GC loop runs (s). Default 300s = 5 min.
     #[serde(default = "default_gc_interval_secs")]
     pub interval_secs: u64,
-    /// How long a run must have been terminal before its source/ is
-    /// reaped (s). Default 600s = 10 min — long enough that any
-    /// reconcile-driven post-job work (artifact register, sidecar
-    /// flush) has settled, short enough that disk isn't held hostage.
+    /// Minimum age used by cleanup. Orphan run directories are always
+    /// retained for at least one hour to avoid racing a submission.
     #[serde(default = "default_gc_min_terminal_age_secs")]
     pub min_terminal_age_secs: u64,
 }

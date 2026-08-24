@@ -211,12 +211,7 @@ async fn do_reconcile(cluster: &ClusterConfig, store: &Arc<Store>) {
     }
 }
 
-/// Reap `<run_dir>/source/<repo>/` for terminal runs that have been
-/// settled for at least `dispatch.gc.min_terminal_age_secs`. Skipped
-/// entirely when the agent is configured with `[dispatch.gc] enabled =
-/// false`. The provenance bundle under `.lab/provenance/<repo>/` is
-/// independent and never touched here — losing source/ doesn't lose
-/// reproducibility, just the convenience of a pre-built working tree.
+/// Reap abandoned run directories that never acquired a registry row.
 async fn gc_loop(
     cluster: Arc<ClusterConfig>,
     store: Arc<Store>,
@@ -246,16 +241,6 @@ async fn gc_loop(
 }
 
 async fn do_gc(cluster: &ClusterConfig, store: &Arc<Store>, min_terminal_age_secs: u64) {
-    match runner::gc_terminal_sources(store, min_terminal_age_secs).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!("labctl dispatch: gc reaped {n} source snapshot(s)"),
-        Err(e) => tracing::error!("labctl dispatch: gc failed: {e:#}"),
-    }
-    // Reap orphan run-dirs: <runs_base>/runs/<user>/<id>/ with no PG row.
-    // Cushion the age so we don't race against an in-flight CLI submit
-    // whose insert_run hasn't committed yet; the terminal-source cutoff
-    // is a sensible minimum (it's already the agent operator's "this
-    // run is settled" threshold).
     let orphan_min_age = min_terminal_age_secs.max(3600);
     match runner::gc_orphan_run_dirs(cluster, store, orphan_min_age).await {
         Ok(0) => {}

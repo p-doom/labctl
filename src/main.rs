@@ -104,6 +104,7 @@ enum Command {
         id: String,
     },
     Gc {
+        /// Unsupported: registered execution snapshots are retained as provenance.
         #[arg(long)]
         terminal_snapshots: bool,
     },
