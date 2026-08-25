@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api } from "../lib/api";
+  import { rolloutWindow } from "../lib/rollout-window";
   import type { RolloutData, RolloutStep, RolloutTask } from "../lib/types";
 
   interface Props {
@@ -20,6 +21,9 @@
   let current = $state(0);
   let expanded = $state<Set<number>>(new Set());
   let maximized = $state(false);
+  let visibleIndices = $derived.by<number[]>(() =>
+    data ? rolloutWindow(data.frame_count, current) : [],
+  );
 
   // Scroll containers for the trajectory tables (inline + maximized). Used to
   // keep the selected row in view as the user steps through frames.
@@ -127,6 +131,8 @@
     <p class="err">Rollout unavailable: {error}</p>
   {:else if !data}
     <div class="skel" style="height: 280px; border-radius: 6px;"></div>
+  {:else if data.frame_count === 0}
+    <p class="empty">No rollout frames were recorded.</p>
   {:else}
     <div class="layout">
     <div class="viewer">
@@ -142,12 +148,8 @@
 
       <div class="controls">
         <button class="nav-btn" onclick={prev} disabled={current === 0} aria-label="previous">◀</button>
-        <div class="scrubber" role="group" aria-label="frame scrubber">
-          {#each { length: data.frame_count } as _, i}
-            <button class="tick" class:active={i === current} class:done={data.steps[i]?.done}
-              onclick={() => goTo(i)} aria-label="frame {i}"></button>
-          {/each}
-        </div>
+        <input class="scrubber" type="range" min="0" max={data.frame_count - 1} value={current}
+          oninput={(event) => goTo(event.currentTarget.valueAsNumber)} aria-label="frame scrubber" />
         <button class="nav-btn" onclick={next} disabled={current === data.frame_count - 1} aria-label="next">▶</button>
       </div>
 
@@ -178,7 +180,8 @@
           </tr>
         </thead>
         <tbody>
-          {#each data.steps as step (step.step_num)}
+          {#each visibleIndices as i (i)}
+            {@const step = data.steps[i]}
             <tr class:selected={step.step_num === current} onclick={() => goTo(step.step_num)}
               role="button" tabindex="0" onkeydown={(e) => e.key === "Enter" && goTo(step.step_num)}>
               <td class="c-step mono">{step.step_num}</td>
@@ -229,12 +232,8 @@
 
         <div class="controls" style="padding: 0 4px;">
           <button class="nav-btn" onclick={prev} disabled={current === 0} aria-label="previous">◀</button>
-          <div class="scrubber" role="group" aria-label="frame scrubber">
-            {#each { length: data.frame_count } as _, i}
-              <button class="tick" class:active={i === current} class:done={data.steps[i]?.done}
-                onclick={() => goTo(i)} aria-label="frame {i}"></button>
-            {/each}
-          </div>
+          <input class="scrubber" type="range" min="0" max={data.frame_count - 1} value={current}
+            oninput={(event) => goTo(event.currentTarget.valueAsNumber)} aria-label="frame scrubber" />
           <button class="nav-btn" onclick={next} disabled={current === data.frame_count - 1} aria-label="next">▶</button>
         </div>
 
@@ -267,7 +266,8 @@
               </tr>
             </thead>
             <tbody>
-              {#each data.steps as step (step.step_num)}
+              {#each visibleIndices as i (i)}
+                {@const step = data.steps[i]}
                 <tr class:selected={step.step_num === current} onclick={() => goTo(step.step_num)}
                   role="button" tabindex="0" onkeydown={(e) => e.key === "Enter" && goTo(step.step_num)}>
                   <td class="c-step mono">{step.step_num}</td>
@@ -372,15 +372,7 @@
   .nav-btn:hover:not(:disabled) { background: theme("colors.bg.2"); }
   .nav-btn:disabled { opacity: 0.35; cursor: default; }
 
-  .scrubber { flex: 1; display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
-  .tick {
-    width: 14px; height: 14px; border-radius: 3px;
-    border: 1px solid theme("colors.line.0");
-    background: theme("colors.bg.1"); cursor: pointer; padding: 0;
-  }
-  .tick:hover { background: theme("colors.bg.2"); }
-  .tick.active { background: theme("colors.accent.DEFAULT"); border-color: theme("colors.accent.DEFAULT"); }
-  .tick.done { border-color: theme("colors.status.succeeded.DEFAULT"); }
+  .scrubber { flex: 1; min-width: 0; accent-color: theme("colors.accent.DEFAULT"); }
 
   .step-info {
     background: theme("colors.bg.1"); border-radius: 6px;

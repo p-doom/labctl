@@ -9,8 +9,9 @@
 //! control is "who can SSH in."
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
+    io::{BufRead, BufReader, Read},
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -1664,6 +1665,23 @@ struct RolloutQuery {
     task: Option<usize>,
 }
 
+const MAX_ROLLOUT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ROLLOUT_LINE_BYTES: u64 = 1024 * 1024;
+const MAX_ROLLOUT_STEPS: usize = 10_000;
+const MAX_ROLLOUT_DIR_ENTRIES: usize = 30_000;
+const MAX_ROLLOUT_FRAME_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RolloutStep {
+    step_num: u32,
+    action: String,
+    response: String,
+    reward: f64,
+    done: bool,
+    info: serde_json::Map<String, Value>,
+}
+
 /// Resolve the `(trajectory.jsonl, steps/)` pair for a rollout, supporting
 /// both eval_result shapes the runner emits:
 ///   * single — top-level `result.traj_path` (absolute); `steps/` is its
@@ -1728,42 +1746,409 @@ async fn get_artifact_rollout(
 
     let (traj_path, steps_dir) = resolve_rollout_paths(&artifact, q.task)?;
 
-    // The traj.jsonl + steps/ dir live on NFS; both reads can stall.
-    // One spawn_blocking covers both so the handler never blocks the
-    // worker thread.
-    let (steps, frame_count) = tokio::task::spawn_blocking(move || {
-        let content = std::fs::read_to_string(&traj_path).map_err(|e| {
-            ApiError(
-                StatusCode::NOT_FOUND,
-                format!("traj.jsonl not readable: {e}"),
-            )
-        })?;
-        let steps: Vec<Value> = content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        let frame_count: u32 = std::fs::read_dir(&steps_dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "png"))
-                    .count() as u32
-            })
-            .unwrap_or(0);
-        Ok::<_, ApiError>((steps, frame_count))
-    })
-    .await
-    .map_err(|e| {
-        ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("rollout task: {e}"),
-        )
-    })??;
+    let (steps, frame_count) =
+        tokio::task::spawn_blocking(move || read_rollout(&traj_path, &steps_dir))
+            .await
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("rollout task: {e}"),
+                )
+            })??;
 
     Ok(axum::Json(json!({
         "steps": steps,
         "frame_count": frame_count,
     })))
+}
+
+fn read_rollout(
+    traj_path: &std::path::Path,
+    steps_dir: &std::path::Path,
+) -> Result<(Vec<RolloutStep>, u32), ApiError> {
+    let file = std::fs::File::open(traj_path).map_err(|e| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            format!("trajectory not readable: {e}"),
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut total_bytes = 0_u64;
+    let mut steps = Vec::new();
+
+    loop {
+        let mut line = Vec::new();
+        let n = reader
+            .by_ref()
+            .take(MAX_ROLLOUT_LINE_BYTES + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("trajectory read failed at row {}: {e}", steps.len()),
+                )
+            })? as u64;
+        if n == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(n);
+        if n > MAX_ROLLOUT_LINE_BYTES || total_bytes > MAX_ROLLOUT_BYTES {
+            return Err(ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "trajectory exceeds the rollout inspection limit".to_string(),
+            ));
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("trajectory row {} is empty", steps.len()),
+            ));
+        }
+        let step: RolloutStep = serde_json::from_slice(&line).map_err(|e| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid trajectory row {}: {e}", steps.len()),
+            )
+        })?;
+        if step.step_num as usize != steps.len() {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "trajectory row {} has step_num {}",
+                    steps.len(),
+                    step.step_num
+                ),
+            ));
+        }
+        steps.push(step);
+        if steps.len() > MAX_ROLLOUT_STEPS {
+            return Err(ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("trajectory exceeds {MAX_ROLLOUT_STEPS} steps"),
+            ));
+        }
+    }
+
+    if let Some(first) = steps.first() {
+        if first.action != "<reset>" || first.response != "<reset>" {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "trajectory row 0 is not the reset frame".to_string(),
+            ));
+        }
+        if !steps.last().is_some_and(|step| step.done)
+            || steps[..steps.len() - 1].iter().any(|step| step.done)
+        {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "trajectory must mark only its final row done".to_string(),
+            ));
+        }
+    }
+
+    let entries = match std::fs::read_dir(steps_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && steps.is_empty() => None,
+        Err(error) => {
+            return Err(ApiError(
+                StatusCode::NOT_FOUND,
+                format!("rollout frames not readable: {error}"),
+            ));
+        }
+    };
+    let mut frame_indices = HashSet::new();
+    let Some(entries) = entries else {
+        return Ok((steps, 0));
+    };
+    for (entry_index, entry) in entries.enumerate() {
+        if entry_index >= MAX_ROLLOUT_DIR_ENTRIES {
+            return Err(ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "rollout frame directory exceeds the inspection limit".to_string(),
+            ));
+        }
+        let entry = entry.map_err(|e| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("rollout frame directory entry is unreadable: {e}"),
+            )
+        })?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "rollout frame name is not UTF-8".to_string(),
+            )
+        })?;
+        if !name.ends_with(".png") {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("rollout frame type is unreadable: {e}"),
+                )
+            })?
+            .is_file()
+        {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("rollout frame is not a regular file: {name}"),
+            ));
+        }
+        let index = name
+            .strip_prefix("step_")
+            .and_then(|s| s.strip_suffix(".png"))
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|index| format!("step_{index:03}.png") == name)
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("invalid rollout frame name: {name}"),
+                )
+            })?;
+        if !frame_indices.insert(index) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("duplicate rollout frame index: {index}"),
+            ));
+        }
+    }
+
+    if frame_indices.len() != steps.len()
+        || (0..steps.len() as u32).any(|index| !frame_indices.contains(&index))
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "rollout has {} trajectory rows and {} frame files",
+                steps.len(),
+                frame_indices.len()
+            ),
+        ));
+    }
+
+    Ok((steps, frame_indices.len() as u32))
+}
+
+fn read_rollout_frame(path: &std::path::Path) -> Result<Vec<u8>, ApiError> {
+    let file = std::fs::File::open(path)
+        .map_err(|_| not_found(format!("rollout frame not found: {}", path.display())))?;
+    if file
+        .metadata()
+        .map_err(|e| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("rollout frame metadata failed: {e}"),
+            )
+        })?
+        .len()
+        > MAX_ROLLOUT_FRAME_BYTES
+    {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "rollout frame exceeds the inspection limit".to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_ROLLOUT_FRAME_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("rollout frame read failed: {e}"),
+            )
+        })?;
+    if bytes.len() as u64 > MAX_ROLLOUT_FRAME_BYTES {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "rollout frame exceeds the inspection limit".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod rollout_reader_tests {
+    use super::*;
+
+    fn row(index: usize, done: bool) -> String {
+        json!({
+            "step_num": index,
+            "action": if index == 0 { "<reset>" } else { "click()" },
+            "response": if index == 0 { "<reset>" } else { "click()" },
+            "reward": 0.0,
+            "done": done,
+            "info": {}
+        })
+        .to_string()
+    }
+
+    fn write_rows(path: &std::path::Path, count: usize) {
+        let mut content = String::new();
+        for index in 0..count {
+            content.push_str(&row(index, index + 1 == count));
+            content.push('\n');
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn reads_exact_contiguous_rollout() {
+        let root = tempfile::tempdir().unwrap();
+        let trajectory = root.path().join("trajectory.jsonl");
+        let frames = root.path().join("steps");
+        std::fs::create_dir(&frames).unwrap();
+        write_rows(&trajectory, 2);
+        std::fs::write(frames.join("step_000.png"), b"png").unwrap();
+        std::fs::write(frames.join("step_001.png"), b"png").unwrap();
+
+        let Ok((steps, frame_count)) = read_rollout(&trajectory, &frames) else {
+            panic!("valid rollout was rejected");
+        };
+
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1].step_num, 1);
+        assert_eq!(frame_count, 2);
+    }
+
+    #[test]
+    fn accepts_refused_rollout_without_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let trajectory = root.path().join("trajectory.jsonl");
+        std::fs::write(&trajectory, "").unwrap();
+
+        let Ok((steps, frame_count)) = read_rollout(&trajectory, &root.path().join("steps")) else {
+            panic!("empty refused rollout was rejected");
+        };
+
+        assert!(steps.is_empty());
+        assert_eq!(frame_count, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_json_instead_of_dropping_it() {
+        let root = tempfile::tempdir().unwrap();
+        let trajectory = root.path().join("trajectory.jsonl");
+        std::fs::write(&trajectory, format!("{}\nnot-json\n", row(0, false))).unwrap();
+
+        let error = read_rollout(&trajectory, &root.path().join("steps")).unwrap_err();
+
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.1.contains("invalid trajectory row 1"));
+    }
+
+    #[test]
+    fn rejects_trajectory_rows_above_byte_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let trajectory = root.path().join("trajectory.jsonl");
+        std::fs::write(&trajectory, vec![b'x'; MAX_ROLLOUT_LINE_BYTES as usize + 1]).unwrap();
+
+        let error = read_rollout(&trajectory, &root.path().join("steps")).unwrap_err();
+
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error.1.contains("inspection limit"));
+    }
+
+    #[test]
+    fn rejects_unknown_trajectory_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let trajectory = root.path().join("trajectory.jsonl");
+        let mut value: Value = serde_json::from_str(&row(0, true)).unwrap();
+        value["unexpected"] = json!(true);
+        std::fs::write(&trajectory, format!("{value}\n")).unwrap();
+
+        let error = read_rollout(&trajectory, &root.path().join("steps")).unwrap_err();
+
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.1.contains("unknown field"));
+    }
+
+    #[test]
+    fn rejects_non_contiguous_step_numbers() {
+        let root = tempfile::tempdir().unwrap();
+        let trajectory = root.path().join("trajectory.jsonl");
+        std::fs::write(
+            &trajectory,
+            format!("{}\n{}\n", row(0, false), row(2, true)),
+        )
+        .unwrap();
+
+        let error = read_rollout(&trajectory, &root.path().join("steps")).unwrap_err();
+
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.1.contains("row 1 has step_num 2"));
+    }
+
+    #[test]
+    fn rejects_trajectory_above_step_limit_before_frame_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let trajectory = root.path().join("trajectory.jsonl");
+        write_rows(&trajectory, MAX_ROLLOUT_STEPS + 1);
+
+        let error = read_rollout(&trajectory, &root.path().join("steps")).unwrap_err();
+
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error.1.contains("exceeds 10000 steps"));
+    }
+
+    #[test]
+    fn rejects_missing_reset_frame() {
+        let root = tempfile::tempdir().unwrap();
+        let trajectory = root.path().join("trajectory.jsonl");
+        let mut value: Value = serde_json::from_str(&row(0, true)).unwrap();
+        value["action"] = json!("click()");
+        value["response"] = json!("click()");
+        std::fs::write(&trajectory, format!("{value}\n")).unwrap();
+
+        let error = read_rollout(&trajectory, &root.path().join("steps")).unwrap_err();
+
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.1.contains("row 0 is not the reset frame"));
+    }
+
+    #[test]
+    fn rejects_early_terminal_row() {
+        let root = tempfile::tempdir().unwrap();
+        let trajectory = root.path().join("trajectory.jsonl");
+        std::fs::write(&trajectory, format!("{}\n{}\n", row(0, true), row(1, true))).unwrap();
+
+        let error = read_rollout(&trajectory, &root.path().join("steps")).unwrap_err();
+
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.1.contains("only its final row done"));
+    }
+
+    #[test]
+    fn rejects_non_contiguous_frame_set() {
+        let root = tempfile::tempdir().unwrap();
+        let trajectory = root.path().join("trajectory.jsonl");
+        let frames = root.path().join("steps");
+        std::fs::create_dir(&frames).unwrap();
+        write_rows(&trajectory, 2);
+        std::fs::write(frames.join("step_000.png"), b"png").unwrap();
+        std::fs::write(frames.join("step_002.png"), b"png").unwrap();
+
+        let error = read_rollout(&trajectory, &frames).unwrap_err();
+
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.1.contains("2 trajectory rows and 2 frame files"));
+    }
+
+    #[test]
+    fn bounds_rollout_frame_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let frame = root.path().join("step_000.png");
+        let file = std::fs::File::create(&frame).unwrap();
+        file.set_len(MAX_ROLLOUT_FRAME_BYTES + 1).unwrap();
+
+        let error = read_rollout_frame(&frame).unwrap_err();
+
+        assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(error.1.contains("frame exceeds the inspection limit"));
+    }
 }
 
 /// Serve step_NNN.png for a GUI rollout artifact. Frame index N is
@@ -1774,6 +2159,9 @@ async fn get_artifact_frame(
     Path((id, n)): Path<(String, u32)>,
     Query(q): Query<RolloutQuery>,
 ) -> Result<Response, ApiError> {
+    if n >= MAX_ROLLOUT_STEPS as u32 {
+        return Err(not_found(format!("frame {n} is outside the rollout limit")));
+    }
     let artifact = {
         let pg = &state.pg;
         pg.get_artifact_optional(&id)
@@ -1785,9 +2173,14 @@ async fn get_artifact_frame(
 
     let frame_path = steps_dir.join(format!("step_{n:03}.png"));
 
-    let bytes = tokio::fs::read(&frame_path)
+    let bytes = tokio::task::spawn_blocking(move || read_rollout_frame(&frame_path))
         .await
-        .map_err(|_| not_found(format!("frame {n} not found at {}", frame_path.display())))?;
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("rollout frame task: {e}"),
+            )
+        })??;
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, "image/png")
