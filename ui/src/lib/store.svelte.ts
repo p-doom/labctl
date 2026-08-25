@@ -14,6 +14,7 @@
 //   - No per-view fetch logic; cache reads are synchronous and instant.
 //   - Hover prefetch is just `loadRunDetail(id)` early.
 
+import { SvelteMap } from "svelte/reactivity";
 import { api } from "./api";
 import type {
   ArtifactSummary,
@@ -46,6 +47,7 @@ interface Detail<T> {
 }
 
 const FRESH_MS = 1000; // SWR threshold — within this we don't refetch on read
+const DETAIL_CACHE_LIMIT = 32;
 
 // ---------- runes-backed state ----------
 
@@ -99,18 +101,51 @@ function sameArtifacts(a: ArtifactSummary[] | null, b: ArtifactSummary[]): boole
   return true; // Artifacts are immutable once written; identity by id is enough.
 }
 
-// Detail caches. Replace whole entries on update so Svelte's deep proxy
-// reactivity picks up only what changed.
-const _runDetails = $state<Record<string, Detail<RunDetailResponse>>>({});
-const _runLogs = $state<Record<string, Detail<LogResponse>>>({});
-const _runEvents = $state<Record<string, Detail<RunEvent[]>>>({});
-const _pipelineDetails = $state<Record<string, Detail<PipelineDetail>>>({});
-const _artifactDetails = $state<Record<string, Detail<{ artifact: ArtifactDetail; producer: RunSummary | null; consumers: RunSummary[] }>>>({});
-const _lineage = $state<Record<string, Detail<LineageNode>>>({});
-const _recipeHistory = $state<Record<string, Detail<RecipeHistory>>>({});
-const _recipeViews = $state<Record<string, Detail<RecipeView>>>({});
-const _compareViews = $state<Record<string, Detail<CompareView>>>({});
-const _policyDetails = $state<Record<string, Detail<PolicyDetail>>>({});
+class DetailCache<T> {
+  private readonly entries = new SvelteMap<string, Detail<T>>();
+  private readonly recency = new Map<string, true>();
+
+  get(key: string): Detail<T> | undefined {
+    const entry = this.entries.get(key);
+    if (entry) this.touch(key);
+    return entry;
+  }
+
+  has(key: string): boolean {
+    return this.entries.has(key);
+  }
+
+  set(key: string, entry: Detail<T>) {
+    this.entries.set(key, entry);
+    this.touch(key);
+    if (this.recency.size <= DETAIL_CACHE_LIMIT) return;
+    const oldest = this.recency.keys().next().value;
+    if (oldest === undefined) return;
+    this.recency.delete(oldest);
+    this.entries.delete(oldest);
+  }
+
+  delete(key: string) {
+    this.recency.delete(key);
+    this.entries.delete(key);
+  }
+
+  private touch(key: string) {
+    this.recency.delete(key);
+    this.recency.set(key, true);
+  }
+}
+
+const _runDetails = new DetailCache<RunDetailResponse>();
+const _runLogs = new DetailCache<LogResponse>();
+const _runEvents = new DetailCache<RunEvent[]>();
+const _pipelineDetails = new DetailCache<PipelineDetail>();
+const _artifactDetails = new DetailCache<{ artifact: ArtifactDetail; producer: RunSummary | null; consumers: RunSummary[] }>();
+const _lineage = new DetailCache<LineageNode>();
+const _recipeHistory = new DetailCache<RecipeHistory>();
+const _recipeViews = new DetailCache<RecipeView>();
+const _compareViews = new DetailCache<CompareView>();
+const _policyDetails = new DetailCache<PolicyDetail>();
 
 // In-flight tracking — dedupe concurrent calls for the same key.
 const inflight = new Map<string, Promise<unknown>>();
@@ -121,6 +156,58 @@ function dedupe<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const p = fn().finally(() => inflight.delete(key));
   inflight.set(key, p);
   return p;
+}
+
+class StreamRefresh {
+  private requestedGeneration = 0;
+  private running = false;
+
+  constructor(
+    private readonly inflightKey: string,
+    private readonly refresh: () => Promise<unknown>,
+    private readonly onIdle: () => void,
+  ) {}
+
+  request() {
+    this.requestedGeneration += 1;
+    if (this.running) return;
+    this.running = true;
+    queueMicrotask(() => void this.drain());
+  }
+
+  private async drain() {
+    try {
+      await inflight.get(this.inflightKey);
+    } catch {}
+    for (;;) {
+      const generation = this.requestedGeneration;
+      try {
+        await this.refresh();
+      } catch {}
+      if (generation === this.requestedGeneration) {
+        this.running = false;
+        this.onIdle();
+        return;
+      }
+    }
+  }
+}
+
+const streamRefreshes = new Map<string, StreamRefresh>();
+
+function requestStreamRefresh(inflightKey: string, refresh: () => Promise<unknown>) {
+  let scheduler = streamRefreshes.get(inflightKey);
+  if (!scheduler) {
+    let created: StreamRefresh;
+    created = new StreamRefresh(inflightKey, refresh, () => {
+      if (streamRefreshes.get(inflightKey) === created) {
+        streamRefreshes.delete(inflightKey);
+      }
+    });
+    scheduler = created;
+    streamRefreshes.set(inflightKey, scheduler);
+  }
+  scheduler.request();
 }
 
 function isFresh(at: number | null): boolean {
@@ -211,11 +298,11 @@ export async function loadPolicies(force = false): Promise<PolicyCard[]> {
 }
 
 export async function loadPolicyDetail(name: string, force = false): Promise<PolicyDetail> {
-  const entry = _policyDetails[name];
+  const entry = _policyDetails.get(name);
   if (!force && entry?.data && isFresh(entry.loadedAt)) return entry.data;
   return dedupe(`policy:${name}`, async () => {
     const next = await api.policy(name);
-    _policyDetails[name] = { data: next, loadedAt: Date.now() };
+    _policyDetails.set(name, { data: next, loadedAt: Date.now() });
     return next;
   });
 }
@@ -231,92 +318,92 @@ export async function loadCluster(): Promise<ClusterInfo> {
 // ---------- detail loaders (SWR) ----------
 
 export async function loadRunDetail(id: string, force = false): Promise<RunDetailResponse> {
-  const entry = _runDetails[id];
+  const entry = _runDetails.get(id);
   if (!force && entry?.data && isFresh(entry.loadedAt)) return entry.data;
   return dedupe(`run:${id}`, async () => {
     const next = await api.run(id);
-    _runDetails[id] = { data: next, loadedAt: Date.now() };
+    _runDetails.set(id, { data: next, loadedAt: Date.now() });
     return next;
   });
 }
 
 export async function loadRunLog(id: string, force = false): Promise<LogResponse> {
-  const entry = _runLogs[id];
+  const entry = _runLogs.get(id);
   if (!force && entry?.data && isFresh(entry.loadedAt)) return entry.data;
   return dedupe(`log:${id}`, async () => {
     const next = await api.runLog(id, 200);
-    _runLogs[id] = { data: next, loadedAt: Date.now() };
+    _runLogs.set(id, { data: next, loadedAt: Date.now() });
     return next;
   });
 }
 
 export async function loadRunEvents(id: string, force = false): Promise<RunEvent[]> {
-  const entry = _runEvents[id];
+  const entry = _runEvents.get(id);
   if (!force && entry?.data && isFresh(entry.loadedAt)) return entry.data;
   return dedupe(`events:${id}`, async () => {
     const next = await api.runEvents(id);
-    _runEvents[id] = { data: next, loadedAt: Date.now() };
+    _runEvents.set(id, { data: next, loadedAt: Date.now() });
     return next;
   });
 }
 
 export async function loadPipelineDetail(id: string, force = false): Promise<PipelineDetail> {
-  const entry = _pipelineDetails[id];
+  const entry = _pipelineDetails.get(id);
   if (!force && entry?.data && isFresh(entry.loadedAt)) return entry.data;
   return dedupe(`pipeline:${id}`, async () => {
     const next = await api.pipeline(id);
-    _pipelineDetails[id] = { data: next, loadedAt: Date.now() };
+    _pipelineDetails.set(id, { data: next, loadedAt: Date.now() });
     return next;
   });
 }
 
 export async function loadArtifactDetail(id: string, force = false) {
-  const entry = _artifactDetails[id];
+  const entry = _artifactDetails.get(id);
   if (!force && entry?.data && isFresh(entry.loadedAt)) return entry.data;
   return dedupe(`artifact:${id}`, async () => {
     const next = await api.artifact(id);
-    _artifactDetails[id] = { data: next, loadedAt: Date.now() };
+    _artifactDetails.set(id, { data: next, loadedAt: Date.now() });
     return next;
   });
 }
 
 export async function loadLineage(id: string, force = false): Promise<LineageNode> {
-  const entry = _lineage[id];
+  const entry = _lineage.get(id);
   if (!force && entry?.data && isFresh(entry.loadedAt)) return entry.data;
   return dedupe(`lineage:${id}`, async () => {
     const next = await api.lineage(id);
-    _lineage[id] = { data: next, loadedAt: Date.now() };
+    _lineage.set(id, { data: next, loadedAt: Date.now() });
     return next;
   });
 }
 
 export async function loadCompareView(ids: string[], force = false): Promise<CompareView> {
   const key = ids.slice().sort().join(",");
-  const entry = _compareViews[key];
+  const entry = _compareViews.get(key);
   if (!force && entry?.data && isFresh(entry.loadedAt)) return entry.data;
   return dedupe(`compare:${key}`, async () => {
     const next = await api.compare(ids);
-    _compareViews[key] = { data: next, loadedAt: Date.now() };
+    _compareViews.set(key, { data: next, loadedAt: Date.now() });
     return next;
   });
 }
 
 export async function loadRecipeView(name: string, force = false): Promise<RecipeView> {
-  const entry = _recipeViews[name];
+  const entry = _recipeViews.get(name);
   if (!force && entry?.data && isFresh(entry.loadedAt)) return entry.data;
   return dedupe(`recipe:${name}`, async () => {
     const next = await api.recipe(name);
-    _recipeViews[name] = { data: next, loadedAt: Date.now() };
+    _recipeViews.set(name, { data: next, loadedAt: Date.now() });
     return next;
   });
 }
 
 export async function loadRecipeHistory(name: string): Promise<RecipeHistory> {
-  const entry = _recipeHistory[name];
+  const entry = _recipeHistory.get(name);
   if (entry?.data) return entry.data;
-  return dedupe(`recipe:${name}`, async () => {
+  return dedupe(`recipe-history:${name}`, async () => {
     const next = await api.recipeHistory(name, 16);
-    _recipeHistory[name] = { data: next, loadedAt: Date.now() };
+    _recipeHistory.set(name, { data: next, loadedAt: Date.now() });
     return next;
   });
 }
@@ -337,38 +424,38 @@ export const store = {
     return _policies;
   },
   policyDetail(name: string) {
-    return _policyDetails[name]?.data ?? null;
+    return _policyDetails.get(name)?.data ?? null;
   },
   get cluster() {
     return _cluster;
   },
   runDetail(id: string) {
-    return _runDetails[id]?.data ?? null;
+    return _runDetails.get(id)?.data ?? null;
   },
   runLog(id: string) {
-    return _runLogs[id]?.data ?? null;
+    return _runLogs.get(id)?.data ?? null;
   },
   runEvents(id: string) {
-    return _runEvents[id]?.data ?? null;
+    return _runEvents.get(id)?.data ?? null;
   },
   pipelineDetail(id: string) {
-    return _pipelineDetails[id]?.data ?? null;
+    return _pipelineDetails.get(id)?.data ?? null;
   },
   artifactDetail(id: string) {
-    return _artifactDetails[id]?.data ?? null;
+    return _artifactDetails.get(id)?.data ?? null;
   },
   lineage(id: string) {
-    return _lineage[id]?.data ?? null;
+    return _lineage.get(id)?.data ?? null;
   },
   recipeHistory(name: string) {
-    return _recipeHistory[name]?.data ?? null;
+    return _recipeHistory.get(name)?.data ?? null;
   },
   recipeView(name: string) {
-    return _recipeViews[name]?.data ?? null;
+    return _recipeViews.get(name)?.data ?? null;
   },
   compareView(ids: string[]) {
     const key = ids.slice().sort().join(",");
-    return _compareViews[key]?.data ?? null;
+    return _compareViews.get(key)?.data ?? null;
   },
 };
 
@@ -392,29 +479,27 @@ export function connectStream() {
   es.onopen = () => { _streamConnected = true; };
 
   es.addEventListener("run.created", (e: MessageEvent) => {
-    // Whole list invalidated; refetch in background.
-    parseId(e);
-    if (_runs.data) loadRuns(true).catch(() => {});
+    const id = parseId(e);
+    if (!id) return;
+    if (_runs.data) requestStreamRefresh("runs", () => loadRuns(true));
   });
   es.addEventListener("run.updated", (e: MessageEvent) => {
     const id = parseId(e);
     if (!id) return;
-    // Refresh list (status/duration may have changed) and the detail if cached.
-    if (_runs.data) loadRuns(true).catch(() => {});
-    if (_runDetails[id]?.data) loadRunDetail(id, true).catch(() => {});
-    if (_runLogs[id]?.data) loadRunLog(id, true).catch(() => {});
-    // Recipe history sparkline likely needs a bump.
-    invalidateRecipeHistoryFor(id);
-    // Eval-request transitions ride on `run.updated` (the eval *run*'s
-    // status flipping is what fires the event). Bump the policies list +
-    // any cached detail.
-    if (_policies.data) loadPolicies(true).catch(() => {});
-    for (const name of Object.keys(_policyDetails)) {
-      if (_policyDetails[name]?.data) loadPolicyDetail(name, true).catch(() => {});
+    if (_runs.data) requestStreamRefresh("runs", () => loadRuns(true));
+    if (_runDetails.has(id)) {
+      requestStreamRefresh(`run:${id}`, () => loadRunDetail(id, true));
     }
+    if (_runLogs.has(id)) {
+      requestStreamRefresh(`log:${id}`, () => loadRunLog(id, true));
+    }
+    if (_runEvents.has(id)) {
+      requestStreamRefresh(`events:${id}`, () => loadRunEvents(id, true));
+    }
+    invalidateRecipeHistoryFor(id);
   });
   es.addEventListener("artifact.created", () => {
-    if (_artifacts.data) loadArtifacts(true).catch(() => {});
+    if (_artifacts.data) requestStreamRefresh("artifacts", () => loadArtifacts(true));
   });
 
   es.onerror = () => {
@@ -439,7 +524,5 @@ function invalidateRecipeHistoryFor(runId: string) {
   const summary = _runs.data?.find((r) => r.id === runId);
   if (!summary) return;
   const name = summary.recipe_name;
-  if (_recipeHistory[name]) {
-    delete _recipeHistory[name];
-  }
+  _recipeHistory.delete(name);
 }
