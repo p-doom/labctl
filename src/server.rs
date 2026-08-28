@@ -12,7 +12,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -1738,13 +1738,7 @@ async fn get_artifact_rollout(
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
-        let frame_count: u32 = std::fs::read_dir(&steps_dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "png"))
-                    .count() as u32
-            })
-            .unwrap_or(0);
+        let frame_count = rollout_frame_count(&steps_dir)?;
         Ok::<_, ApiError>((steps, frame_count))
     })
     .await
@@ -1761,7 +1755,7 @@ async fn get_artifact_rollout(
     })))
 }
 
-/// Serve step_NNN.png for a GUI rollout artifact. Frame index N is
+/// Serve step_NNN.jpg for a GUI rollout artifact. Frame index N is
 /// zero-based and must match a file written by the runner. `?task=N`
 /// selects an instruction in the multi shape (see [`resolve_rollout_paths`]).
 async fn get_artifact_frame(
@@ -1778,17 +1772,82 @@ async fn get_artifact_frame(
 
     let (_traj_path, steps_dir) = resolve_rollout_paths(&artifact, q.task)?;
 
-    let frame_path = steps_dir.join(format!("step_{n:03}.png"));
+    let frame_path = steps_dir.join(format!("step_{n:03}.jpg"));
 
     let bytes = tokio::fs::read(&frame_path)
         .await
         .map_err(|_| not_found(format!("frame {n} not found at {}", frame_path.display())))?;
+    if !is_jpeg(&bytes) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("frame {n} is not a JPEG: {}", frame_path.display()),
+        ));
+    }
 
     Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CONTENT_TYPE, "image/jpeg")
         .header(header::CACHE_CONTROL, "public, max-age=3600")
         .body(axum::body::Body::from(bytes))
         .unwrap())
+}
+
+fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xff, 0xd8, 0xff])
+}
+
+fn rollout_frame_count(steps_dir: &FsPath) -> Result<u32, ApiError> {
+    let entries = match std::fs::read_dir(steps_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(0),
+    };
+    let mut count = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "png") {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("PNG rollout frame is unsupported: {}", path.display()),
+            ));
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(step) = name
+            .strip_prefix("step_")
+            .and_then(|name| name.strip_suffix(".jpg"))
+        else {
+            continue;
+        };
+        if step.len() == 3 && step.bytes().all(|byte| byte.is_ascii_digit()) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod rollout_frame_tests {
+    use super::*;
+
+    #[test]
+    fn rollout_frames_are_numbered_jpegs_and_png_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("step_000.jpg"), [0xff, 0xd8, 0xff]).unwrap();
+        std::fs::write(dir.path().join("step_001.jpg"), [0xff, 0xd8, 0xff]).unwrap();
+        std::fs::write(dir.path().join("preview.jpg"), [0xff, 0xd8, 0xff]).unwrap();
+        assert!(matches!(rollout_frame_count(dir.path()), Ok(2)));
+
+        std::fs::write(dir.path().join("step_002.png"), b"legacy").unwrap();
+        let ApiError(status, message) = rollout_frame_count(dir.path()).unwrap_err();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(message.contains("PNG rollout frame is unsupported"));
+    }
+
+    #[test]
+    fn rollout_frame_bytes_must_be_jpeg() {
+        assert!(is_jpeg(&[0xff, 0xd8, 0xff, 0x00]));
+        assert!(!is_jpeg(b"\x89PNG\r\n\x1a\n"));
+    }
 }
 
 // ---------- dataset explorer ----------
