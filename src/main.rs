@@ -16,8 +16,9 @@ mod store;
 mod template;
 mod tracking;
 mod util;
+mod validate;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -25,6 +26,8 @@ use clap::{Parser, Subcommand};
 /// Compile-time version stamp. Crate version + short git SHA captured by
 /// build.rs so `labctl --version` identifies the exact build.
 const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("LABCTL_GIT_SHA"), ")");
+
+const STATUS_DEFAULT_LIMIT: i64 = 50;
 
 #[derive(Parser)]
 #[command(name = "labctl")]
@@ -81,13 +84,22 @@ enum Command {
     PipelineShow {
         id: String,
     },
-    /// Parse and semantically validate a recipe, pipeline, or eval policy.
+    /// Parse and semantically validate a recipe, pipeline, eval policy, or cluster config.
     /// Does not submit, does not touch the registry.
     Validate {
         path: PathBuf,
+        /// Treat contract warnings (dirty repo pins, checks that could
+        /// not run) as failures.
+        #[arg(long)]
+        strict: bool,
     },
     Reconcile,
-    Status,
+    /// List runs, newest first.
+    Status {
+        /// Include every run instead of the most recent 50.
+        #[arg(long)]
+        all: bool,
+    },
     Show {
         id: String,
     },
@@ -354,9 +366,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cluster_path = resolve_cluster_path(cli.cluster.clone());
 
-    // Validate is pure file inspection — no cluster, no registry.
-    if let Command::Validate { path } = &cli.command {
-        return validate_path(path);
+    // Validate reads the cluster config (for [repos] pins) but never the
+    // registry, and never submits.
+    if let Command::Validate { path, strict } = &cli.command {
+        return validate_path(path, &cluster_path, *strict);
     }
 
     // If the cluster.toml exists and configures a shared_group, drop our
@@ -532,8 +545,11 @@ async fn main() -> Result<()> {
             let report = runner::reconcile(&cluster, &store).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Command::Status => {
-            for run in store.list_runs().await? {
+        Command::Status { all } => {
+            let runs = store
+                .list_run_summaries((!all).then_some(STATUS_DEFAULT_LIMIT))
+                .await?;
+            for run in runs {
                 println!(
                     "{:<28} {:<12} {:<10} {}",
                     run.id,
@@ -1093,7 +1109,7 @@ fn current_user() -> Result<String> {
     Ok(user)
 }
 
-fn validate_path(path: &PathBuf) -> Result<()> {
+fn validate_path(path: &PathBuf, cluster_path: &Path, strict: bool) -> Result<()> {
     // Heuristic: routes to the right loader by content. We try pipeline first
     // (it's the most structured); if that fails to parse as a pipeline, try
     // policy, then recipe.
@@ -1107,6 +1123,7 @@ fn validate_path(path: &PathBuf) -> Result<()> {
 
     if raw.contains_key("filesystem") {
         let cluster = config::ClusterConfig::load(path)?;
+        validate::report(&validate::repo_pins(&cluster.repos), strict)?;
         println!(
             "cluster {:?} OK ({} repo(s), runs_base={})",
             cluster.name,
@@ -1150,6 +1167,7 @@ fn validate_path(path: &PathBuf) -> Result<()> {
             ),
             None => String::new(),
         };
+        validate::report(&validate::recipe_contracts(&recipe, cluster_path), strict)?;
         println!(
             "recipe {:?} OK (repo={}, {} inputs, {} outputs{})",
             recipe.name,

@@ -1299,7 +1299,7 @@ pub async fn gc_terminal_sources(store: &Store, min_terminal_age_secs: u64) -> R
     let now = util::now_ts();
     let cutoff = min_terminal_age_secs as i64;
     let mut removed = 0;
-    for run in store.list_runs().await? {
+    for run in store.list_run_summaries(None).await? {
         if !is_terminal(&run.status) {
             continue;
         }
@@ -1810,13 +1810,13 @@ async fn submit_script(
     }
 }
 
-/// Query sacct for the run's State and End. We pass ``--starttime`` derived
-/// from the run's ``created_at`` (minus a 1-day buffer) so that very old jobs
-/// still appear, and so a recycled job_id can't return a row from a different
-/// run that ran much later. ``TZ=UTC`` is forced so we can parse End without
-/// ambiguity. Returns ``None`` only if sacct itself can't be invoked or
-/// returns nonzero — an unparseable End is fine, we just leave finished_at
-/// empty and let the caller fall back.
+/// Query sacct for the run's allocation identity, State, and End. The parent
+/// allocation is authoritative; historical failed step rows from an earlier
+/// requeue must not terminalize an active allocation. We pass ``--starttime``
+/// derived from the run's ``created_at`` (minus a 1-day buffer) so that very
+/// old jobs still appear, and so a recycled job_id can't return a row from a
+/// different run that ran much later. ``TZ=UTC`` is forced so we can parse End
+/// without ambiguity.
 async fn scheduler_outcome(
     cluster: &ClusterConfig,
     run: &crate::store::RunRow,
@@ -1833,7 +1833,7 @@ async fn scheduler_outcome(
             job_id,
             "-P",
             "-n",
-            "--format=State,End",
+            "--format=JobIDRaw,State,End",
             "--starttime",
             &starttime,
         ])
@@ -1843,32 +1843,78 @@ async fn scheduler_outcome(
     if !output.status.success() {
         return None;
     }
-    // Aggregate all sacct rows: handles both normal jobs (one row) and
-    // array jobs (one row per element). Priority: any failure trumps all;
-    // running > submitted > succeeded (so partial completion stays "running").
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut best: Option<String> = None;
-    let mut latest_end: Option<i64> = None;
+    parse_sacct_outcome(job_id, &stdout)
+}
+
+fn parse_sacct_outcome(job_id: &str, stdout: &str) -> Option<SchedulerOutcome> {
+    let mut parent_seen = false;
+    let mut parent = None;
+    let mut allocations = Vec::new();
     for line in stdout.lines() {
         let mut parts = line.split('|');
-        let Some(state_field) = parts.next() else {
-            continue;
-        };
-        let state = state_field.split_whitespace().next().unwrap_or("").trim();
+        let row_id = parts.next()?.trim();
+        let state_field = parts.next()?.trim();
         let end_field = parts.next().unwrap_or("").trim();
-        let status = map_slurm_state(state);
-        if let Some(ts) = parse_sacct_end_utc(end_field) {
+        if row_id == job_id {
+            if parent_seen {
+                return None;
+            }
+            parent_seen = true;
+            parent = row_outcome(state_field, end_field);
+        } else if is_allocation_child(job_id, row_id) {
+            allocations.push(row_outcome(state_field, end_field)?);
+        }
+    }
+    if parent_seen {
+        return parent;
+    }
+    aggregate_allocation_outcomes(allocations)
+}
+
+fn row_outcome(state_field: &str, end_field: &str) -> Option<SchedulerOutcome> {
+    let state = state_field.split_whitespace().next()?.trim();
+    if state.is_empty() {
+        return None;
+    }
+    let status = map_slurm_state(state);
+    let finished_at = is_terminal(&status)
+        .then(|| parse_sacct_end_utc(end_field))
+        .flatten();
+    Some(SchedulerOutcome {
+        status,
+        finished_at,
+    })
+}
+
+fn is_allocation_child(job_id: &str, row_id: &str) -> bool {
+    if row_id.contains('.') {
+        return false;
+    }
+    row_id
+        .strip_prefix(job_id)
+        .is_some_and(|suffix| suffix.starts_with('_') || suffix.starts_with('+'))
+}
+
+fn aggregate_allocation_outcomes(rows: Vec<SchedulerOutcome>) -> Option<SchedulerOutcome> {
+    let mut best: Option<String> = None;
+    let mut latest_end: Option<i64> = None;
+    let mut failure = None;
+    for row in rows {
+        if let Some(ts) = row.finished_at {
             latest_end = Some(latest_end.map_or(ts, |prev: i64| prev.max(ts)));
         }
-        best = Some(match (best.as_deref(), status.as_str()) {
-            // Failure is terminal — short-circuit once seen.
-            (_, "failed" | "timeout" | "oom" | "cancelled" | "unknown_terminal") => {
-                return Some(SchedulerOutcome {
-                    status,
-                    finished_at: latest_end,
-                });
+        if matches!(
+            row.status.as_str(),
+            "failed" | "timeout" | "oom" | "cancelled" | "unknown_terminal"
+        ) {
+            if failure.is_none() {
+                failure = Some(row.status);
             }
-            (None, _) => status,
+            continue;
+        }
+        best = Some(match (best.as_deref(), row.status.as_str()) {
+            (None, _) => row.status,
             (Some("running"), _) => "running".to_string(),
             (Some("submitted"), "running") => "running".to_string(),
             (Some("submitted"), _) => best.unwrap(),
@@ -1877,10 +1923,11 @@ async fn scheduler_outcome(
             _ => best.unwrap(),
         });
     }
-    let status = best?;
+    let status = failure.or(best)?;
+    let finished_at = latest_end.filter(|_| is_terminal(&status));
     Some(SchedulerOutcome {
         status,
-        finished_at: latest_end,
+        finished_at,
     })
 }
 
@@ -1904,7 +1951,8 @@ fn fmt_starttime_utc(ts: i64) -> String {
 fn map_slurm_state(state: &str) -> String {
     let primary = state.split_whitespace().next().unwrap_or(state);
     match primary {
-        "PENDING" | "CONFIGURING" | "SUSPENDED" => "submitted",
+        "PENDING" | "CONFIGURING" | "SUSPENDED" | "REQUEUED" | "REQUEUE_FED" | "REQUEUE_HOLD"
+        | "RESV_DEL_HOLD" | "SPECIAL_EXIT" => "submitted",
         "RUNNING" | "COMPLETING" => "running",
         "COMPLETED" => "succeeded",
         "CANCELLED" => "cancelled",
@@ -1914,6 +1962,141 @@ fn map_slurm_state(state: &str) -> String {
         _ => "unknown_terminal",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn assert_outcome(rows: &str, status: &str, finished_at: Option<i64>) {
+        let outcome = parse_sacct_outcome("42", rows).expect("scheduler outcome");
+        assert_eq!(outcome.status, status);
+        assert_eq!(outcome.finished_at, finished_at);
+    }
+
+    #[tokio::test]
+    async fn active_parent_outweighs_failed_historical_step() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sacct = tmp.path().join("sacct");
+        std::fs::write(
+            &sacct,
+            "#!/bin/sh\nprintf '%s\\n' \\
+             '42|RUNNING|Unknown' \\
+             '42.batch|FAILED|2026-08-23T10:00:00' \\
+             '42.extern|COMPLETED|2026-08-23T10:00:00'\n",
+        )
+        .expect("write fake sacct");
+        let mut permissions = std::fs::metadata(&sacct)
+            .expect("sacct metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&sacct, permissions).expect("make sacct executable");
+        let cluster: ClusterConfig = toml::from_str(&format!(
+            r#"
+name = "scheduler-test"
+[filesystem]
+runs_base = "{}"
+[filesystem.artifact_roots]
+checkpoint = "{}"
+[filesystem.output_roots]
+checkpoint_stream = "{}"
+[scheduler]
+kind = "slurm"
+sacct = "{}"
+"#,
+            tmp.path().join("runs").display(),
+            tmp.path().join("checkpoints").display(),
+            tmp.path().join("checkpoints").display(),
+            sacct.display(),
+        ))
+        .expect("cluster config");
+        let run = crate::store::RunRow {
+            id: "run_00000000000000000000000000000000".into(),
+            recipe_name: "scheduler-test".into(),
+            recipe_hash: "a".repeat(64),
+            status: "running".into(),
+            job_id: Some("42".into()),
+            run_dir: tmp.path().join("run"),
+            repo: "repo".into(),
+            source_path: tmp.path().join("source"),
+            recipe_json: serde_json::json!({}),
+            context_json: serde_json::json!({}),
+            created_at: 1_777_000_000,
+            finished_at: None,
+            pipeline_id: None,
+            stage_name: None,
+            dependency_on: None,
+            submitted_by: Some("tester".into()),
+            cache_key: None,
+        };
+
+        let outcome = scheduler_outcome(&cluster, &run).await.expect("outcome");
+        assert_eq!(outcome.status, "running");
+        assert_eq!(outcome.finished_at, None);
+    }
+
+    #[test]
+    fn pending_parent_outweighs_failed_historical_steps() {
+        assert_outcome(
+            "42|PENDING|Unknown|\n\
+             42.batch|FAILED|2026-08-23T10:00:00|\n\
+             42.extern|COMPLETED|2026-08-23T10:00:00|\n\
+             42.0|PREEMPTED|2026-08-23T10:00:00|\n",
+            "submitted",
+            None,
+        );
+    }
+
+    #[test]
+    fn requeue_parent_states_are_still_submitted() {
+        for state in ["REQUEUED", "REQUEUE_FED", "REQUEUE_HOLD", "RESV_DEL_HOLD"] {
+            assert_outcome(
+                &format!(
+                    "42|{state}|2026-08-23T10:00:00|\n\
+                     42.batch|CANCELLED|2026-08-23T10:00:00|\n"
+                ),
+                "submitted",
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_parent_remains_authoritative() {
+        assert_outcome(
+            "42|FAILED|2026-08-23T21:02:52|\n\
+             42.batch|FAILED|2026-08-23T21:02:52|\n\
+             42.extern|COMPLETED|2026-08-23T21:02:52|\n\
+             42.0|OUT_OF_MEMORY|2026-08-23T21:02:52|\n",
+            "failed",
+            Some(1_787_518_972),
+        );
+    }
+
+    #[test]
+    fn allocation_children_are_aggregated_when_parent_is_absent() {
+        assert_outcome(
+            "42_0|COMPLETED|2026-08-23T10:00:00|\n\
+             42_0.batch|COMPLETED|2026-08-23T10:00:00|\n\
+             42_1|RUNNING|Unknown|\n\
+             42_1.batch|FAILED|2026-08-23T09:00:00|\n",
+            "running",
+            None,
+        );
+    }
+
+    #[test]
+    fn step_rows_without_an_allocation_are_not_an_outcome() {
+        assert!(
+            parse_sacct_outcome(
+                "42",
+                "42.batch|FAILED|2026-08-23T10:00:00|\n\
+                 42.extern|COMPLETED|2026-08-23T10:00:00|\n",
+            )
+            .is_none()
+        );
+    }
 }
 
 async fn register_outputs(store: &Store, run: &crate::store::RunRow) -> Result<usize> {
