@@ -64,6 +64,44 @@ pub struct RunRow {
     pub cache_key: Option<String>,
 }
 
+/// Scalar fields used by run listings; JSON payloads remain on detail reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunSummaryRow {
+    pub id: String,
+    pub recipe_name: String,
+    pub recipe_hash: String,
+    pub status: String,
+    pub job_id: Option<String>,
+    pub run_dir: PathBuf,
+    pub repo: String,
+    pub source_path: PathBuf,
+    pub created_at: i64,
+    pub finished_at: Option<i64>,
+    pub pipeline_id: Option<String>,
+    pub stage_name: Option<String>,
+    pub submitted_by: Option<String>,
+}
+
+impl RunRow {
+    pub fn summary(&self) -> RunSummaryRow {
+        RunSummaryRow {
+            id: self.id.clone(),
+            recipe_name: self.recipe_name.clone(),
+            recipe_hash: self.recipe_hash.clone(),
+            status: self.status.clone(),
+            job_id: self.job_id.clone(),
+            run_dir: self.run_dir.clone(),
+            repo: self.repo.clone(),
+            source_path: self.source_path.clone(),
+            created_at: self.created_at,
+            finished_at: self.finished_at,
+            pipeline_id: self.pipeline_id.clone(),
+            stage_name: self.stage_name.clone(),
+            submitted_by: self.submitted_by.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRow {
     pub id: String,
@@ -293,8 +331,9 @@ impl Store {
         self.pg.runs_by_recipe(recipe_name).await
     }
 
-    pub async fn list_runs(&self) -> Result<Vec<RunRow>> {
-        self.pg.list_runs().await
+    /// Newest-first run listing. `None` returns every row.
+    pub async fn list_run_summaries(&self, limit: Option<i64>) -> Result<Vec<RunSummaryRow>> {
+        self.pg.list_run_summaries(limit).await
     }
 
     /// Active runs owned by `submitted_by`. Scoped so a daemon never
@@ -323,7 +362,8 @@ impl Store {
     /// lives there permanently — no content-addressed relocation, no
     /// hash computation. Identity is path-canonical: `artifact_<sha256
     /// of the canonical path, first 16 hex>`. Re-registering the same
-    /// path therefore yields the same id.
+    /// path therefore yields the same id. An exact retry returns the
+    /// existing row; changed registration data is a conflict.
     pub async fn insert_artifact(
         &self,
         kind: &str,
@@ -370,17 +410,8 @@ impl Store {
             metadata: metadata.clone(),
             created_at: now,
         };
-        // Small JSON write to NFS — offload so we don't pin a worker on
-        // slow filesystems.
-        {
-            let target = staging_path.join(fs_layout::ARTIFACT_META);
-            tokio::task::spawn_blocking(move || fs_layout::atomic_write_json(&target, &sidecar))
-                .await
-                .context("artifact sidecar write join")??;
-        }
-
         self.pg
-            .insert_artifact(
+            .complete_artifact_registration(
                 &id,
                 kind,
                 staging_path,
@@ -388,22 +419,10 @@ impl Store {
                 metadata,
                 &user,
                 now,
+                &staging_path.join(fs_layout::ARTIFACT_META),
+                sidecar,
             )
-            .await?;
-        self.pg
-            .rehydrate_inputs_by_path(&staging_path.display().to_string(), &id)
-            .await?;
-        if let Some(run_id) = producer_run_id {
-            let payload = serde_json::json!({
-                "artifact_id": id,
-                "kind": kind,
-                "path": staging_path,
-            });
-            self.pg
-                .append_event(Some(run_id), "artifact_registered", &payload, now)
-                .await?;
-        }
-        self.get_artifact(&id).await
+            .await
     }
 
     /// Look up an artifact by `(kind, path)`. The PG `find_artifact_by_path`
