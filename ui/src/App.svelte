@@ -19,6 +19,8 @@
   import CompareView from "./views/CompareView.svelte";
   import ColophonView from "./views/ColophonView.svelte";
   import RolloutBrowserView from "./views/RolloutBrowserView.svelte";
+  import EnvsView from "./views/EnvsView.svelte";
+  import EnvTaskView from "./views/EnvTaskView.svelte";
 
   let cluster = $derived(store.cluster);
 
@@ -42,7 +44,7 @@
     if (inField) return;
 
     if (gPending) {
-      const map: Record<string, View> = { r: "runs", p: "pipelines", a: "artifacts", e: "policies" };
+      const map: Record<string, View> = { r: "runs", p: "pipelines", a: "artifacts", e: "policies", n: "envs" };
       const v = map[e.key.toLowerCase()];
       if (v) {
         e.preventDefault();
@@ -81,7 +83,7 @@
 <div class="shell">
   <LeftRail />
   <main>
-    {#if router.view !== "lineage" && router.view !== "recipes" && router.view !== "compare" && router.view !== "colophon" && router.view !== "rollouts" && !(router.view === "policies" && router.selected)}
+    {#if router.view !== "lineage" && router.view !== "recipes" && router.view !== "compare" && router.view !== "colophon" && router.view !== "rollouts" && !(router.view === "policies" && router.selected) && !(router.view === "envs" && router.selected)}
       <TopBar {cluster} />
     {/if}
     <div class="content">
@@ -102,6 +104,9 @@
       <div class="view" data-active={router.view === "policies" && !router.selected}>
         <PoliciesView />
       </div>
+      <div class="view" data-active={router.view === "envs" && !router.selected}>
+        <EnvsView />
+      </div>
       {#if router.view === "policies" && router.selected}
         <div class="view" data-active="true">
           <PolicyDetailView policyName={router.selected} />
@@ -121,6 +126,12 @@
       {:else if router.view === "colophon"}
         <div class="view" data-active="true">
           <ColophonView />
+        </div>
+      {:else if router.view === "envs" && router.selected}
+        <div class="view" data-active="true">
+          {#key router.selected}
+            <EnvTaskView taskKey={router.selected} />
+          {/key}
         </div>
       {:else if router.view === "rollouts" && router.selected}
         <div class="view" data-active="true">

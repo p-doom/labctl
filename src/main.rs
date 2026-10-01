@@ -2,6 +2,8 @@ mod admin;
 mod agent;
 mod artifacts;
 mod config;
+#[cfg(feature = "ui")]
+mod envs;
 mod evald;
 mod fs_layout;
 mod init;

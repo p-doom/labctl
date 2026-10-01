@@ -25,7 +25,12 @@
       | "sun"
       | "moon"
       | "system"
-      | "check";
+      | "check"
+      | "envs"
+      | "eye"
+      | "eye-off"
+      | "file"
+      | "commit";
     size?: number;
   }
   let { name, size = 14 }: Props = $props();
@@ -42,7 +47,24 @@
   stroke-linejoin="round"
   aria-hidden="true"
 >
-  {#if name === "runs"}
+  {#if name === "envs"}
+    <circle cx="8" cy="8" r="5.5" />
+    <ellipse cx="8" cy="8" rx="2.4" ry="5.5" />
+    <path d="M2.5 8h11" />
+  {:else if name === "eye"}
+    <path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8z" />
+    <circle cx="8" cy="8" r="1.9" />
+  {:else if name === "eye-off"}
+    <path d="M6.2 3.8A6.4 6.4 0 0 1 8 3.5c4.1 0 6.5 4.5 6.5 4.5a11 11 0 0 1-1.7 2.2" />
+    <path d="M4.3 4.9C2.6 6.1 1.5 8 1.5 8s2.4 4.5 6.5 4.5c1.2 0 2.3-.4 3.2-.9" />
+    <path d="M2.5 2.5l11 11" />
+  {:else if name === "file"}
+    <path d="M4 1.8h5l3 3v9.4H4z" />
+    <path d="M9 1.8v3h3" />
+  {:else if name === "commit"}
+    <circle cx="8" cy="8" r="2.4" />
+    <path d="M1.5 8h4.1M10.4 8h4.1" />
+  {:else if name === "runs"}
     <rect x="2.5" y="3" width="11" height="2.2" rx="1" />
     <rect x="2.5" y="6.9" width="11" height="2.2" rx="1" />
     <rect x="2.5" y="10.8" width="11" height="2.2" rx="1" />

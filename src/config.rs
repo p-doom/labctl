@@ -30,6 +30,35 @@ pub struct ClusterConfig {
     /// hard-fail at `Store::open` rather than silently falling back.
     #[serde(default)]
     pub postgres: Option<PgConfig>,
+    /// Optional environment browser. Read by `labctl serve`; when absent
+    /// the UI's Environments view says so and nothing else changes.
+    #[serde(default)]
+    pub envs: Option<EnvsConfig>,
+}
+
+/// Where the RL environment packages live. The browser reads them out of
+/// git at a revision — never from the work tree — so what it shows is
+/// always something a training run could have pinned.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EnvsConfig {
+    /// Key into `[repos]` naming the crowd-cast-envs checkout.
+    pub repo: String,
+    /// Revision shown when the UI doesn't ask for one. Resolved on every
+    /// request, so a `git fetch` in the checkout shows up without a
+    /// restart. labctl itself never fetches.
+    #[serde(default = "default_envs_rev")]
+    pub rev: String,
+    /// Repo-relative directory holding one subdirectory per task.
+    #[serde(default = "default_envs_tasks_dir")]
+    pub tasks_dir: String,
+}
+
+fn default_envs_rev() -> String {
+    "origin/main".to_string()
+}
+
+fn default_envs_tasks_dir() -> String {
+    "environments/crowd_envs_v1/crowd_envs_v1/tasks".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -254,6 +283,28 @@ impl ClusterConfig {
         }
         for value in cfg.repos.values_mut() {
             *value = absolute(value)?;
+        }
+        if let Some(envs) = &cfg.envs {
+            if !cfg.repos.contains_key(&envs.repo) {
+                bail!(
+                    "cluster {:?}: [envs].repo = {:?} is not a key in [repos]",
+                    cfg.name,
+                    envs.repo,
+                );
+            }
+            let tasks_dir = Path::new(&envs.tasks_dir);
+            if tasks_dir.is_absolute()
+                || tasks_dir
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "cluster {:?}: [envs].tasks_dir must be relative to the repo root \
+                     and must not contain `..`: {:?}",
+                    cfg.name,
+                    envs.tasks_dir,
+                );
+            }
         }
         // Dispatch: resolve policies_dir relative to the cluster file's
         // parent if it's a relative path. That makes `policies_dir =
@@ -783,5 +834,53 @@ fn absolute(path: &Path) -> Result<PathBuf> {
         Ok(path.to_path_buf())
     } else {
         Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+#[cfg(test)]
+mod envs_config_tests {
+    use super::*;
+
+    fn load(extra: &str) -> Result<ClusterConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cluster.toml");
+        let text = format!(
+            "name = \"t\"\n\
+             [filesystem]\nruns_base = \"/tmp/runs\"\n\
+             [filesystem.artifact_roots]\ndataset = \"/tmp/datasets\"\n\
+             [repos]\nenvs = \"/tmp/crowd-cast-envs\"\n\
+             {extra}"
+        );
+        fs::write(&path, text).unwrap();
+        ClusterConfig::load(&path)
+    }
+
+    #[test]
+    fn absent_section_is_none() {
+        assert!(load("").unwrap().envs.is_none());
+    }
+
+    #[test]
+    fn defaults_point_at_crowd_envs_v1_on_origin_main() {
+        let envs = load("[envs]\nrepo = \"envs\"\n").unwrap().envs.unwrap();
+        assert_eq!(envs.rev, "origin/main");
+        assert_eq!(
+            envs.tasks_dir,
+            "environments/crowd_envs_v1/crowd_envs_v1/tasks"
+        );
+    }
+
+    #[test]
+    fn repo_must_name_a_repos_entry() {
+        let err = load("[envs]\nrepo = \"nope\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("not a key in [repos]"));
+    }
+
+    #[test]
+    fn tasks_dir_must_stay_inside_the_repo() {
+        for bad in ["/abs/tasks", "../tasks", "a/../../tasks"] {
+            let extra = format!("[envs]\nrepo = \"envs\"\ntasks_dir = \"{bad}\"\n");
+            assert!(load(&extra).is_err(), "{bad}");
+        }
     }
 }

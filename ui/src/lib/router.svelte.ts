@@ -9,6 +9,8 @@
 //   #/pipelines/pipe_xyz           → pipeline detail
 //   #/artifacts                    → artifact list
 //   #/artifacts/artifact_abc       → artifact detail panel
+//   #/envs?rev=origin/main         → environment list at a revision
+//   #/envs/idm-degenerate-actions  → one environment's full page
 
 export type View =
   | "runs"
@@ -19,7 +21,8 @@ export type View =
   | "recipes"
   | "compare"
   | "colophon"
-  | "rollouts";
+  | "rollouts"
+  | "envs";
 
 export interface Route {
   view: View;
@@ -34,7 +37,7 @@ function parse(hash: string): Route {
   const view = (segments[0] as View) || "runs";
   const selected = segments[1] ?? null;
   const query = new URLSearchParams(queryPart ?? "");
-  if (!["runs", "pipelines", "artifacts", "policies", "lineage", "recipes", "compare", "colophon", "rollouts"].includes(view)) {
+  if (!["runs", "pipelines", "artifacts", "policies", "lineage", "recipes", "compare", "colophon", "rollouts", "envs"].includes(view)) {
     return { view: "runs", selected: null, query };
   }
   return { view, selected, query };

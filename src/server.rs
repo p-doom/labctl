@@ -37,7 +37,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tower_http::trace::TraceLayer;
 
 use crate::{
-    config::ClusterConfig,
+    config::{ClusterConfig, EnvsConfig},
+    envs,
     pg_store::PgStore,
     store::{ArtifactRow, RunRow, is_terminal},
 };
@@ -64,6 +65,10 @@ struct AppState {
     /// that path without re-parsing chat_line.json per request. Key
     /// shape: "<artifact_id>::<split>::<seg>".
     segment_frames_cache: SegmentFramesCache,
+    /// Environment-browser snapshots keyed by commit sha. A commit's tree
+    /// never changes, so an entry is valid forever; the map is cleared
+    /// wholesale when it grows past `ENVS_CACHE_MAX`.
+    envs_cache: Arc<Mutex<HashMap<String, Arc<envs::Snapshot>>>>,
 }
 
 /// `"<artifact_id>::<split>::<seg>"` → `frame_index → absolute_path`.
@@ -92,6 +97,7 @@ pub async fn serve(cluster: ClusterConfig, pg: Arc<PgStore>, addr: SocketAddr) -
         events_tx: events_tx.clone(),
         dataset_cache: Arc::new(Mutex::new(HashMap::new())),
         segment_frames_cache: Arc::new(Mutex::new(HashMap::new())),
+        envs_cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let api = Router::new()
@@ -125,6 +131,12 @@ pub async fn serve(cluster: ClusterConfig, pg: Arc<PgStore>, addr: SocketAddr) -
         .route("/policies", get(list_policies))
         .route("/policies/:name", get(get_policy))
         .route("/cluster", get(get_cluster))
+        // Environment browser. `/envs/tasks/:key` rather than `/envs/:key`
+        // so it doesn't collide with the static `/envs/revisions`.
+        .route("/envs", get(list_envs))
+        .route("/envs/revisions", get(get_env_revisions))
+        .route("/envs/tasks/:key", get(get_env_task))
+        .route("/envs/tasks/:key/file", get(get_env_file))
         .route("/stream", get(stream_handler));
 
     let tail_pg = state.pg.clone();
@@ -1648,6 +1660,192 @@ async fn get_cluster(State(state): State<AppState>) -> axum::Json<Value> {
         "name": state.cluster.name,
         "runs_base": state.cluster.filesystem.runs_base.display().to_string(),
     }))
+}
+
+// ---------- environment browser ----------
+//
+// Task packages read out of the `[envs]` repo with git plumbing at a
+// resolved commit (see src/envs.rs). `?rev=` picks the commit (default
+// `[envs].rev`); `?grader=1` adds `scoring/` and `reference/`.
+
+/// Snapshots kept before the cache is dropped and rebuilt on demand.
+const ENVS_CACHE_MAX: usize = 64;
+const ENVS_HISTORY_LIMIT: usize = 30;
+const ENVS_REVISIONS_LIMIT: usize = 50;
+
+#[derive(Deserialize)]
+struct EnvsQuery {
+    rev: Option<String>,
+    grader: Option<String>,
+    path: Option<String>,
+}
+
+impl EnvsQuery {
+    fn grader(&self) -> bool {
+        matches!(self.grader.as_deref(), Some("1" | "true"))
+    }
+}
+
+fn envs_config(state: &AppState) -> Result<(&EnvsConfig, PathBuf), ApiError> {
+    let cfg = state
+        .cluster
+        .envs
+        .as_ref()
+        .ok_or_else(|| not_found("no [envs] section in the cluster config"))?;
+    // ClusterConfig::load checks the key exists.
+    let path = state.cluster.repos[&cfg.repo].clone();
+    Ok((cfg, path))
+}
+
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("envs task: {e}")))?
+}
+
+/// Resolve `rev` (or the configured default) and return that commit's
+/// snapshot, building and caching it on first use.
+async fn envs_snapshot(
+    state: &AppState,
+    rev: Option<&str>,
+) -> Result<(String, Arc<envs::Snapshot>), ApiError> {
+    let (cfg, repo_path) = envs_config(state)?;
+    let rev = rev.unwrap_or(&cfg.rev).to_string();
+    envs::validate_rev(&rev).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let tasks_dir = cfg.tasks_dir.clone();
+    let cache = state.envs_cache.clone();
+    let asked = rev.clone();
+    let snapshot = blocking(move || {
+        let repo = envs::Repo::new(repo_path);
+        let commit = repo
+            .resolve(&rev)?
+            .ok_or_else(|| not_found(format!("revision not found: {rev}")))?;
+        if let Some(hit) = cache.lock().unwrap().get(&commit.sha) {
+            return Ok(hit.clone());
+        }
+        let sha = commit.sha.clone();
+        let snap = Arc::new(envs::load_snapshot(&repo, commit, &tasks_dir)?);
+        let mut cache = cache.lock().unwrap();
+        if cache.len() >= ENVS_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(sha, snap.clone());
+        Ok(snap)
+    })
+    .await?;
+    Ok((asked, snapshot))
+}
+
+async fn list_envs(
+    State(state): State<AppState>,
+    Query(q): Query<EnvsQuery>,
+) -> Result<axum::Json<Value>, ApiError> {
+    // Unconfigured is a normal state for the list view, not an error:
+    // the UI renders setup instructions from `configured: false`.
+    let Some(cfg) = state.cluster.envs.as_ref() else {
+        return Ok(axum::Json(json!({ "configured": false })));
+    };
+    let (rev, snap) = envs_snapshot(&state, q.rev.as_deref()).await?;
+    let tasks: Vec<_> = snap.tasks.values().map(|t| t.summary()).collect();
+    Ok(axum::Json(json!({
+        "configured": true,
+        "repo": {
+            "name": cfg.repo,
+            "path": state.cluster.repos[&cfg.repo].display().to_string(),
+            "tasks_dir": cfg.tasks_dir,
+        },
+        "default_rev": cfg.rev,
+        "rev": rev,
+        "commit": snap.commit,
+        "tasks": tasks,
+        "skipped": snap.skipped,
+    })))
+}
+
+async fn get_env_revisions(State(state): State<AppState>) -> Result<axum::Json<Value>, ApiError> {
+    let (cfg, repo_path) = envs_config(&state)?;
+    let default_rev = cfg.rev.clone();
+    let tasks_dir = cfg.tasks_dir.clone();
+    let body = blocking(move || {
+        let repo = envs::Repo::new(repo_path);
+        let refs = repo.refs(ENVS_REVISIONS_LIMIT)?;
+        // The default may not resolve (e.g. a checkout with no remote);
+        // say so instead of failing the whole picker.
+        let default = repo.resolve(&default_rev)?;
+        let commits = match &default {
+            Some(c) => repo.log(&c.sha, &tasks_dir, ENVS_REVISIONS_LIMIT)?,
+            None => Vec::new(),
+        };
+        Ok(json!({
+            "default_rev": default_rev,
+            "default": default,
+            "refs": refs,
+            "commits": commits,
+        }))
+    })
+    .await?;
+    Ok(axum::Json(body))
+}
+
+async fn get_env_task(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Query(q): Query<EnvsQuery>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let (rev, snap) = envs_snapshot(&state, q.rev.as_deref()).await?;
+    let (cfg, repo_path) = envs_config(&state)?;
+    let tasks_dir = cfg.tasks_dir.clone();
+    let grader = q.grader();
+    let detail = blocking(move || {
+        let task = snap.tasks.get(&key).ok_or_else(|| {
+            if snap.skipped.contains(&key) {
+                not_found(format!(
+                    "{key} has no task.json at {}; this browser reads RL-Env-Contract packages only",
+                    snap.commit.short
+                ))
+            } else {
+                not_found(format!("no task {key:?} at {}", snap.commit.short))
+            }
+        })?;
+        let repo = envs::Repo::new(repo_path);
+        let detail = task.detail(&repo, &snap, &tasks_dir, grader, ENVS_HISTORY_LIMIT)?;
+        Ok(json!({ "rev": rev, "commit": snap.commit, "detail": detail }))
+    })
+    .await?;
+    Ok(axum::Json(detail))
+}
+
+async fn get_env_file(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Query(q): Query<EnvsQuery>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let path = q
+        .path
+        .clone()
+        .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "missing ?path=".to_string()))?;
+    let (_, snap) = envs_snapshot(&state, q.rev.as_deref()).await?;
+    let (_, repo_path) = envs_config(&state)?;
+    let grader = q.grader();
+    let content = blocking(move || {
+        let task = snap
+            .tasks
+            .get(&key)
+            .ok_or_else(|| not_found(format!("no task {key:?} at {}", snap.commit.short)))?;
+        let repo = envs::Repo::new(repo_path);
+        task.read_file(&repo, &path, grader).map_err(|e| match e {
+            envs::FileError::NotFound => not_found(format!("no file {path:?} in {key}")),
+            envs::FileError::GraderOnly => ApiError(
+                StatusCode::FORBIDDEN,
+                format!("{path} is grader-side; pass grader=1"),
+            ),
+            envs::FileError::Git(e) => e.into(),
+        })
+    })
+    .await?;
+    Ok(axum::Json(serde_json::to_value(content).unwrap()))
 }
 
 // ---------- rollout viewer ----------

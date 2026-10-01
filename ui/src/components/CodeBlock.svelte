@@ -1,10 +1,10 @@
 <script lang="ts">
-  import { highlight } from "../lib/highlight";
+  import { highlight, type Lang } from "../lib/highlight";
   import { theme } from "../lib/theme.svelte";
 
   interface Props {
     code: string;
-    lang?: "toml" | "json" | "bash";
+    lang?: Lang;
     collapsedLines?: number;
   }
   let { code, lang = "toml", collapsedLines = 12 }: Props = $props();

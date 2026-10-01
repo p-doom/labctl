@@ -5,7 +5,7 @@
   interface NavItem {
     view: View;
     label: string;
-    icon: "runs" | "pipelines" | "artifacts" | "evals";
+    icon: "runs" | "pipelines" | "artifacts" | "evals" | "envs";
     shortcut: string;
   }
   // "evals" icon (checkbox-with-checkmark) doubles as the policies icon —
@@ -20,6 +20,7 @@
     { view: "pipelines", label: "Pipelines", icon: "pipelines", shortcut: "g p" },
     { view: "artifacts", label: "Artifacts", icon: "artifacts", shortcut: "g a" },
     { view: "policies", label: "Policies", icon: "evals", shortcut: "g e" },
+    { view: "envs", label: "Environments", icon: "envs", shortcut: "g n" },
   ];
 </script>
 
