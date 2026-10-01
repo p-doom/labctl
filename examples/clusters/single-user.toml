@@ -24,6 +24,14 @@ kind = "slurm"
 qos = "low"
 gres_gpu_syntax = "gpu:{n}"
 
+# Optional. Lets `labctl serve` browse RL environment packages. `repo`
+# names a [repos] entry; tasks are read from git at `rev` (never the
+# work tree), so run `git fetch` in that checkout to pick up new tasks.
+# [envs]
+# repo = "crowd-cast-envs"
+# rev = "origin/main"
+# tasks_dir = "environments/crowd_envs_v1/crowd_envs_v1/tasks"
+
 # Optional. Without [dispatch], `labctl agent` is a no-op.
 # [dispatch]
 # reconcile_interval_secs = 60

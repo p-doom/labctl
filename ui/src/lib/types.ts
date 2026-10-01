@@ -314,3 +314,192 @@ export interface SegmentDetail {
    */
   frame_indices: number[];
 }
+
+// ---------- Environment browser (crowd-cast RL task packages) ----------
+// Shapes from src/envs.rs. Everything is read from git at one resolved
+// commit; `rev` is what was asked for, `commit` what it resolved to.
+
+export interface EnvCommit {
+  sha: string;
+  short: string;
+  /** Committer date, ISO 8601. */
+  date: string;
+  author: string;
+  subject: string;
+}
+
+/** False before the repo adopted task.json, or once the task was
+ *  deleted: there's nothing to browse at that commit. */
+export interface EnvHistoryCommit extends EnvCommit {
+  has_manifest: boolean;
+}
+
+export interface EnvRef {
+  name: string;
+  kind: "branch" | "remote" | "tag";
+  sha: string;
+  date: string;
+}
+
+export interface EnvSummary {
+  key: string;
+  title: string | null;
+  tags: string[];
+  difficulty: string | null;
+  authors: string[];
+  runtime: string | null;
+  agent_timeout_secs: number | null;
+  workspace_files: number;
+  workspace_bytes: number;
+  prompt: string;
+  error?: string;
+}
+
+export type EnvsList =
+  | { configured: false }
+  | {
+      configured: true;
+      repo: { name: string; path: string; tasks_dir: string };
+      default_rev: string;
+      rev: string;
+      commit: EnvCommit;
+      tasks: EnvSummary[];
+      /** Directories under tasks_dir without a task.json. */
+      skipped: string[];
+    };
+
+export interface EnvRevisions {
+  default_rev: string;
+  /** Null when the default rev doesn't resolve in the checkout. */
+  default: EnvCommit | null;
+  refs: EnvRef[];
+  /** Commits touching tasks_dir, newest first, from the default rev. */
+  commits: EnvCommit[];
+}
+
+export type EnvArea = "package" | "workspace" | "scoring" | "reference";
+
+export interface EnvFileEntry {
+  /** Relative to the task directory, e.g. `workspace/README.md`. */
+  path: string;
+  size: number;
+  area: EnvArea;
+  executable?: boolean;
+  symlink?: boolean;
+}
+
+export interface EnvSetupStep {
+  type: string;
+  source?: string;
+  destination?: string;
+  overwrite?: string;
+  [k: string]: unknown;
+}
+
+export interface EnvArtifactSpec {
+  name: string;
+  type: string;
+  phase: string;
+  required?: boolean;
+  description?: string;
+  source?: string;
+  max_files?: number;
+  max_bytes?: number;
+}
+
+/** task.json, RL-Env-Contract 0.4. Only the fields the page renders are typed. */
+export interface EnvTaskJson {
+  schema_version?: string;
+  key?: string;
+  prompt?: string;
+  runtime?: string;
+  setup?: EnvSetupStep[];
+  artifacts?: EnvArtifactSpec[];
+  scoring?: { type?: string; path?: string };
+  timeout?: { agent?: number; scoring?: number };
+  metadata?: {
+    name?: string;
+    tags?: string[];
+    difficulty?: string;
+    authors?: { name?: string }[];
+  };
+  extensions?: Record<string, Record<string, unknown>>;
+}
+
+export type EnvRole = "outcome" | "invariant" | "veto";
+
+export interface EnvCriterion {
+  name: string;
+  criterion: string;
+  points?: number;
+  creative_ok?: string;
+  creative_not_ok?: string;
+}
+
+export interface EnvRubricGroup {
+  name: string;
+  title?: string;
+  role: EnvRole | string;
+  artifact_refs?: string[];
+  scoring: { type: "python" | "judge" | string; entrypoint?: string; evidence?: string };
+  criteria: EnvCriterion[];
+}
+
+export interface EnvRubrics {
+  schema_version?: string;
+  rubrics: EnvRubricGroup[];
+}
+
+export interface EnvFinding {
+  id: string;
+  source?: string;
+  segment?: string | null;
+  symptom: string;
+  check?: string | null;
+}
+
+export interface EnvRecording {
+  person?: string;
+  dates?: string[];
+  segments?: string[];
+  summary?: string;
+  description?: string;
+  repo?: string;
+  source_repository?: string;
+}
+
+export interface EnvGraderSide {
+  rubrics: EnvRubrics | null;
+  findings: EnvFinding[] | null;
+  checks: string[] | null;
+  prediction: { expected_low?: number; expected_high?: number; why?: string } | null;
+  provenance: EnvRecording | null;
+  notes: string | null;
+  reproduce: string | null;
+  judge_system_prompt: string | null;
+}
+
+export interface EnvTaskDetail {
+  key: string;
+  task: EnvTaskJson;
+  task_error?: string;
+  prompt: string;
+  files: EnvFileEntry[];
+  history: EnvHistoryCommit[];
+  grader: EnvGraderSide | null;
+}
+
+export interface EnvTaskResponse {
+  rev: string;
+  commit: EnvCommit;
+  detail: EnvTaskDetail;
+}
+
+export interface EnvFileContent {
+  path: string;
+  size: number;
+  area: EnvArea;
+  binary: boolean;
+  truncated: boolean;
+  text: string | null;
+}

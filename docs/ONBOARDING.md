@@ -253,6 +253,32 @@ ssh -L 8765:127.0.0.1:8765 <login-node>
 
 Then open `http://127.0.0.1:8765`.
 
+### Environments view (`g n`)
+
+The **Environments** view browses the RL task packages in
+crowd-cast-envs: the list with search and tag chips, and one page per
+task with its prompt, workspace, sandbox spec and history. Rubrics,
+recorded findings, build notes and the reference solution sit behind a
+"Grader side" toggle. Enable it by pointing `[envs]` at a `[repos]`
+entry:
+
+```toml
+[repos]
+crowd-cast-envs = "/fast/project/<group>/repos/crowd-cast-envs"
+
+[envs]
+repo = "crowd-cast-envs"
+# rev       = "origin/main"                                     # default
+# tasks_dir = "environments/crowd_envs_v1/crowd_envs_v1/tasks"  # default
+```
+
+`labctl serve` reads the packages with `git` at `rev` and never touches
+the work tree, so local edits don't show and the server never fetches.
+Run `git fetch` in that checkout to pick up new tasks. To look at any
+branch, tag or sha, use the revision picker or add `?rev=<sha>` to the
+URL. Commits from before the repo adopted `task.json` are listed but
+can't be opened.
+
 ## 6. Sharing the registry with your team
 
 labctl is built for multi-tenant use over a single shared

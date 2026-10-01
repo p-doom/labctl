@@ -19,6 +19,7 @@
     pipelines: "Series",
     artifacts: "Specimens",
     policies: "Rules",
+    envs: "Worlds",
   };
 </script>
 

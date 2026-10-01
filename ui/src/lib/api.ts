@@ -4,6 +4,10 @@ import type {
   ClusterInfo,
   CompareView,
   DatasetSummary,
+  EnvFileContent,
+  EnvRevisions,
+  EnvsList,
+  EnvTaskResponse,
   LineageNode,
   LogResponse,
   PipelineDetail,
@@ -27,6 +31,14 @@ async function get<T>(path: string): Promise<T> {
     throw new Error(`${res.status} ${res.statusText}: ${text}`);
   }
   return res.json() as Promise<T>;
+}
+
+/** `?a=1&b=2` from the defined, non-empty entries; "" when there are none. */
+function qs(params: Record<string, string | undefined>): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v) q.set(k, v);
+  const s = q.toString();
+  return s ? `?${s}` : "";
 }
 
 export const api = {
@@ -78,4 +90,16 @@ export const api = {
     ),
   datasetFrameUrl: (id: string, split: string, seg: string, n: number) =>
     `/api/artifacts/${encodeURIComponent(id)}/dataset/frames/${encodeURIComponent(split)}/${encodeURIComponent(seg)}/${n}`,
+  // Environment browser. `rev` defaults server-side to [envs].rev;
+  // `grader` adds scoring/ and reference/ (see src/envs.rs).
+  envs: (rev?: string) => get<EnvsList>(`/envs${qs({ rev })}`),
+  envRevisions: () => get<EnvRevisions>("/envs/revisions"),
+  envTask: (key: string, rev?: string, grader = false) =>
+    get<EnvTaskResponse>(
+      `/envs/tasks/${encodeURIComponent(key)}${qs({ rev, grader: grader ? "1" : undefined })}`,
+    ),
+  envFile: (key: string, path: string, rev?: string, grader = false) =>
+    get<EnvFileContent>(
+      `/envs/tasks/${encodeURIComponent(key)}/file${qs({ path, rev, grader: grader ? "1" : undefined })}`,
+    ),
 };
